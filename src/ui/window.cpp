@@ -109,20 +109,23 @@ int Px(int dips) { return MulDiv(dips, GetDpiForWindow(g.hwnd), 96); }
 int MenuBarHeight() { return g.fullscreen ? 0 : Px(26); }
 int ControlsHeight() { return Px(150); }
 
-// Where a control is, in client pixels: the seek bar with the time right of it, and below them a row of buttons
-// left and right of the centered title.
+// Where a control is, in client pixels: the seek bar across the window, and below it a row of buttons, the time
+// right of the left ones, and the centered title.
 RECT ControlRect(Control c) {
     RECT client;
     GetClientRect(g.hwnd, &client);
     if (c == kFile) return {0, 0, Px(40), MenuBarHeight()};
-    const int margin = Px(16), step = Px(56), time = Px(64);
+    const int margin = Px(12), step = Px(56), time = Px(140);
     const int seekY = client.bottom - Px(80), rowY = client.bottom - Px(34), half = Px(24);
     switch (c) {
-        case kSeek: return {margin, seekY - Px(10), client.right - margin - time - Px(12), seekY + Px(10)};
-        case kTime: return {client.right - margin - time, seekY - Px(10), client.right - margin, seekY + Px(10)};
+        case kSeek: return {margin, seekY - Px(10), client.right - margin, seekY + Px(10)};
+        case kTime: {
+            const int x = margin + 4 * step + Px(8);
+            return {x, rowY - half, x + time, rowY + half};
+        }
         case kTitle: {
             const int center = int(client.right) / 2;
-            const int w = std::max(0, center - margin - 4 * step);  // clear of the four buttons on the left
+            const int w = std::max(0, center - int(ControlRect(kTime).right));  // clear of the time on the left
             return {center - w, rowY - half, center + w, rowY + half};
         }
         case kSubtitles:
@@ -192,7 +195,7 @@ bool DrawControls() {
         !off && (g.hot == kSeek || g.seeking),
         rect(kTime),
         rect(kTitle),
-        off ? L"" : FormatTime(std::isfinite(duration) ? duration - now : now),
+        off ? L"" : FormatTime(now) + (std::isfinite(duration) ? L" / " + FormatTime(duration) : L""),
         g.title,
         {button(kPlay, g.playing ? L"\xE769" : L"\xF5B0", off), button(kBack, step, off, -1),
          button(kForward, step, off, 1), button(kVolume, VolumeGlyph(), false),

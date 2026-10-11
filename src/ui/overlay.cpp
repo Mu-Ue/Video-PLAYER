@@ -183,7 +183,7 @@ bool SetScale(float scale) {
     if (scale == g.scale) return true;
     g.scale = 0;
     g.menu = CreateFormat(L"Segoe UI", 12 * scale, false, DWRITE_TEXT_ALIGNMENT_CENTER);
-    g.time = CreateFormat(L"Segoe UI", 13 * scale, false, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    g.time = CreateFormat(L"Segoe UI", 13 * scale, false, DWRITE_TEXT_ALIGNMENT_LEADING);
     g.title = CreateFormat(L"Segoe UI", 15 * scale, true, DWRITE_TEXT_ALIGNMENT_CENTER);
     g.icons = CreateFormat(IconFont(), 24 * scale, false, DWRITE_TEXT_ALIGNMENT_CENTER);
     g.number = CreateFormat(L"Segoe UI", 9 * scale, true, DWRITE_TEXT_ALIGNMENT_CENTER);
