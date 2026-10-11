@@ -37,9 +37,11 @@ void DrawBar(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT width
 
 // The playback controls laid over the bottom of the video.
 struct Controls {
-    RECT seekBar;     // the track runs along its middle
-    double progress;  // 0..1 of the track played
-    bool seekHot;     // the track is thicker
+    RECT seekBar;        // the track runs along its middle
+    double progress;     // 0..1 of the track played
+    bool seekHot;        // the track is thicker
+    RECT volumeTrack;    // the volume slider's track runs along its middle; none if empty
+    double volumeLevel;  // 0..1 of the volume track filled
     RECT timeRect, titleRect;
     std::wstring time, title;
     std::vector<BarItem> buttons;  // hot ones are drawn larger

@@ -24,8 +24,11 @@ namespace {
 
 enum : UINT_PTR { kSubtitleTimer = 1, kOsdTimer, kIdleTimer, kShowTimer };
 enum : UINT { kCmdOpen = 1 };
-// The button on the menu bar, then the controls: buttons left to right, the seek bar, and two labels.
-enum Control { kNone, kFile, kPlay, kBack, kForward, kVolume, kSubtitles, kFullscreen, kSeek, kTime, kTitle };
+// The button on the menu bar, then the controls: buttons left to right, the seek bar, the volume slider, and two
+// labels.
+enum Control {
+    kNone, kFile, kPlay, kBack, kForward, kVolume, kSubtitles, kFullscreen, kSeek, kVolumeBar, kTime, kTitle
+};
 constexpr UINT kShowFallbackMs = 1000;  // show the window even if the video's size isn't known by then
 constexpr float kFadeSeconds = 0.2f;    // of the controls
 
@@ -57,7 +60,7 @@ struct Window {
     Controls drawn{};  // what the controls show, at drawnSize and drawnScale
     SIZE drawnSize{};
     float drawnScale = 0;
-    bool seeking = false;  // dragging along the seek bar
+    Control drag = kNone;  // kSeek or kVolumeBar while dragging along it
     // The engine's state, kept here so drawing never waits on the engine. playing changes as soon as it is
     // asked to, then follows the engine's events.
     bool playing = false;
@@ -109,23 +112,29 @@ int Px(int dips) { return MulDiv(dips, GetDpiForWindow(g.hwnd), 96); }
 int MenuBarHeight() { return g.fullscreen ? 0 : Px(26); }
 int ControlsHeight() { return Px(150); }
 
-// Where a control is, in client pixels: the seek bar across the window, and below it a row of buttons, the time
-// right of the left ones, and the centered title.
+// The volume slider opens right of the volume button while the mouse is on either, or dragging the slider.
+bool VolumeExpanded() { return g.hot == kVolume || g.hot == kVolumeBar || g.drag == kVolumeBar; }
+
+// Where a control is, in client pixels: the seek bar across the window, and below it a row of buttons, the volume
+// slider and time right of the left ones, and the centered title.
 RECT ControlRect(Control c) {
     RECT client;
     GetClientRect(g.hwnd, &client);
     if (c == kFile) return {0, 0, Px(40), MenuBarHeight()};
-    const int margin = Px(12), step = Px(56), time = Px(140);
+    const int margin = Px(12), step = Px(56), slider = Px(64), time = Px(140);
     const int seekY = client.bottom - Px(80), rowY = client.bottom - Px(34), half = Px(24);
+    const int sliderX = margin + 4 * step;  // right of the volume button
     switch (c) {
         case kSeek: return {margin, seekY - Px(10), client.right - margin, seekY + Px(10)};
+        case kVolumeBar: return {sliderX, rowY - half, sliderX + (VolumeExpanded() ? slider : 0), rowY + half};
         case kTime: {
-            const int x = margin + 4 * step + Px(8);
+            const int x = int(ControlRect(kVolumeBar).right) + Px(8);
             return {x, rowY - half, x + time, rowY + half};
         }
         case kTitle: {
             const int center = int(client.right) / 2;
-            const int w = std::max(0, center - int(ControlRect(kTime).right));  // clear of the time on the left
+            // Clear of the time with the slider open, so the title doesn't move with it.
+            const int w = std::max(0, center - (sliderX + slider + Px(8) + time));
             return {center - w, rowY - half, center + w, rowY + half};
         }
         case kSubtitles:
@@ -140,13 +149,20 @@ RECT ControlRect(Control c) {
     }
 }
 
+// The volume slider's track, inset so the knob fits at either end; empty while the slider is closed.
+RECT VolumeTrack() {
+    RECT r = ControlRect(kVolumeBar);
+    if (r.right > r.left) InflateRect(&r, -Px(8), 0);
+    return r;
+}
+
 // The controls take clicks from the top of the seek bar down, while they show.
 bool IsOnControls(POINT pt) { return g.controlsShown && pt.y >= ControlRect(kSeek).top; }
 
 bool IsOnBar(POINT pt) { return pt.y < MenuBarHeight() || IsOnControls(pt); }
 
 Control HitTest(POINT pt) {
-    for (const Control c : {kFile, kPlay, kBack, kForward, kVolume, kSubtitles, kFullscreen, kSeek}) {
+    for (const Control c : {kFile, kPlay, kBack, kForward, kVolume, kSubtitles, kFullscreen, kSeek, kVolumeBar}) {
         const RECT r = ControlRect(c);
         if (PtInRect(&r, pt) && (c == kFile || g.controlsShown)) return c;
     }
@@ -167,7 +183,7 @@ const wchar_t* VolumeGlyph() {
 }
 
 // Where the video is, or will be once the seeks in flight are done.
-double ShownTime() { return g.seekBusy || g.seeking ? g.seekTarget : PlaybackTime(); }
+double ShownTime() { return g.seekBusy || g.drag == kSeek ? g.seekTarget : PlaybackTime(); }
 
 // Redraws the controls, unless they would look the same, and returns whether it did.
 bool DrawControls() {
@@ -189,10 +205,14 @@ bool DrawControls() {
     // Progress to the nearest pixel of the track, so it only changes when the drawing would.
     const RECT seek = rect(kSeek);
     const double track = std::max(1L, seek.right - seek.left);
+    RECT volume = VolumeTrack();
+    OffsetRect(&volume, 0, -top);
     Controls controls{
         seek,
         duration > 0 ? std::round(std::clamp(now / duration, 0.0, 1.0) * track) / track : 0.0,
-        !off && (g.hot == kSeek || g.seeking),
+        !off && (g.hot == kSeek || g.drag == kSeek),
+        volume,
+        g.muted ? 0.0 : g.volume,
         rect(kTime),
         rect(kTitle),
         off ? L"" : FormatTime(now) + (std::isfinite(duration) ? L" / " + FormatTime(duration) : L""),
@@ -278,7 +298,7 @@ void OnIdle() {
     POINT pt;
     GetCursorPos(&pt);
     ScreenToClient(g.hwnd, &pt);
-    if (!g.playing || g.seeking || IsOnBar(pt)) return;
+    if (!g.playing || g.drag || IsOnBar(pt)) return;
     SetControlsShown(false);
     SetCursorHidden(true);
 }
@@ -592,11 +612,19 @@ void SeekToX(int x, bool fast) {
     UpdateControls();
 }
 
+// Sets the volume under x on the volume slider.
+void SetVolumeToX(int x) {
+    const RECT r = VolumeTrack();
+    g.volume = SetVolume(std::clamp(double(x - r.left) / std::max(1L, r.right - r.left), 0.0, 1.0));
+    g.muted = g.muted && g.volume == 0;
+    UpdateControls();
+}
+
 // Switches between the normal window and a borderless one covering its monitor.
 void ToggleFullscreen() {
     g.fullscreen = !g.fullscreen;
     g.hot = kNone;
-    g.seeking = false;
+    g.drag = kNone;
     const LONG_PTR style = GetWindowLongPtrW(g.hwnd, GWL_STYLE);
     if (g.fullscreen) {
         GetWindowPlacement(g.hwnd, &g.placement);
@@ -796,9 +824,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             const Control c = HitTest(pt);
             if (c == kSeek && HasVideo()) {
-                g.seeking = true;
+                g.drag = kSeek;
                 SetCapture(hwnd);
                 SeekToX(pt.x, true);
+            } else if (c == kVolumeBar) {
+                g.drag = kVolumeBar;
+                SetCapture(hwnd);
+                SetVolumeToX(pt.x);
             } else if (IsOnBar(pt)) {  // a double click there is just a second click
                 Press(c);
             } else if (msg == WM_LBUTTONDOWN) {
@@ -810,14 +842,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_LBUTTONUP:
-            if (g.seeking) {
-                g.seeking = false;
-                SeekToX(GET_X_LPARAM(lp), false);  // lands on the exact frame
+            if (g.drag) {
+                const Control drag = g.drag;
+                g.drag = kNone;
+                if (drag == kSeek) SeekToX(GET_X_LPARAM(lp), false);  // lands on the exact frame
                 ReleaseCapture();
+                SetHot(HitTest({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}));  // closes the volume slider if left
             }
             return 0;
         case WM_CAPTURECHANGED:
-            g.seeking = false;
+            g.drag = kNone;
             return 0;
         case WM_MOUSEMOVE:
             if (lp != g.lastMouse) Wake();  // not the move SetCursorPos fakes
@@ -826,8 +860,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0};
                 g.tracking = TrackMouseEvent(&tme);
             }
-            if (g.seeking) {
+            if (g.drag == kSeek) {
                 SeekToX(GET_X_LPARAM(lp), true);
+            } else if (g.drag == kVolumeBar) {
+                SetVolumeToX(GET_X_LPARAM(lp));
             } else {
                 SetHot(HitTest({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}));
             }
@@ -835,7 +871,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_MOUSELEAVE:
             g.tracking = false;
             SetHot(kNone);
-            if (g.playing && !g.seeking) SetControlsShown(false);
+            if (g.playing && !g.drag) SetControlsShown(false);
             return 0;
         case WM_SETCURSOR:
             if (g.cursorHidden && LOWORD(lp) == HTCLIENT) {

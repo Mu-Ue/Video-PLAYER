@@ -21,7 +21,7 @@ Output: `build\Video VIEWER.exe` (single file, no dependencies).
 "Video VIEWER.exe" [video.mp4] [subtitles.srt]
 ```
 
-Plays the formats Windows supports (MP4, MOV, MKV, AVI, WMV, …). Drop a video or an `.srt` file on the window, or use File → Open. Moving the mouse shows the controls over the bottom of the video: a seek bar, play / pause, seek back / forward, mute, subtitles and fullscreen.
+Plays the formats Windows supports (MP4, MOV, MKV, AVI, WMV, …). Drop a video or an `.srt` file on the window, or use File → Open. Moving the mouse shows the controls over the bottom of the video: a seek bar, play / pause, seek back / forward, volume, subtitles and fullscreen.
 
 | Input                  | Action                  |
 | ---------------------- | ----------------------- |

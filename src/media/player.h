@@ -35,4 +35,6 @@ double Volume();  // 0..1
 bool IsMuted();
 // Changes the volume by delta (0..1 scale), unmuting when raising it, and returns the new volume.
 double ChangeVolume(double delta);
+// Sets the volume (0..1), unmuting unless it is 0, and returns it.
+double SetVolume(double volume);
 bool ToggleMute();  // returns true if now muted

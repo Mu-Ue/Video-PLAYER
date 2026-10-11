@@ -370,6 +370,18 @@ void DrawControls(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT 
         dc->FillRectangle(D2D1::RectF(seek.left, y - half, x, y + half), g.brush.Get());
         dc->FillEllipse(D2D1::Ellipse({x, y}, knob, knob), g.brush.Get());
 
+        // The volume slider, the same way in white.
+        if (c.volumeTrack.right > c.volumeTrack.left) {
+            const D2D1_RECT_F v = RectF(c.volumeTrack);
+            const float vy = (v.top + v.bottom) / 2, vhalf = 1.5f * scale;
+            const float vx = v.left + float(c.volumeLevel) * (v.right - v.left);
+            g.brush->SetColor(D2D1::ColorF(1, 1, 1, 0.35f));
+            dc->FillRectangle(D2D1::RectF(vx, vy - vhalf, v.right, vy + vhalf), g.brush.Get());
+            g.brush->SetColor(D2D1::ColorF(0xffffff));
+            dc->FillRectangle(D2D1::RectF(v.left, vy - vhalf, vx, vy + vhalf), g.brush.Get());
+            dc->FillEllipse(D2D1::Ellipse({vx, vy}, 6 * scale, 6 * scale), g.brush.Get());
+        }
+
         g.brush->SetColor(D2D1::ColorF(0xffffff));
         dc->DrawText(c.time.data(), UINT32(c.time.size()), g.time.Get(), RectF(c.timeRect), g.brush.Get(),
                      D2D1_DRAW_TEXT_OPTIONS_CLIP);

@@ -314,6 +314,13 @@ double ChangeVolume(double delta) {
     return volume;
 }
 
+double SetVolume(double volume) {
+    volume = std::clamp(std::round(volume * 100) / 100, 0.0, 1.0);
+    g.engine->SetVolume(volume);
+    if (volume > 0) g.engine->SetMuted(FALSE);
+    return volume;
+}
+
 bool ToggleMute() {
     const bool muted = !g.engine->GetMuted();
     g.engine->SetMuted(muted);
