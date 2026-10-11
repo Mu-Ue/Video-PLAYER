@@ -54,6 +54,9 @@ struct Window {
     bool menuOpen = false;  // the File menu is showing
     std::wstring title;     // the video's file name
     bool controlsShown = false;
+    Controls drawn{};  // what the controls show, at drawnSize and drawnScale
+    SIZE drawnSize{};
+    float drawnScale = 0;
     bool seeking = false;  // dragging along the seek bar
     bool tracking = false;  // for WM_MOUSELEAVE
 
@@ -148,10 +151,12 @@ const wchar_t* VolumeGlyph() {
     return volume == 0 ? L"\xE992" : volume < 1.0 / 3 ? L"\xE993" : volume < 2.0 / 3 ? L"\xE994" : L"\xE995";
 }
 
-void DrawControls() {
+// Redraws the controls, unless they would look the same, and returns whether it did.
+bool DrawControls() {
     RECT client;
     GetClientRect(g.hwnd, &client);
     const int h = std::min(ControlsHeight(), int(client.bottom)), top = client.bottom - h;
+    const float scale = GetDpiForWindow(g.hwnd) / 96.0f;
     const bool off = !HasVideo();
     const auto rect = [&](Control c) {
         RECT r = ControlRect(c);
@@ -163,9 +168,12 @@ void DrawControls() {
     };
     const double now = PlaybackTime(), duration = Duration();
     const std::wstring step = std::to_wstring(std::lround(kSeekStep));
-    const Controls controls{
-        rect(kSeek),
-        duration > 0 ? std::clamp(now / duration, 0.0, 1.0) : 0.0,
+    // Progress to the nearest pixel of the track, so it only changes when the drawing would.
+    const RECT seek = rect(kSeek);
+    const double track = std::max(1L, seek.right - seek.left);
+    Controls controls{
+        seek,
+        duration > 0 ? std::round(std::clamp(now / duration, 0.0, 1.0) * track) / track : 0.0,
         !off && (g.hot == kSeek || g.seeking),
         rect(kTime),
         rect(kTitle),
@@ -175,15 +183,21 @@ void DrawControls() {
          button(kForward, step, off, 1), button(kVolume, VolumeGlyph(), false),
          button(kSubtitles, L"\xE7F0", off || g.subs.cues.empty()),
          button(kFullscreen, g.fullscreen ? L"\xE73F" : L"\xE740", false)}};
-    DrawControls(g.dcomp.Get(), g.controls.Get(), client.right, h, GetDpiForWindow(g.hwnd) / 96.0f, controls);
     g.controls->SetOffsetY(float(top));
+    const SIZE size{client.right, h};
+    if (controls == g.drawn && size.cx == g.drawnSize.cx && size.cy == g.drawnSize.cy && scale == g.drawnScale) {
+        return false;
+    }
+    DrawControls(g.dcomp.Get(), g.controls.Get(), size.cx, size.cy, scale, controls);
+    g.drawn = std::move(controls);
+    g.drawnSize = size;
+    g.drawnScale = scale;
+    return true;
 }
 
-// Redraws the controls if they show, for a new time, play state or volume.
+// Redraws the controls if they show and changed, for a new time, play state or volume.
 void UpdateControls() {
-    if (!g.controlsShown) return;
-    DrawControls();
-    g.dcomp->Commit();
+    if (g.controlsShown && DrawControls()) g.dcomp->Commit();
 }
 
 void SetHot(Control c) {

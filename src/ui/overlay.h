@@ -1,6 +1,7 @@
 #pragma once
 
 #include <windows.h>
+#include <d3d11.h>  // also compares RECTs
 #include <dcomp.h>
 
 #include <string>
@@ -8,8 +9,6 @@
 #include <vector>
 
 #include "media/subtitles.h"
-
-struct ID3D11Device;
 
 // The device to draw with: the one the DirectComposition device was created on. Call before drawing.
 void SetOverlayDevice(ID3D11Device* device);
@@ -27,6 +26,7 @@ struct BarItem {
     int replay = 0;    // -1 or 1: a circular arrow back or forward around the text rather than a glyph
     bool hot = false;  // under the mouse
     bool dim = false;  // disabled
+    bool operator==(const BarItem&) const = default;
 };
 
 // Draws a dark bar with the items into the visual's surface and sets it as the visual's content. Zero size clears
@@ -42,6 +42,7 @@ struct Controls {
     RECT timeRect, titleRect;
     std::wstring time, title;
     std::vector<BarItem> buttons;  // hot ones are drawn larger
+    bool operator==(const Controls&) const = default;
 };
 
 // Draws the controls, over a gradient that darkens toward the bottom edge, into the visual's transparent surface
