@@ -816,6 +816,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ScreenToClient(hwnd, &pt);
             return hit == HTCLIENT && pt.y < MenuBarHeight() && !IsMenuButton(HitTest(pt)) ? HTCAPTION : hit;
         }
+        case WM_SYSCOMMAND:  // no system menu: Alt, Alt+Space, F10 and clicking the title bar icon
+            if ((wp & 0xFFF0) == SC_MOUSEMENU || (wp & 0xFFF0) == SC_KEYMENU) return 0;
+            break;
+        case WM_CONTEXTMENU:  // no system menu on right-clicking the title bar or the menu bar
+            return 0;
         case WM_SIZE:
             if (wp != SIZE_MINIMIZED && g.dcomp) Layout();
             return 0;
