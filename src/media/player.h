@@ -24,13 +24,12 @@ void SetVideoSize(int width, int height);
 HANDLE VideoSurface();
 
 bool IsPlaying();
-void TogglePlay();
+void SetPlaying(bool playing);  // playing from the start if it has ended
 double PlaybackTime();  // seconds
 double Duration();      // seconds; NaN if unknown
-// Seeks to a time or by seconds from the current position, staying within the video, and returns the target
-// time. A fast seek lands on the nearest key frame, for dragging along the seek bar.
-double SeekTo(double seconds, bool fast = false);
-double SeekBy(double seconds);
+// Starts seeking to a time within the video; SEEKED follows. A fast seek lands on the nearest key frame, for
+// dragging along the seek bar.
+void SeekTo(double seconds, bool fast);
 double Volume();  // 0..1
 bool IsMuted();
 // Changes the volume by delta (0..1 scale), unmuting when raising it, and returns the new volume.

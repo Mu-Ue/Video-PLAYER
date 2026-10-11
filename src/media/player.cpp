@@ -138,12 +138,12 @@ HANDLE VideoSurface() {
 
 bool IsPlaying() { return g.engine && !g.engine->IsPaused() && !g.engine->IsEnded(); }
 
-void TogglePlay() {
+void SetPlaying(bool playing) {
     if (!g.engine) return;
-    if (IsPlaying()) {
-        g.engine->Pause();
-    } else {
+    if (playing) {
         g.engine->Play();  // from the start if it has ended
+    } else {
+        g.engine->Pause();
     }
 }
 
@@ -151,17 +151,10 @@ double PlaybackTime() { return g.engine ? g.engine->GetCurrentTime() : 0; }
 
 double Duration() { return g.engine ? g.engine->GetDuration() : NAN; }
 
-double SeekTo(double seconds, bool fast) {
-    double target = std::max(0.0, seconds);
-    const double duration = g.engine->GetDuration();
-    if (std::isfinite(duration)) target = std::min(target, duration);
-    g.engine->SetCurrentTimeEx(target,
+void SeekTo(double seconds, bool fast) {
+    g.engine->SetCurrentTimeEx(seconds,
                                fast ? MF_MEDIA_ENGINE_SEEK_MODE_APPROXIMATE : MF_MEDIA_ENGINE_SEEK_MODE_NORMAL);
-    return target;
 }
-
-// GetCurrentTime is the pending target while seeking.
-double SeekBy(double seconds) { return SeekTo(g.engine->GetCurrentTime() + seconds); }
 
 double Volume() { return g.engine ? g.engine->GetVolume() : 1; }
 

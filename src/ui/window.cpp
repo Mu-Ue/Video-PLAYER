@@ -58,6 +58,15 @@ struct Window {
     SIZE drawnSize{};
     float drawnScale = 0;
     bool seeking = false;  // dragging along the seek bar
+    // The engine's state, kept here so drawing never waits on the engine. playing changes as soon as it is
+    // asked to, then follows the engine's events.
+    bool playing = false;
+    double duration = NAN;
+    double volume = 1;
+    bool muted = false;
+    // One seek at a time is in flight; the latest one asked for meanwhile waits for it to finish.
+    bool seekBusy = false, seekQueued = false, seekFast = false;
+    double seekTarget = 0;  // of the latest seek
     bool tracking = false;  // for WM_MOUSELEAVE
 
     bool fullscreen = false;
@@ -146,10 +155,13 @@ void DrawMenuBar() {
 }
 
 const wchar_t* VolumeGlyph() {
-    const double volume = Volume();
-    if (IsMuted()) return L"\xE74F";
+    const double volume = g.volume;
+    if (g.muted) return L"\xE74F";
     return volume == 0 ? L"\xE992" : volume < 1.0 / 3 ? L"\xE993" : volume < 2.0 / 3 ? L"\xE994" : L"\xE995";
 }
+
+// Where the video is, or will be once the seeks in flight are done.
+double ShownTime() { return g.seekBusy || g.seeking ? g.seekTarget : PlaybackTime(); }
 
 // Redraws the controls, unless they would look the same, and returns whether it did.
 bool DrawControls() {
@@ -166,7 +178,7 @@ bool DrawControls() {
     const auto button = [&](Control c, std::wstring text, bool dim, int replay = 0) {
         return BarItem{rect(c), std::move(text), replay, g.hot == c && !dim, dim};
     };
-    const double now = PlaybackTime(), duration = Duration();
+    const double now = ShownTime(), duration = g.duration;
     const std::wstring step = std::to_wstring(std::lround(kSeekStep));
     // Progress to the nearest pixel of the track, so it only changes when the drawing would.
     const RECT seek = rect(kSeek);
@@ -179,7 +191,7 @@ bool DrawControls() {
         rect(kTitle),
         off ? L"" : FormatTime(std::isfinite(duration) ? duration - now : now),
         g.title,
-        {button(kPlay, IsPlaying() ? L"\xE769" : L"\xF5B0", off), button(kBack, step, off, -1),
+        {button(kPlay, g.playing ? L"\xE769" : L"\xF5B0", off), button(kBack, step, off, -1),
          button(kForward, step, off, 1), button(kVolume, VolumeGlyph(), false),
          button(kSubtitles, L"\xE7F0", off || g.subs.cues.empty()),
          button(kFullscreen, g.fullscreen ? L"\xE73F" : L"\xE740", false)}};
@@ -260,7 +272,7 @@ void OnIdle() {
     POINT pt;
     GetCursorPos(&pt);
     ScreenToClient(g.hwnd, &pt);
-    if (!IsPlaying() || g.seeking || IsOnBar(pt)) return;
+    if (!g.playing || g.seeking || IsOnBar(pt)) return;
     SetControlsShown(false);
     SetCursorHidden(true);
 }
@@ -308,7 +320,7 @@ void UpdateSubtitles(bool redraw) {
         DrawSubtitles();
         g.dcomp->Commit();
     }
-    if (IsPlaying() && std::isfinite(next)) {
+    if (g.playing && std::isfinite(next)) {
         SetTimer(g.hwnd, kSubtitleTimer, UINT(std::clamp(std::ceil((next - now) * 1000) + 1, 1.0, 3600000.0)),
                  nullptr);
     }
@@ -460,7 +472,9 @@ bool OpenVideoFile(const std::wstring& path) {
         ShowError(L"Can't open \"" + FileName(path) + L"\"." + (missing ? L"\n\nThe file doesn't exist." : L""));
         return false;
     }
-    // Subtitles belong to the video they were loaded for.
+    // Seeks and subtitles belong to the video they were for.
+    g.duration = NAN;
+    g.seekBusy = g.seekQueued = false;
     g.subs = {};
     UpdateSubtitles(false);
     HideOsd();
@@ -515,12 +529,48 @@ void ShowFileMenu() {
     }
 }
 
-void Seek(double seconds) {
-    const double target = SeekBy(seconds);
-    ShowOsd(FormatTime(target) + L" / " + FormatTime(Duration()));
+// Seeks to a time within the video and returns it. While a seek is in flight the new one waits, replacing any
+// that was already waiting, so dragging or holding an arrow key never piles up seeks in the engine.
+double RequestSeek(double seconds, bool fast) {
+    g.seekTarget = std::max(0.0, std::isfinite(g.duration) ? std::min(seconds, g.duration) : seconds);
+    g.seekFast = fast;
+    if (g.seekBusy) {
+        g.seekQueued = true;
+    } else {
+        g.seekBusy = true;
+        SeekTo(g.seekTarget, fast);
+    }
+    UpdateControls();
+    return g.seekTarget;
 }
 
-void ToggleMuted() { ShowOsd(ToggleMute() ? L"Muted" : L"Unmuted"); }
+// A seek finished: start the waiting one, if any.
+void OnSeeked() {
+    if (g.seekQueued) {
+        g.seekQueued = false;
+        SeekTo(g.seekTarget, g.seekFast);
+    } else {
+        g.seekBusy = false;
+    }
+}
+
+void Seek(double seconds) {
+    const double target = RequestSeek(ShownTime() + seconds, false);
+    ShowOsd(FormatTime(target) + L" / " + FormatTime(g.duration));
+}
+
+// Plays or pauses, showing it at once rather than when the engine reports it.
+void TogglePlay() {
+    g.playing = !g.playing;
+    SetPlaying(g.playing);
+    UpdateSubtitles(false);
+    UpdateControls();
+}
+
+void ToggleMuted() {
+    g.muted = ToggleMute();
+    ShowOsd(g.muted ? L"Muted" : L"Unmuted");
+}
 
 void ToggleSubtitles() {
     if (g.subs.cues.empty()) return;
@@ -532,10 +582,9 @@ void ToggleSubtitles() {
 // Seeks to the time under x on the seek bar.
 void SeekToX(int x, bool fast) {
     const RECT r = ControlRect(kSeek);
-    const double duration = Duration();
+    const double duration = g.duration;
     if (!(duration > 0)) return;
-    SeekTo(std::clamp(double(x - r.left) / std::max(1L, r.right - r.left), 0.0, 1.0) * duration, fast);
-    UpdateControls();
+    RequestSeek(std::clamp(double(x - r.left) / std::max(1L, r.right - r.left), 0.0, 1.0) * duration, fast);
 }
 
 // Switches between the normal window and a borderless one covering its monitor.
@@ -583,6 +632,7 @@ void OnMediaEvent(WPARAM event, LPARAM param) {
     switch (event) {
         case MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA:
             g.attached = false;  // a new source may bring a new swap chain
+            g.duration = Duration();
             if (!g.sized && HasVideo()) {
                 PlaceWindow();
                 g.sized = true;
@@ -598,6 +648,7 @@ void OnMediaEvent(WPARAM event, LPARAM param) {
             Layout();
             break;
         case MF_MEDIA_ENGINE_EVENT_PLAYING:
+            g.playing = IsPlaying();  // not if paused again since
             // Keep the display on while playing.
             SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
             UpdateSubtitles(false);
@@ -606,21 +657,30 @@ void OnMediaEvent(WPARAM event, LPARAM param) {
             break;
         case MF_MEDIA_ENGINE_EVENT_PAUSE:
         case MF_MEDIA_ENGINE_EVENT_ENDED:
+            g.playing = IsPlaying();
             SetThreadExecutionState(ES_CONTINUOUS);
             UpdateSubtitles(false);
             Wake();
             UpdateControls();
             break;
         case MF_MEDIA_ENGINE_EVENT_SEEKED:
+            OnSeeked();
+            [[fallthrough]];
         case MF_MEDIA_ENGINE_EVENT_TIMEUPDATE:
             UpdateSubtitles(false);
             UpdateControls();
             break;
         case MF_MEDIA_ENGINE_EVENT_DURATIONCHANGE:
+            g.duration = Duration();
+            UpdateControls();
+            break;
         case MF_MEDIA_ENGINE_EVENT_VOLUMECHANGE:
+            g.volume = Volume();
+            g.muted = IsMuted();
             UpdateControls();
             break;
         case MF_MEDIA_ENGINE_EVENT_ERROR: {
+            g.playing = g.seekBusy = g.seekQueued = false;
             SetThreadExecutionState(ES_CONTINUOUS);
             // The video given on the command line failed before the window showed: like a failed start, close.
             const bool starting = !IsWindowVisible(g.hwnd);
@@ -648,7 +708,7 @@ void OnKey(WPARAM key, bool repeat) {
             break;
         case VK_UP:
         case VK_DOWN: {
-            const double volume = ChangeVolume(key == VK_UP ? kVolumeStep : -kVolumeStep);
+            const double volume = g.volume = ChangeVolume(key == VK_UP ? kVolumeStep : -kVolumeStep);
             ShowOsd(L"Volume " + std::to_wstring(std::lround(volume * 100)) + L"%");
             break;
         }
@@ -763,7 +823,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_MOUSELEAVE:
             g.tracking = false;
             SetHot(kNone);
-            if (IsPlaying() && !g.seeking) SetControlsShown(false);
+            if (g.playing && !g.seeking) SetControlsShown(false);
             return 0;
         case WM_SETCURSOR:
             if (g.cursorHidden && LOWORD(lp) == HTCLIENT) {
