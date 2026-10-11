@@ -23,7 +23,7 @@ using Microsoft::WRL::ComPtr;
 namespace {
 
 enum : UINT_PTR { kSubtitleTimer = 1, kOsdTimer, kIdleTimer, kShowTimer };
-enum : UINT { kCmdOpen = 1, kCmdExit };
+enum : UINT { kCmdOpen = 1 };
 // The button on the menu bar, then the controls: buttons left to right, the seek bar, and two labels.
 enum Control { kNone, kFile, kPlay, kBack, kForward, kVolume, kSubtitles, kFullscreen, kSeek, kTime, kTitle };
 constexpr UINT kShowFallbackMs = 1000;  // show the window even if the video's size isn't known by then
@@ -498,8 +498,6 @@ void ShowFileMenu() {
     const HMENU menu = CreatePopupMenu();
     if (!menu) return;
     AppendMenuW(menu, MF_STRING, kCmdOpen, L"&Open...\tCtrl+O");
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kCmdExit, L"E&xit");
     const RECT r = ControlRect(kFile);
     POINT pt{r.left, r.bottom};
     ClientToScreen(g.hwnd, &pt);
@@ -516,11 +514,7 @@ void ShowFileMenu() {
     DrawMenuBar();
     if (g.controlsShown) DrawControls();
     g.dcomp->Commit();
-    if (cmd == kCmdOpen) {
-        Open();
-    } else if (cmd == kCmdExit) {
-        DestroyWindow(g.hwnd);
-    }
+    if (cmd == kCmdOpen) Open();
 }
 
 // Seeks to a time within the video and returns it; the caller shows it. While a seek is in flight the new one waits, replacing any
