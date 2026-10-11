@@ -201,3 +201,43 @@ SIZE DrawOutlinedText(IDCompositionDevice* dcomp, IDCompositionVisual* visual, s
     visual->SetContent(surface.Get());
     return {LONG(w), LONG(h)};
 }
+
+void DrawBar(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT width, UINT height, float scale,
+             const std::vector<BarItem>& items) {
+    visual->SetContent(nullptr);
+    if (width == 0 || height == 0 || !Init()) return;
+    ComPtr<IDWriteTextFormat> text, icons;
+    HRESULT hr = g.dwrite->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                                            DWRITE_FONT_STRETCH_NORMAL, 12 * scale, L"", &text);
+    if (SUCCEEDED(hr)) {
+        hr = g.dwrite->CreateTextFormat(L"Segoe MDL2 Assets", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+                                        DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 16 * scale, L"", &icons);
+    }
+    if (FAILED(hr)) return;
+    text->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    icons->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    icons->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+
+    const float h = float(height), inset = std::round(3 * scale), radius = 4 * scale;
+    const ComPtr<IDCompositionSurface> surface = Paint(dcomp, width, height, [&](ID2D1DeviceContext* dc,
+                                                                                 const D2D1_MATRIX_3X2_F&) {
+        dc->Clear(D2D1::ColorF(0x202020));  // the dark title bar's color
+        dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        for (const BarItem& item : items) {
+            const D2D1_RECT_F r = D2D1::RectF(item.x, 0, item.x + item.width, h);
+            if (item.hot) {
+                g.brush->SetColor(D2D1::ColorF(0x3a3a3a));
+                dc->FillRoundedRectangle(
+                    D2D1::RoundedRect(D2D1::RectF(r.left, inset, r.right, h - inset), radius, radius), g.brush.Get());
+            }
+            IDWriteTextFormat* format = item.icon ? icons.Get() : text.Get();
+            if (!item.icon) {
+                format->SetTextAlignment(item.label ? DWRITE_TEXT_ALIGNMENT_LEADING : DWRITE_TEXT_ALIGNMENT_CENTER);
+            }
+            g.brush->SetColor(D2D1::ColorF(item.dim ? 0x707070 : 0xffffff));
+            dc->DrawText(item.text.data(), UINT32(item.text.size()), format, r, g.brush.Get(),
+                         D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+    });
+    visual->SetContent(surface.Get());
+}

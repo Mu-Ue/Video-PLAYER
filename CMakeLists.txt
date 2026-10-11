@@ -25,7 +25,7 @@ target_compile_options(VideoVIEWER PRIVATE /W4 /permissive- /utf-8 /sdl /guard:c
 set(CMAKE_CXX_STANDARD_LIBRARIES "")
 target_link_libraries(VideoVIEWER PRIVATE delayimp kernel32 user32 imm32 dwmapi shell32 comdlg32 oleaut32 uuid
                       mfplat mfuuid d3d11 dxgi dcomp d2d1 dwrite onecore_apiset)
-# The file picker, dropped files and text drawing load their DLLs on first use, off the startup path.
+# The file picker and dropped files load their DLLs on first use, and text drawing once the window lays out.
 target_link_options(VideoVIEWER PRIVATE /DELAYLOAD:comdlg32.dll /DELAYLOAD:shell32.dll /DELAYLOAD:d2d1.dll
                     /DELAYLOAD:dwrite.dll)
 # Control-flow guard, shadow stack, and DLL imports from System32 only (no planted DLLs next to the exe).

@@ -22,15 +22,18 @@ using Microsoft::WRL::ComPtr;
 namespace {
 
 enum : UINT_PTR { kSubtitleTimer = 1, kOsdTimer, kCursorTimer, kShowTimer };
+enum : UINT { kCmdOpen = 1, kCmdExit };
+enum Control { kNone, kFile, kBack, kPlay, kForward };  // the buttons on the menu and control bars
 constexpr UINT kShowFallbackMs = 1000;  // show the window even if the video's size isn't known by then
 
 struct Window {
     HWND hwnd = nullptr;
     int showCmd = SW_SHOWNORMAL;
-    // Bottom to top: black background, video, subtitles at the bottom and top, seek / volume feedback.
+    // Bottom to top: black background, video, subtitles at the bottom and top, seek / volume feedback, and the
+    // menu and control bars, which the video doesn't overlap.
     ComPtr<IDCompositionDevice> dcomp;
     ComPtr<IDCompositionTarget> target;
-    ComPtr<IDCompositionVisual> root, background, video, subtitleBottom, subtitleTop, osd;
+    ComPtr<IDCompositionVisual> root, background, video, subtitleBottom, subtitleTop, osd, menuBar, controlBar;
     ComPtr<IDXGISwapChain1> black;  // 8 x 8, stretched over the window
     bool attached = false;          // the engine's swap chain is the content of `video`
     SIZE videoSize{};               // swap chain size
@@ -41,6 +44,10 @@ struct Window {
     bool subsOn = true;
     std::vector<size_t> shown;  // indices of the cues on screen
     std::wstring osdText;
+    Control hot = kNone;    // under the mouse
+    bool menuOpen = false;  // the File menu is showing
+    std::wstring barTime;   // the time and play state the control bar shows
+    bool barPlaying = false;
 
     bool fullscreen = false;
     WINDOWPLACEMENT placement{sizeof(WINDOWPLACEMENT)};  // of the window before it went fullscreen
@@ -71,6 +78,86 @@ std::wstring FormatTime(double seconds) {
 float TextScale() {
     const float w = float(g.videoRect.right - g.videoRect.left), h = float(g.videoRect.bottom - g.videoRect.top);
     return std::min(h, w * 9 / 16);
+}
+
+// The bars are hidden in fullscreen.
+int MenuBarHeight() { return g.fullscreen ? 0 : MulDiv(26, GetDpiForWindow(g.hwnd), 96); }
+int ControlBarHeight() { return g.fullscreen ? 0 : MulDiv(40, GetDpiForWindow(g.hwnd), 96); }
+
+// Where a button is, in client pixels.
+RECT ControlRect(Control c) {
+    RECT client;
+    GetClientRect(g.hwnd, &client);
+    const UINT dpi = GetDpiForWindow(g.hwnd);
+    const int w = MulDiv(40, dpi, 96);
+    if (c == kFile) return {0, 0, w, MenuBarHeight()};
+    const int x = MulDiv(4, dpi, 96) + (c - kBack) * w;
+    return {x, client.bottom - ControlBarHeight(), x + w, client.bottom};
+}
+
+Control HitTest(POINT pt) {
+    for (const Control c : {kFile, kBack, kPlay, kForward}) {
+        const RECT r = ControlRect(c);
+        if (PtInRect(&r, pt)) return c;
+    }
+    return kNone;
+}
+
+bool IsOnBar(POINT pt) {
+    RECT client;
+    GetClientRect(g.hwnd, &client);
+    return pt.y < MenuBarHeight() || pt.y >= client.bottom - ControlBarHeight();
+}
+
+BarItem Button(Control c, std::wstring text, bool icon, bool dim = false) {
+    const RECT r = ControlRect(c);
+    return {float(r.left), float(r.right - r.left), std::move(text), icon, false, g.hot == c && !dim, dim};
+}
+
+void DrawMenuBar() {
+    RECT client;
+    GetClientRect(g.hwnd, &client);
+    BarItem file = Button(kFile, L"File", false);
+    file.hot |= g.menuOpen;
+    DrawBar(g.dcomp.Get(), g.menuBar.Get(), client.right, MenuBarHeight(), GetDpiForWindow(g.hwnd) / 96.0f, {file});
+}
+
+std::wstring BarTime() { return HasVideo() ? FormatTime(PlaybackTime()) + L" / " + FormatTime(Duration()) : L""; }
+
+// Seek back, play / pause and seek forward buttons, then the time.
+void DrawControlBar() {
+    RECT client;
+    GetClientRect(g.hwnd, &client);
+    const UINT dpi = GetDpiForWindow(g.hwnd);
+    const int h = ControlBarHeight();
+    const bool off = !HasVideo();
+    g.barPlaying = IsPlaying();
+    g.barTime = BarTime();
+    const float x = float(ControlRect(kForward).right + MulDiv(8, dpi, 96));
+    DrawBar(g.dcomp.Get(), g.controlBar.Get(), client.right, h, dpi / 96.0f,
+            {Button(kBack, L"\xEB9E", true, off), Button(kPlay, g.barPlaying ? L"\xE769" : L"\xE768", true, off),
+             Button(kForward, L"\xEB9D", true, off), {x, std::max(0.0f, client.right - x), g.barTime, false, true}});
+    g.controlBar->SetOffsetY(float(client.bottom - h));
+}
+
+// Redraws the control bar if the time or play state it shows changed.
+void UpdateControlBar() {
+    if (g.fullscreen || (IsPlaying() == g.barPlaying && BarTime() == g.barTime)) return;
+    DrawControlBar();
+    g.dcomp->Commit();
+}
+
+void SetHot(Control c) {
+    if (c == g.hot) return;
+    const bool menu = c == kFile || g.hot == kFile;
+    g.hot = c;
+    if (menu) DrawMenuBar();
+    DrawControlBar();
+    g.dcomp->Commit();
+    if (c != kNone) {
+        TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, g.hwnd, 0};
+        TrackMouseEvent(&tme);
+    }
 }
 
 void DrawSubtitles() {
@@ -118,11 +205,12 @@ void UpdateSubtitles(bool redraw) {
 }
 
 void DrawOsd() {
-    const float fontSize = std::max(12.0f, (HasVideo() ? TextScale() : float(g.videoRect.bottom)) * 0.035f);
+    const float fontSize =
+        std::max(12.0f, (HasVideo() ? TextScale() : float(g.videoRect.bottom - g.videoRect.top)) * 0.035f);
     const float margin = std::round(fontSize * 0.8f);
     DrawOutlinedText(g.dcomp.Get(), g.osd.Get(), g.osdText, {}, fontSize, float(g.videoRect.right), false);
     g.osd->SetOffsetX(margin);
-    g.osd->SetOffsetY(margin);
+    g.osd->SetOffsetY(float(MenuBarHeight()) + margin);
 }
 
 // Shows text in the top left for a moment, or until replaced if it stays.
@@ -145,19 +233,22 @@ void HideOsd() {
     g.dcomp->Commit();
 }
 
-// Fits the video in the window, keeping its aspect ratio; the engine scales it on the GPU.
+// Fits the video between the bars, keeping its aspect ratio; the engine scales it on the GPU.
 void Layout() {
     RECT client;
     GetClientRect(g.hwnd, &client);
     const int cw = client.right, ch = client.bottom;
     if (cw <= 0 || ch <= 0) return;  // minimized
     g.background->SetTransform(D2D_MATRIX_3X2_F{cw / 8.0f, 0, 0, ch / 8.0f, 0, 0});
+    DrawMenuBar();
+    DrawControlBar();
+    const int top = MenuBarHeight(), ah = std::max(1, ch - top - ControlBarHeight());
 
     const SIZE v = VideoSize();
     if (v.cx > 0 && v.cy > 0) {
-        const double scale = std::min(double(cw) / v.cx, double(ch) / v.cy);
+        const double scale = std::min(double(cw) / v.cx, double(ah) / v.cy);
         const int w = std::max(1, int(std::lround(v.cx * scale))), h = std::max(1, int(std::lround(v.cy * scale)));
-        const int x = (cw - w) / 2, y = (ch - h) / 2;
+        const int x = (cw - w) / 2, y = top + (ah - h) / 2;
         if (w != g.videoSize.cx || h != g.videoSize.cy || !g.attached) {
             SetVideoSize(w, h);
             g.videoSize = {w, h};
@@ -175,7 +266,7 @@ void Layout() {
             }
         }
     } else {
-        g.videoRect = client;
+        g.videoRect = {0, top, cw, top + ah};
     }
     UpdateSubtitles(true);
     if (!g.osdText.empty()) DrawOsd();
@@ -198,6 +289,7 @@ void PlaceWindow() {
         rc.right = std::max(LONG(std::lround(v.cx * scale)), LONG(MulDiv(320, dpi, 96)));
         rc.bottom = std::max(LONG(std::lround(v.cy * scale)), LONG(MulDiv(180, dpi, 96)));
     }
+    rc.bottom += MenuBarHeight() + ControlBarHeight();
     AdjustWindowRectExForDpi(&rc, WS_OVERLAPPEDWINDOW, FALSE, 0, dpi);
     const int w = rc.right - rc.left, h = rc.bottom - rc.top;
     SetWindowPos(g.hwnd, nullptr, work.left + (int(workW) - w) / 2, work.top + (int(workH) - h) / 2, w, h,
@@ -268,6 +360,53 @@ void Open() {
     if (!path.empty()) OpenFiles({path});
 }
 
+void ShowFileMenu() {
+    if (g.fullscreen) return;
+    const HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendMenuW(menu, MF_STRING, kCmdOpen, L"&Open...\tCtrl+O");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kCmdExit, L"E&xit");
+    const RECT r = ControlRect(kFile);
+    POINT pt{r.left, r.bottom};
+    ClientToScreen(g.hwnd, &pt);
+    g.menuOpen = true;
+    DrawMenuBar();
+    g.dcomp->Commit();
+    const UINT cmd = UINT(TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, g.hwnd, nullptr));
+    DestroyMenu(menu);
+    // The menu had the mouse while it showed.
+    g.menuOpen = false;
+    GetCursorPos(&pt);
+    ScreenToClient(g.hwnd, &pt);
+    g.hot = HitTest(pt);
+    DrawMenuBar();
+    DrawControlBar();
+    g.dcomp->Commit();
+    if (cmd == kCmdOpen) {
+        Open();
+    } else if (cmd == kCmdExit) {
+        DestroyWindow(g.hwnd);
+    }
+}
+
+void Seek(double seconds) {
+    const double target = SeekBy(seconds);
+    ShowOsd(FormatTime(target) + L" / " + FormatTime(Duration()));
+}
+
+void Press(Control c) {
+    if (c == kFile) {
+        ShowFileMenu();
+    } else if (c != kNone && HasVideo()) {
+        if (c == kPlay) {
+            TogglePlay();
+        } else {
+            Seek(c == kBack ? -kSeekStep : kSeekStep);
+        }
+    }
+}
+
 void SetCursorHidden(bool hidden) {
     if (g.cursorHidden == hidden) return;
     g.cursorHidden = hidden;
@@ -279,6 +418,7 @@ void SetCursorHidden(bool hidden) {
 // Switches between the normal window and a borderless one covering its monitor.
 void ToggleFullscreen() {
     g.fullscreen = !g.fullscreen;
+    g.hot = kNone;
     const LONG_PTR style = GetWindowLongPtrW(g.hwnd, GWL_STYLE);
     if (g.fullscreen) {
         GetWindowPlacement(g.hwnd, &g.placement);
@@ -321,15 +461,21 @@ void OnMediaEvent(WPARAM event, LPARAM param) {
             // Keep the display on while playing.
             SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
             UpdateSubtitles(false);
+            UpdateControlBar();
             break;
         case MF_MEDIA_ENGINE_EVENT_PAUSE:
         case MF_MEDIA_ENGINE_EVENT_ENDED:
             SetThreadExecutionState(ES_CONTINUOUS);
             UpdateSubtitles(false);
+            UpdateControlBar();
             break;
         case MF_MEDIA_ENGINE_EVENT_SEEKED:
         case MF_MEDIA_ENGINE_EVENT_TIMEUPDATE:
             UpdateSubtitles(false);
+            UpdateControlBar();
+            break;
+        case MF_MEDIA_ENGINE_EVENT_DURATIONCHANGE:
+            UpdateControlBar();
             break;
         case MF_MEDIA_ENGINE_EVENT_ERROR: {
             SetThreadExecutionState(ES_CONTINUOUS);
@@ -355,10 +501,7 @@ void OnKey(WPARAM key, bool repeat) {
             break;
         case VK_LEFT:
         case VK_RIGHT:
-            if (video) {
-                const double target = SeekBy(key == VK_LEFT ? -kSeekStep : kSeekStep);
-                ShowOsd(FormatTime(target) + L" / " + FormatTime(Duration()));
-            }
+            if (video) Seek(key == VK_LEFT ? -kSeekStep : kSeekStep);
             break;
         case VK_UP:
         case VK_DOWN: {
@@ -430,19 +573,35 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_KEYDOWN:
             OnKey(wp, (lp & (1 << 30)) != 0);
             return 0;
+        case WM_SYSCHAR:  // Alt+F
+            if (wp == 'f' || wp == 'F') {
+                ShowFileMenu();
+                return 0;
+            }
+            break;
         case WM_LBUTTONDOWN:
-            if (HasVideo()) TogglePlay();
+        case WM_LBUTTONDBLCLK: {
+            const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            if (IsOnBar(pt)) {  // a double click there is just a second click
+                Press(HitTest(pt));
+            } else if (msg == WM_LBUTTONDOWN) {
+                if (HasVideo()) TogglePlay();
+            } else {  // the first click toggled playback; undo that
+                if (HasVideo()) TogglePlay();
+                ToggleFullscreen();
+            }
             return 0;
-        case WM_LBUTTONDBLCLK:  // the first click toggled playback; undo that
-            if (HasVideo()) TogglePlay();
-            ToggleFullscreen();
-            return 0;
+        }
         case WM_MOUSEMOVE:
             if (g.fullscreen && lp != g.lastMouse) {  // not the move SetCursorPos fakes
                 SetCursorHidden(false);
                 SetTimer(hwnd, kCursorTimer, kCursorHideMs, nullptr);
             }
             g.lastMouse = lp;
+            SetHot(HitTest({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}));
+            return 0;
+        case WM_MOUSELEAVE:
+            SetHot(kNone);
             return 0;
         case WM_SETCURSOR:
             if (g.cursorHidden && LOWORD(lp) == HTCLIENT) {
@@ -481,7 +640,7 @@ bool InitComposition() {
     if (SUCCEEDED(hr)) hr = g.dcomp->CreateVisual(&g.root);
     for (IDCompositionVisual** v : {g.background.GetAddressOf(), g.video.GetAddressOf(),
                                     g.subtitleBottom.GetAddressOf(), g.subtitleTop.GetAddressOf(),
-                                    g.osd.GetAddressOf()}) {
+                                    g.osd.GetAddressOf(), g.menuBar.GetAddressOf(), g.controlBar.GetAddressOf()}) {
         if (SUCCEEDED(hr)) hr = g.dcomp->CreateVisual(v);
         if (SUCCEEDED(hr)) hr = g.root->AddVisual(*v, FALSE, nullptr);  // in front of the previous ones
     }
