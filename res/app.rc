@@ -12,10 +12,10 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "FileDescription", "Video VIEWER"
+            VALUE "FileDescription", "Video-PLAYER"
             VALUE "FileVersion", "1.0.0"
-            VALUE "OriginalFilename", "Video VIEWER.exe"
-            VALUE "ProductName", "Video VIEWER"
+            VALUE "OriginalFilename", "Video-PLAYER.exe"
+            VALUE "ProductName", "Video-PLAYER"
             VALUE "ProductVersion", "1.0.0"
         END
     END

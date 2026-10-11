@@ -1,6 +1,6 @@
-<p align="center"><img src="docs/icon.png" width="128" alt="Video VIEWER icon"></p>
+<p align="center"><img src="docs/icon.png" width="128" alt="Video-PLAYER icon"></p>
 
-# Video VIEWER
+# Video-PLAYER
 
 A minimal, fast native video player for Windows (Win32 + Media Foundation + DirectComposition) with hardware decoding and `.srt` subtitles.
 
@@ -13,12 +13,12 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-Output: `build\Video VIEWER.exe` (single file, no dependencies).
+Output: `build\Video-PLAYER.exe` (single file, no dependencies).
 
 ## Use
 
 ```
-"Video VIEWER.exe" [video.mp4] [subtitles.srt]
+"Video-PLAYER.exe" [video.mp4] [subtitles.srt]
 ```
 
 Plays the formats Windows supports (MP4, MOV, MKV, AVI, WMV, …). Drop a video or an `.srt` file on the window, use File → Open, or add subtitles to the playing video with Subtitles → Add subtitle file. Moving the mouse shows the controls over the bottom of the video: a seek bar, play / pause, seek back / forward, volume, subtitles and fullscreen.
