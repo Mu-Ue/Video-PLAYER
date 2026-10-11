@@ -122,6 +122,56 @@ ComPtr<IDWriteTextLayout> CreateLayout(std::wstring_view text, const std::vector
     return layout;
 }
 
+// A single line of text centered vertically in its box.
+ComPtr<IDWriteTextFormat> CreateFormat(const wchar_t* family, float size, bool bold, DWRITE_TEXT_ALIGNMENT align) {
+    ComPtr<IDWriteTextFormat> format;
+    const DWRITE_FONT_WEIGHT weight = bold ? DWRITE_FONT_WEIGHT_SEMI_BOLD : DWRITE_FONT_WEIGHT_NORMAL;
+    if (FAILED(g.dwrite->CreateTextFormat(family, nullptr, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                                          size, L"", &format))) {
+        return nullptr;
+    }
+    format->SetTextAlignment(align);
+    format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    return format;
+}
+
+// Windows 11's icon font, or Windows 10's, which has the same code points.
+const wchar_t* IconFont() {
+    static const wchar_t* const font = [] {
+        ComPtr<IDWriteFontCollection> fonts;
+        UINT32 index;
+        BOOL found = FALSE;
+        if (SUCCEEDED(g.dwrite->GetSystemFontCollection(&fonts))) {
+            fonts->FindFamilyName(L"Segoe Fluent Icons", &index, &found);
+        }
+        return found ? L"Segoe Fluent Icons" : L"Segoe MDL2 Assets";
+    }();
+    return font;
+}
+
+D2D1_RECT_F RectF(const RECT& r) { return D2D1::RectF(float(r.left), float(r.top), float(r.right), float(r.bottom)); }
+
+// A circular arrow around center, open at the top, with its head at the top pointing back (dir -1) or forward.
+void DrawReplayArrow(ID2D1DeviceContext* dc, D2D1_POINT_2F center, float radius, float stroke, int dir) {
+    const float m = float(-dir), x = center.x, y = center.y - radius, head = stroke * 2;
+    ComPtr<ID2D1PathGeometry> path;
+    ComPtr<ID2D1GeometrySink> sink;
+    if (FAILED(g.factory->CreatePathGeometry(&path)) || FAILED(path->Open(&sink))) return;
+    sink->BeginFigure({x, y}, D2D1_FIGURE_BEGIN_HOLLOW);
+    sink->AddArc(D2D1::ArcSegment({x - m * radius * 0.866f, center.y - radius * 0.5f}, {radius, radius}, 0,
+                                  m > 0 ? D2D1_SWEEP_DIRECTION_CLOCKWISE : D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
+                                  D2D1_ARC_SIZE_LARGE));
+    sink->EndFigure(D2D1_FIGURE_END_OPEN);
+    sink->BeginFigure({x - m * head, y}, D2D1_FIGURE_BEGIN_FILLED);
+    const D2D1_POINT_2F base[] = {{x + m * head * 0.5f, y - head}, {x + m * head * 0.5f, y + head}};
+    sink->AddLines(base, 2);
+    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+    if (FAILED(sink->Close())) return;
+    dc->DrawGeometry(path.Get(), g.brush.Get(), stroke, g.round.Get());
+    dc->FillGeometry(path.Get(), g.brush.Get());
+}
+
 // Creates a w x h surface and draws into it with draw(context, transform to the surface's pixels).
 template <typename Draw>
 ComPtr<IDCompositionSurface> Paint(IDCompositionDevice* dcomp, UINT w, UINT h, Draw draw) {
@@ -206,37 +256,82 @@ void DrawBar(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT width
              const std::vector<BarItem>& items) {
     visual->SetContent(nullptr);
     if (width == 0 || height == 0 || !Init()) return;
-    ComPtr<IDWriteTextFormat> text, icons;
-    HRESULT hr = g.dwrite->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-                                            DWRITE_FONT_STRETCH_NORMAL, 12 * scale, L"", &text);
-    if (SUCCEEDED(hr)) {
-        hr = g.dwrite->CreateTextFormat(L"Segoe MDL2 Assets", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
-                                        DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 16 * scale, L"", &icons);
-    }
-    if (FAILED(hr)) return;
-    text->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    icons->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    icons->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    const ComPtr<IDWriteTextFormat> text = CreateFormat(L"Segoe UI", 12 * scale, false, DWRITE_TEXT_ALIGNMENT_CENTER);
+    if (!text) return;
 
-    const float h = float(height), inset = std::round(3 * scale), radius = 4 * scale;
+    const float inset = std::round(3 * scale), radius = 4 * scale;
     const ComPtr<IDCompositionSurface> surface = Paint(dcomp, width, height, [&](ID2D1DeviceContext* dc,
                                                                                  const D2D1_MATRIX_3X2_F&) {
         dc->Clear(D2D1::ColorF(0x202020));  // the dark title bar's color
         dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         for (const BarItem& item : items) {
-            const D2D1_RECT_F r = D2D1::RectF(item.x, 0, item.x + item.width, h);
+            const D2D1_RECT_F r = RectF(item.rect);
             if (item.hot) {
                 g.brush->SetColor(D2D1::ColorF(0x3a3a3a));
                 dc->FillRoundedRectangle(
-                    D2D1::RoundedRect(D2D1::RectF(r.left, inset, r.right, h - inset), radius, radius), g.brush.Get());
-            }
-            IDWriteTextFormat* format = item.icon ? icons.Get() : text.Get();
-            if (!item.icon) {
-                format->SetTextAlignment(item.label ? DWRITE_TEXT_ALIGNMENT_LEADING : DWRITE_TEXT_ALIGNMENT_CENTER);
+                    D2D1::RoundedRect(D2D1::RectF(r.left, r.top + inset, r.right, r.bottom - inset), radius, radius),
+                    g.brush.Get());
             }
             g.brush->SetColor(D2D1::ColorF(item.dim ? 0x707070 : 0xffffff));
-            dc->DrawText(item.text.data(), UINT32(item.text.size()), format, r, g.brush.Get(),
+            dc->DrawText(item.text.data(), UINT32(item.text.size()), text.Get(), r, g.brush.Get(),
                          D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+    });
+    visual->SetContent(surface.Get());
+}
+
+void DrawControls(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT width, UINT height, float scale,
+                  const Controls& c) {
+    visual->SetContent(nullptr);
+    if (width == 0 || height == 0 || !Init()) return;
+    const auto time = CreateFormat(L"Segoe UI", 13 * scale, false, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    const auto title = CreateFormat(L"Segoe UI", 15 * scale, true, DWRITE_TEXT_ALIGNMENT_CENTER);
+    const auto icons = CreateFormat(IconFont(), 24 * scale, false, DWRITE_TEXT_ALIGNMENT_CENTER);
+    const auto number = CreateFormat(L"Segoe UI", 9 * scale, true, DWRITE_TEXT_ALIGNMENT_CENTER);
+    ComPtr<IDWriteInlineObject> ellipsis;
+    if (!time || !title || !icons || !number || FAILED(g.dwrite->CreateEllipsisTrimmingSign(title.Get(), &ellipsis))) {
+        return;
+    }
+    const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
+    title->SetTrimming(&trimming, ellipsis.Get());
+
+    const ComPtr<IDCompositionSurface> surface = Paint(dcomp, width, height, [&](ID2D1DeviceContext* dc,
+                                                                                 const D2D1_MATRIX_3X2_F& base) {
+        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+        dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        const D2D1_GRADIENT_STOP stops[] = {
+            {0, D2D1::ColorF(0, 0, 0, 0)}, {0.5f, D2D1::ColorF(0, 0, 0, 0.5f)}, {1, D2D1::ColorF(0, 0, 0, 0.85f)}};
+        ComPtr<ID2D1GradientStopCollection> collection;
+        ComPtr<ID2D1LinearGradientBrush> shade;
+        if (SUCCEEDED(dc->CreateGradientStopCollection(stops, UINT32(std::size(stops)), &collection)) &&
+            SUCCEEDED(dc->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties({0, 0}, {0, float(height)}),
+                                                    collection.Get(), &shade))) {
+            dc->FillRectangle(D2D1::RectF(0, 0, float(width), float(height)), shade.Get());
+        }
+
+        // The rest of the track, the played part and the knob.
+        const D2D1_RECT_F seek = RectF(c.seekBar);
+        const float y = (seek.top + seek.bottom) / 2, half = (c.seekHot ? 3 : 2) * scale;
+        const float x = seek.left + float(c.progress) * (seek.right - seek.left), knob = (c.seekHot ? 8 : 6) * scale;
+        g.brush->SetColor(D2D1::ColorF(1, 1, 1, 0.35f));
+        dc->FillRectangle(D2D1::RectF(x, y - half, seek.right, y + half), g.brush.Get());
+        g.brush->SetColor(D2D1::ColorF(0xe50914));
+        dc->FillRectangle(D2D1::RectF(seek.left, y - half, x, y + half), g.brush.Get());
+        dc->FillEllipse(D2D1::Ellipse({x, y}, knob, knob), g.brush.Get());
+
+        g.brush->SetColor(D2D1::ColorF(0xffffff));
+        dc->DrawText(c.time.data(), UINT32(c.time.size()), time.Get(), RectF(c.timeRect), g.brush.Get(),
+                     D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        dc->DrawText(c.title.data(), UINT32(c.title.size()), title.Get(), RectF(c.titleRect), g.brush.Get(),
+                     D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        for (const BarItem& item : c.buttons) {
+            const D2D1_RECT_F r = RectF(item.rect);
+            const D2D1_POINT_2F center{(r.left + r.right) / 2, (r.top + r.bottom) / 2};
+            dc->SetTransform(item.hot ? D2D1::Matrix3x2F::Scale(1.2f, 1.2f, center) * base : base);
+            g.brush->SetColor(D2D1::ColorF(item.dim ? 0x808080 : 0xffffff));
+            if (item.replay) DrawReplayArrow(dc, center, 11 * scale, 2 * scale, item.replay);
+            dc->DrawText(item.text.data(), UINT32(item.text.size()), item.replay ? number.Get() : icons.Get(), r,
+                         g.brush.Get());
         }
     });
     visual->SetContent(surface.Get());

@@ -12,6 +12,6 @@ constexpr wchar_t kFileFilter[] =
 constexpr double kSeekStep = 5.0;     // seconds
 constexpr double kVolumeStep = 0.05;  // of full volume
 constexpr UINT kOsdMs = 1500;          // how long seek / volume feedback stays up
-constexpr UINT kCursorHideMs = 2000;   // idle time before the cursor hides in fullscreen
+constexpr UINT kIdleMs = 2500;         // idle time before the controls and cursor hide while playing
 constexpr LONGLONG kMaxSubtitleBytes = 16 << 20;
 constexpr size_t kMaxCueChars = 2048;
