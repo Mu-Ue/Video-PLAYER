@@ -388,14 +388,9 @@ void Layout() {
         g.videoRect = {x, y, x + s.cx, y + s.cy};
         g.video->SetTransform(D2D_MATRIX_3X2_F{float(s.cx) / chain.cx, 0, 0, float(s.cy) / chain.cy, float(x),
                                                float(y)});
-        // The swap chain exists once the engine has a size for it.
+        // The swap chain exists once it has a size.
         if (!g.attached) {
-            if (const HANDLE surface = VideoSurface()) {
-                ComPtr<IUnknown> content;
-                g.attached = SUCCEEDED(g.dcomp->CreateSurfaceFromHandle(surface, &content));
-                if (g.attached) g.video->SetContent(content.Get());
-                CloseHandle(surface);
-            }
+            if (IUnknown* swapChain = VideoSwapChain()) g.attached = SUCCEEDED(g.video->SetContent(swapChain));
         }
     } else {
         g.videoRect = {0, top, cw, top + ah};

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <windows.h>
+#include <unknwn.h>
 
 #include <string>
 
@@ -8,8 +9,9 @@
 // parameter (the MF_MEDIA_ENGINE_ERR code for an error).
 constexpr UINT WM_APP_MEDIA = WM_APP + 1;
 
-// Creates a GPU device of its own and Media Foundation's media engine, which decodes on the GPU and presents
-// frames itself, at the right time, into a swap chain for DirectComposition. Its events are posted to hwnd.
+// Creates a GPU device of its own, Media Foundation's media engine, which decodes on the GPU, and a thread that
+// presents each new frame into a swap chain for DirectComposition, once per compositor frame. The engine's events
+// are posted to hwnd.
 bool InitPlayer(HWND hwnd);
 void ShutdownPlayer();
 
@@ -19,9 +21,8 @@ bool HasVideo();
 SIZE VideoSize();  // display size in pixels, or 0 x 0
 // Sizes the video's swap chain; the first call creates it.
 void SetVideoSize(int width, int height);
-// A new handle to the swap chain, for IDCompositionDevice::CreateSurfaceFromHandle, or null before SetVideoSize.
-// The caller closes it.
-HANDLE VideoSurface();
+// The swap chain, as content for a DirectComposition visual, or null before SetVideoSize.
+IUnknown* VideoSwapChain();
 
 bool IsPlaying();
 void SetPlaying(bool playing);  // playing from the start if it has ended
