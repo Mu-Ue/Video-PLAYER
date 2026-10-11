@@ -7,6 +7,7 @@
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <mfapi.h>
+#include <mfidl.h>
 #include <mfmediaengine.h>
 #include <wrl/client.h>
 
@@ -47,6 +48,9 @@ struct {
     ComPtr<ID3D10Multithread> multithread;
     ComPtr<IMFDXGIDeviceManager> manager;
     ComPtr<IMFMediaEngineEx> engine;
+    // A second parser of the open file, which knows where its key frames are; null if the format doesn't say.
+    ComPtr<IMFMediaSource> keySource;
+    ComPtr<IMFSeekInfo> keyFrames;
     bool started = false;  // MFStartup succeeded
     // The video's swap chain, guarded by lock: the render thread presents into it, the window thread sizes it.
     SRWLOCK lock = SRWLOCK_INIT;
@@ -141,6 +145,48 @@ void RenderLoop() {
     if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
 }
 
+void CloseKeyFrames() {
+    g.keyFrames.Reset();
+    if (g.keySource) g.keySource->Shutdown();
+    g.keySource.Reset();
+}
+
+void OpenKeyFrames(const std::wstring& path) {
+    CloseKeyFrames();
+    ComPtr<IMFByteStream> stream;
+    ComPtr<IMFSourceResolver> resolver;
+    MF_OBJECT_TYPE type;
+    ComPtr<IUnknown> object;
+    ComPtr<IMFGetService> service;
+    if (FAILED(MFCreateFile(MF_ACCESSMODE_READ, MF_OPENMODE_FAIL_IF_NOT_EXIST, MF_FILEFLAGS_NONE, path.c_str(),
+                            &stream)) ||
+        FAILED(MFCreateSourceResolver(&resolver)) ||
+        FAILED(resolver->CreateObjectFromByteStream(stream.Get(), path.c_str(),
+                                                    MF_RESOLUTION_MEDIASOURCE | MF_RESOLUTION_READ, nullptr, &type,
+                                                    &object)) ||
+        FAILED(object.As(&g.keySource))) {
+        return;
+    }
+    if (FAILED(g.keySource.As(&service)) ||
+        FAILED(service->GetService(MF_SCRUBBING_SERVICE, IID_PPV_ARGS(&g.keyFrames)))) {
+        CloseKeyFrames();
+    }
+}
+
+// The key frame nearest to a time, in seconds, or the time itself if unknown.
+double NearestKeyFrame(double seconds) {
+    if (!g.keyFrames) return seconds;
+    PROPVARIANT start{}, before{}, after{};  // 100 ns units, which need no clearing
+    start.vt = VT_I8;
+    start.hVal.QuadPart = LONGLONG(seconds * 1e7);
+    if (SUCCEEDED(g.keyFrames->GetNearestKeyFrames(&GUID_NULL, &start, &before, &after)) && before.vt == VT_I8 &&
+        after.vt == VT_I8) {
+        const double a = before.hVal.QuadPart / 1e7, b = after.hVal.QuadPart / 1e7;
+        seconds = seconds - a <= b - seconds ? a : b;
+    }
+    return seconds;
+}
+
 }  // namespace
 
 bool InitPlayer(HWND hwnd) {
@@ -160,6 +206,7 @@ void ShutdownPlayer() {
         g.renderer.join();
     }
     g.chain.Reset();
+    CloseKeyFrames();
     if (g.engine) g.engine->Shutdown();
     g.engine.Reset();
     g.manager.Reset();
@@ -179,6 +226,7 @@ HRESULT OpenVideo(const std::wstring& path) {
     SysFreeString(name);
     g.redraw = true;  // the first frame, even if it never plays
     if (SUCCEEDED(hr)) hr = g.engine->Play();
+    if (SUCCEEDED(hr)) OpenKeyFrames(path);
     return hr;
 }
 
@@ -245,6 +293,12 @@ double PlaybackTime() { return g.engine ? g.engine->GetCurrentTime() : 0; }
 double Duration() { return g.engine ? g.engine->GetDuration() : NAN; }
 
 void SeekTo(double seconds, bool fast) {
+    // The engine's approximate seek still decodes from a key frame up to near the target, a frame at a time,
+    // so a fast seek goes exactly to a key frame instead (just past it, so rounding can't land a frame early).
+    if (fast && g.keyFrames) {
+        g.engine->SetCurrentTimeEx(NearestKeyFrame(seconds) + 0.0005, MF_MEDIA_ENGINE_SEEK_MODE_NORMAL);
+        return;
+    }
     g.engine->SetCurrentTimeEx(seconds,
                                fast ? MF_MEDIA_ENGINE_SEEK_MODE_APPROXIMATE : MF_MEDIA_ENGINE_SEEK_MODE_NORMAL);
 }
