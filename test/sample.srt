@@ -1,0 +1,65 @@
+1
+00:00:00,500 --> 00:00:03,000
+Welcome to Video VIEWER.
+
+2
+00:00:03,500 --> 00:00:07,000
+This is a sample subtitle file
+spread over two lines.
+
+3
+00:00:07,500 --> 00:00:09,000
+Short cue.
+
+4
+00:00:09,200 --> 00:00:10,400
+Another short one.
+
+5
+00:00:11,000 --> 00:00:15,500
+<i>This line is in italics.</i>
+
+6
+00:00:16,000 --> 00:00:19,000
+<b>This line is bold</b>, and this part isn't.
+
+7
+00:00:19,500 --> 00:00:24,000
+{\an8}This cue shows at the top of the video.
+
+8
+00:00:20,000 --> 00:00:23,000
+While this one shows at the bottom.
+
+9
+00:00:25,000 --> 00:00:30,000
+First of two overlapping cues...
+
+10
+00:00:27,000 --> 00:00:32,000
+...and the second, stacked below it.
+
+11
+00:00:33,000 --> 00:00:36,000
+Non-ASCII text: café, Grüße, 日本語.
+
+12
+00:00:37,000 --> 00:00:40,500
+- Did you hear that?
+- <i>Hear what?</i>
+
+13
+00:00:42,000 --> 00:00:46,000
+A cue after a gap of a second and a half.
+
+14
+00:00:46,500 --> 00:00:50,000
+Mixed <b>bold</b> and <i>italic</i> words in one line.
+
+15
+00:00:51,000 --> 00:00:55,000
+A long line that is wide enough that it should wrap onto a second line on most window sizes.
+
+16
+00:00:56,000 --> 00:01:00,000
+The end. Subtitles stop here at one minute.
