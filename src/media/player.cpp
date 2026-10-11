@@ -155,13 +155,21 @@ double PlaybackTime() { return g.engine ? g.engine->GetCurrentTime() : 0; }
 
 double Duration() { return g.engine ? g.engine->GetDuration() : NAN; }
 
-double SeekBy(double seconds) {
-    double target = std::max(0.0, g.engine->GetCurrentTime() + seconds);  // the pending target while seeking
+double SeekTo(double seconds, bool fast) {
+    double target = std::max(0.0, seconds);
     const double duration = g.engine->GetDuration();
     if (std::isfinite(duration)) target = std::min(target, duration);
-    g.engine->SetCurrentTimeEx(target, MF_MEDIA_ENGINE_SEEK_MODE_NORMAL);
+    g.engine->SetCurrentTimeEx(target,
+                               fast ? MF_MEDIA_ENGINE_SEEK_MODE_APPROXIMATE : MF_MEDIA_ENGINE_SEEK_MODE_NORMAL);
     return target;
 }
+
+// GetCurrentTime is the pending target while seeking.
+double SeekBy(double seconds) { return SeekTo(g.engine->GetCurrentTime() + seconds); }
+
+double Volume() { return g.engine ? g.engine->GetVolume() : 1; }
+
+bool IsMuted() { return g.engine && g.engine->GetMuted(); }
 
 double ChangeVolume(double delta) {
     const double volume = std::clamp(std::round((g.engine->GetVolume() + delta) * 100) / 100, 0.0, 1.0);

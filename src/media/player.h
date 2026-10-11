@@ -38,8 +38,12 @@ bool IsPlaying();
 void TogglePlay();
 double PlaybackTime();  // seconds
 double Duration();      // seconds; NaN if unknown
-// Seeks by seconds from the current position, staying within the video, and returns the target time.
+// Seeks to a time or by seconds from the current position, staying within the video, and returns the target
+// time. A fast seek lands on the nearest key frame, for dragging along the seek bar.
+double SeekTo(double seconds, bool fast = false);
 double SeekBy(double seconds);
+double Volume();  // 0..1
+bool IsMuted();
 // Changes the volume by delta (0..1 scale), unmuting when raising it, and returns the new volume.
 double ChangeVolume(double delta);
 bool ToggleMute();  // returns true if now muted
