@@ -122,6 +122,40 @@ ComPtr<IDWriteTextLayout> CreateLayout(std::wstring_view text, const std::vector
     return layout;
 }
 
+// Creates a w x h surface and draws into it with draw(context, transform to the surface's pixels).
+template <typename Draw>
+ComPtr<IDCompositionSurface> Paint(IDCompositionDevice* dcomp, UINT w, UINT h, Draw draw) {
+    ComPtr<IDCompositionSurface> surface;
+    if (FAILED(dcomp->CreateSurface(w, h, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_ALPHA_MODE_PREMULTIPLIED, &surface))) {
+        return nullptr;
+    }
+    DeviceLock lock;
+    // The surface may be part of a larger shared texture, at offset.
+    POINT offset;
+    ComPtr<IDXGISurface> target;
+    if (FAILED(surface->BeginDraw(nullptr, IID_PPV_ARGS(&target), &offset))) return nullptr;
+    const D2D1_BITMAP_PROPERTIES1 props =
+        D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    ComPtr<ID2D1Bitmap1> bitmap;
+    const bool drawn = SUCCEEDED(g.context->CreateBitmapFromDxgiSurface(target.Get(), &props, &bitmap));
+    if (drawn) {
+        ID2D1DeviceContext* dc = g.context.Get();
+        dc->SetTarget(bitmap.Get());
+        dc->BeginDraw();
+        const D2D1_MATRIX_3X2_F base = D2D1::Matrix3x2F::Translation(float(offset.x), float(offset.y));
+        dc->SetTransform(base);
+        dc->PushAxisAlignedClip(D2D1::RectF(0, 0, float(w), float(h)), D2D1_ANTIALIAS_MODE_ALIASED);
+        draw(dc, base);
+        dc->SetTransform(base);
+        dc->PopAxisAlignedClip();
+        dc->EndDraw();
+        dc->SetTarget(nullptr);
+    }
+    surface->EndDraw();
+    return drawn ? surface : nullptr;
+}
+
 }  // namespace
 
 SIZE DrawOutlinedText(IDCompositionDevice* dcomp, IDCompositionVisual* visual, std::wstring_view text,
@@ -141,54 +175,29 @@ SIZE DrawOutlinedText(IDCompositionDevice* dcomp, IDCompositionVisual* visual, s
     const float right = std::max(m.left + m.width, maxWidth + o.right), bottom = std::max(m.top + m.height, o.bottom);
     const UINT w = UINT(std::ceil(right - left + 2 * pad)), h = UINT(std::ceil(bottom - top + 2 * pad));
 
-    ComPtr<IDCompositionSurface> surface;
-    if (FAILED(dcomp->CreateSurface(w, h, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_ALPHA_MODE_PREMULTIPLIED, &surface))) {
-        return {};
-    }
     g.runs.clear();
     if (FAILED(layout->Draw(nullptr, &collector, pad - left, pad - top))) return {};
-
-    {
-        DeviceLock lock;
-        // The surface may be part of a larger shared texture, at offset.
-        POINT offset;
-        ComPtr<IDXGISurface> target;
-        if (FAILED(surface->BeginDraw(nullptr, IID_PPV_ARGS(&target), &offset))) return {};
-        const D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
-            D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-        ComPtr<ID2D1Bitmap1> bitmap;
-        if (SUCCEEDED(g.context->CreateBitmapFromDxgiSurface(target.Get(), &props, &bitmap))) {
-            ID2D1DeviceContext* dc = g.context.Get();
-            dc->SetTarget(bitmap.Get());
-            dc->BeginDraw();
-            const D2D1_MATRIX_3X2_F base = D2D1::Matrix3x2F::Translation(float(offset.x), float(offset.y));
-            dc->SetTransform(base);
-            dc->PushAxisAlignedClip(D2D1::RectF(0, 0, float(w), float(h)), D2D1_ANTIALIAS_MODE_ALIASED);
-            dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-            // A wide faint halo, a solid outline, then the white fill.
-            const struct {
-                float alpha, width;
-            } passes[] = {{0.35f, stroke * 2.2f}, {0.9f, stroke}, {1, 0}};
-            for (const auto& pass : passes) {
-                g.brush->SetColor(pass.width > 0 ? D2D1::ColorF(0, 0, 0, pass.alpha) : D2D1::ColorF(1, 1, 1, 1));
-                for (const Run& r : g.runs) {
-                    dc->SetTransform(D2D1::Matrix3x2F::Translation(r.origin.x, r.origin.y) * base);
-                    if (pass.width > 0) {
-                        dc->DrawGeometry(r.outline.Get(), g.brush.Get(), pass.width, g.round.Get());
-                    } else {
-                        dc->FillGeometry(r.outline.Get(), g.brush.Get());
-                    }
+    const ComPtr<IDCompositionSurface> surface = Paint(dcomp, w, h, [&](ID2D1DeviceContext* dc,
+                                                                        const D2D1_MATRIX_3X2_F& base) {
+        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+        // A wide faint halo, a solid outline, then the white fill.
+        const struct {
+            float alpha, width;
+        } passes[] = {{0.35f, stroke * 2.2f}, {0.9f, stroke}, {1, 0}};
+        for (const auto& pass : passes) {
+            g.brush->SetColor(pass.width > 0 ? D2D1::ColorF(0, 0, 0, pass.alpha) : D2D1::ColorF(1, 1, 1, 1));
+            for (const Run& r : g.runs) {
+                dc->SetTransform(D2D1::Matrix3x2F::Translation(r.origin.x, r.origin.y) * base);
+                if (pass.width > 0) {
+                    dc->DrawGeometry(r.outline.Get(), g.brush.Get(), pass.width, g.round.Get());
+                } else {
+                    dc->FillGeometry(r.outline.Get(), g.brush.Get());
                 }
             }
-            dc->SetTransform(base);
-            dc->PopAxisAlignedClip();
-            dc->EndDraw();
-            dc->SetTarget(nullptr);
         }
-        surface->EndDraw();
-    }
+    });
     g.runs.clear();
+    if (!surface) return {};
     visual->SetContent(surface.Get());
     return {LONG(w), LONG(h)};
 }
