@@ -41,7 +41,7 @@ struct Window {
     ComPtr<IDCompositionEffectGroup> controlsFade;
     ComPtr<IDXGISwapChain1> black;  // 8 x 8, stretched over the window
     bool attached = false;          // the engine's swap chain is the content of `video`
-    SIZE videoSize{};               // swap chain size
+    SIZE videoSize{};               // swap chain size: the video fitted to the monitor
     RECT videoRect{};               // where the video is, in client pixels
 
     bool sized = false;  // the window has been sized to a video
@@ -329,7 +329,15 @@ void HideOsd() {
     g.dcomp->Commit();
 }
 
-// Fits the video below the menu bar, keeping its aspect ratio; the engine scales it on the GPU.
+// v scaled to fit w x h, keeping its aspect ratio.
+SIZE Fit(SIZE v, int w, int h) {
+    const double scale = std::min(double(w) / v.cx, double(h) / v.cy);
+    return {std::max(1L, LONG(std::lround(v.cx * scale))), std::max(1L, LONG(std::lround(v.cy * scale)))};
+}
+
+// Fits the video below the menu bar, keeping its aspect ratio. The engine renders it at the size it fills the
+// monitor at, which only changes with the video or the monitor, and composition scales that to the window, so
+// resizing and fullscreen take effect in the same frame as the window, with no wait on the engine.
 void Layout() {
     RECT client;
     GetClientRect(g.hwnd, &client);
@@ -342,16 +350,18 @@ void Layout() {
 
     const SIZE v = VideoSize();
     if (v.cx > 0 && v.cy > 0) {
-        const double scale = std::min(double(cw) / v.cx, double(ah) / v.cy);
-        const int w = std::max(1, int(std::lround(v.cx * scale))), h = std::max(1, int(std::lround(v.cy * scale)));
-        const int x = (cw - w) / 2, y = top + (ah - h) / 2;
-        if (w != g.videoSize.cx || h != g.videoSize.cy || !g.attached) {
-            SetVideoSize(w, h);
-            g.videoSize = {w, h};
+        MONITORINFO mi{sizeof(mi)};
+        GetMonitorInfoW(MonitorFromWindow(g.hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+        const SIZE chain = Fit(v, mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top);
+        if (chain.cx != g.videoSize.cx || chain.cy != g.videoSize.cy || !g.attached) {
+            SetVideoSize(chain.cx, chain.cy);
+            g.videoSize = chain;
         }
-        g.videoRect = {x, y, x + w, y + h};
-        g.video->SetOffsetX(float(x));
-        g.video->SetOffsetY(float(y));
+        const SIZE s = Fit(v, cw, ah);
+        const int x = (cw - s.cx) / 2, y = top + (ah - s.cy) / 2;
+        g.videoRect = {x, y, x + s.cx, y + s.cy};
+        g.video->SetTransform(D2D_MATRIX_3X2_F{float(s.cx) / chain.cx, 0, 0, float(s.cy) / chain.cy, float(x),
+                                               float(y)});
         // The swap chain exists once the engine has a size for it.
         if (!g.attached) {
             if (const HANDLE surface = VideoSurface()) {
@@ -674,6 +684,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_SIZE:
             if (wp != SIZE_MINIMIZED && g.dcomp) Layout();
             return 0;
+        case WM_EXITSIZEMOVE:  // it may be on another monitor now
+        case WM_DISPLAYCHANGE:
+            if (!IsIconic(hwnd) && g.dcomp) Layout();
+            return 0;
         case WM_TIMER:
             switch (wp) {
                 case kSubtitleTimer: UpdateSubtitles(false); break;
@@ -815,6 +829,7 @@ bool InitComposition() {
         g.background->SetContent(g.black.Get());
         g.background->SetBitmapInterpolationMode(DCOMPOSITION_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
         g.background->SetBorderMode(DCOMPOSITION_BORDER_MODE_HARD);
+        g.video->SetBitmapInterpolationMode(DCOMPOSITION_BITMAP_INTERPOLATION_MODE_LINEAR);
         SetOverlayDevice(device);
     }
     return SUCCEEDED(hr);
