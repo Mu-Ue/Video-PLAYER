@@ -338,16 +338,12 @@ void DrawOsd() {
     g.osd->SetOffsetY(float(MenuBarHeight()) + margin);
 }
 
-// Shows text in the top left for a moment, or until replaced if it stays.
-void ShowOsd(std::wstring text, bool stays = false) {
+// Shows text in the top left for a moment.
+void ShowOsd(std::wstring text) {
     g.osdText = std::move(text);
     DrawOsd();
     g.dcomp->Commit();
-    if (stays) {
-        KillTimer(g.hwnd, kOsdTimer);
-    } else {
-        SetTimer(g.hwnd, kOsdTimer, kOsdMs, nullptr);
-    }
+    SetTimer(g.hwnd, kOsdTimer, kOsdMs, nullptr);
 }
 
 void HideOsd() {
@@ -956,7 +952,6 @@ bool StartPlayer(HINSTANCE instance, const std::vector<std::wstring>& files, int
     if (std::none_of(files.begin(), files.end(), [](const std::wstring& f) { return !IsSubtitleFile(f); })) {
         ShowMainWindow();
         Layout();
-        ShowOsd(L"Drop a video here or press Ctrl+O", true);
         return true;
     }
     if (!OpenFiles(files)) return false;
