@@ -67,6 +67,9 @@ struct Window {
     // One seek at a time is in flight; the latest one asked for meanwhile waits for it to finish.
     bool seekBusy = false, seekQueued = false, seekFast = false;
     double seekTarget = 0;  // of the latest seek
+    // A key frame seek by a step, from seekFrom: redone exactly if it lands on the wrong side of seekFrom.
+    bool seekCheck = false;
+    double seekFrom = 0;
     bool tracking = false;  // for WM_MOUSELEAVE
 
     bool fullscreen = false;
@@ -469,7 +472,7 @@ bool OpenVideoFile(const std::wstring& path) {
     }
     // Seeks and subtitles belong to the video they were for.
     g.duration = NAN;
-    g.seekBusy = g.seekQueued = false;
+    g.seekBusy = g.seekQueued = g.seekCheck = false;
     g.subs = {};
     UpdateSubtitles(false);
     HideOsd();
@@ -539,18 +542,30 @@ double RequestSeek(double seconds, bool fast) {
     return g.seekTarget;
 }
 
-// A seek finished: start the waiting one, if any.
+// A seek finished: start the waiting one, if any, or redo a step that went the wrong way, which a long gap
+// between key frames can cause.
 void OnSeeked() {
     if (g.seekQueued) {
         g.seekQueued = false;
         SeekTo(g.seekTarget, g.seekFast);
-    } else {
-        g.seekBusy = false;
+        return;
     }
+    if (g.seekCheck) {
+        g.seekCheck = false;
+        const double landed = PlaybackTime();
+        if (g.seekTarget > g.seekFrom ? landed <= g.seekFrom : landed >= g.seekFrom) {
+            SeekTo(g.seekTarget, false);
+            return;
+        }
+    }
+    g.seekBusy = false;
 }
 
+// Steps by key frame, which shows at once; an exact seek would first decode up to the target.
 void Seek(double seconds) {
-    const double target = RequestSeek(ShownTime() + seconds, false);
+    g.seekFrom = ShownTime();
+    g.seekCheck = true;
+    const double target = RequestSeek(g.seekFrom + seconds, true);
     ShowOsd(FormatTime(target) + L" / " + FormatTime(g.duration));
 }
 
@@ -579,6 +594,7 @@ void SeekToX(int x, bool fast) {
     const RECT r = ControlRect(kSeek);
     const double duration = g.duration;
     if (!(duration > 0)) return;
+    g.seekCheck = false;
     RequestSeek(std::clamp(double(x - r.left) / std::max(1L, r.right - r.left), 0.0, 1.0) * duration, fast);
 }
 
@@ -675,7 +691,7 @@ void OnMediaEvent(WPARAM event, LPARAM param) {
             UpdateControls();
             break;
         case MF_MEDIA_ENGINE_EVENT_ERROR: {
-            g.playing = g.seekBusy = g.seekQueued = false;
+            g.playing = g.seekBusy = g.seekQueued = g.seekCheck = false;
             SetThreadExecutionState(ES_CONTINUOUS);
             // The video given on the command line failed before the window showed: like a failed start, close.
             const bool starting = !IsWindowVisible(g.hwnd);

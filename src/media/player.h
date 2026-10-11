@@ -29,7 +29,7 @@ void SetPlaying(bool playing);  // playing from the start if it has ended
 double PlaybackTime();  // seconds
 double Duration();      // seconds; NaN if unknown
 // Starts seeking to a time within the video; SEEKED follows. A fast seek lands on the nearest key frame, for
-// dragging along the seek bar.
+// dragging along the seek bar and stepping.
 void SeekTo(double seconds, bool fast);
 double Volume();  // 0..1
 bool IsMuted();
