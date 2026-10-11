@@ -527,7 +527,7 @@ void ShowFileMenu() {
     }
 }
 
-// Seeks to a time within the video and returns it. While a seek is in flight the new one waits, replacing any
+// Seeks to a time within the video and returns it; the caller shows it. While a seek is in flight the new one waits, replacing any
 // that was already waiting, so dragging or holding an arrow key never piles up seeks in the engine.
 double RequestSeek(double seconds, bool fast) {
     g.seekTarget = std::max(0.0, std::isfinite(g.duration) ? std::min(seconds, g.duration) : seconds);
@@ -538,7 +538,6 @@ double RequestSeek(double seconds, bool fast) {
         g.seekBusy = true;
         SeekTo(g.seekTarget, fast);
     }
-    UpdateControls();
     return g.seekTarget;
 }
 
@@ -566,6 +565,7 @@ void Seek(double seconds) {
     g.seekFrom = ShownTime();
     g.seekCheck = true;
     const double target = RequestSeek(g.seekFrom + seconds, true);
+    if (g.controlsShown) DrawControls();  // committed with the OSD
     ShowOsd(FormatTime(target) + L" / " + FormatTime(g.duration));
 }
 
@@ -596,6 +596,7 @@ void SeekToX(int x, bool fast) {
     if (!(duration > 0)) return;
     g.seekCheck = false;
     RequestSeek(std::clamp(double(x - r.left) / std::max(1L, r.right - r.left), 0.0, 1.0) * duration, fast);
+    UpdateControls();
 }
 
 // Switches between the normal window and a borderless one covering its monitor.
