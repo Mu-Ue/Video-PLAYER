@@ -2,6 +2,7 @@
 
 #include <d2d1_1.h>
 #include <d2d1_1helper.h>
+#include <d2d1effects.h>
 #include <d3d11.h>
 #include <dwrite.h>
 #include <wrl/client.h>
@@ -33,6 +34,7 @@ struct {
     ComPtr<ID2D1SolidColorBrush> brush;
     ComPtr<ID2D1LinearGradientBrush> shade;  // under the controls
     ComPtr<ID2D1StrokeStyle> round;
+    ComPtr<ID2D1Effect> shadow;  // under the outlined text
     std::vector<Run> runs;  // of the text being drawn
     std::vector<Target> targets;
     // The text formats of the bars and controls, for one DPI scale.
@@ -114,6 +116,7 @@ bool Init() {
                                                                       D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND),
                                           nullptr, 0, &g.round);
     }
+    if (SUCCEEDED(hr)) hr = g.context->CreateEffect(CLSID_D2D1Shadow, &g.shadow);
     const D2D1_GRADIENT_STOP stops[] = {
         {0, D2D1::ColorF(0, 0, 0, 0)}, {0.5f, D2D1::ColorF(0, 0, 0, 0.5f)}, {1, D2D1::ColorF(0, 0, 0, 0.85f)}};
     ComPtr<ID2D1GradientStopCollection> collection;
@@ -126,11 +129,25 @@ bool Init() {
     return SUCCEEDED(hr);
 }
 
+bool IsFontInstalled(const wchar_t* family) {
+    ComPtr<IDWriteFontCollection> fonts;
+    UINT32 index;
+    BOOL found = FALSE;
+    if (SUCCEEDED(g.dwrite->GetSystemFontCollection(&fonts))) fonts->FindFamilyName(family, &index, &found);
+    return found;
+}
+
+// Netflix's subtitle font if installed, else the closest one Windows has.
+const wchar_t* SubtitleFont() {
+    static const wchar_t* const font = IsFontInstalled(L"Netflix Sans") ? L"Netflix Sans" : L"Segoe UI";
+    return font;
+}
+
 ComPtr<IDWriteTextLayout> CreateLayout(std::wstring_view text, const std::vector<StyleSpan>& spans, float fontSize,
                                        float maxWidth, bool center) {
     if (!g.text || g.textSize != fontSize) {
         g.text.Reset();
-        if (FAILED(g.dwrite->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+        if (FAILED(g.dwrite->CreateTextFormat(SubtitleFont(), nullptr, DWRITE_FONT_WEIGHT_BOLD,
                                               DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, fontSize, L"",
                                               &g.text))) {
             return nullptr;
@@ -145,7 +162,7 @@ ComPtr<IDWriteTextLayout> CreateLayout(std::wstring_view text, const std::vector
     for (const StyleSpan& s : spans) {
         const DWRITE_TEXT_RANGE range{s.start, s.length};
         if (s.italic) layout->SetFontStyle(DWRITE_FONT_STYLE_ITALIC, range);
-        if (s.bold) layout->SetFontWeight(DWRITE_FONT_WEIGHT_BOLD, range);
+        if (s.bold) layout->SetFontWeight(DWRITE_FONT_WEIGHT_BLACK, range);
     }
     return layout;
 }
@@ -166,15 +183,8 @@ ComPtr<IDWriteTextFormat> CreateFormat(const wchar_t* family, float size, bool b
 
 // Windows 11's icon font, or Windows 10's, which has the same code points.
 const wchar_t* IconFont() {
-    static const wchar_t* const font = [] {
-        ComPtr<IDWriteFontCollection> fonts;
-        UINT32 index;
-        BOOL found = FALSE;
-        if (SUCCEEDED(g.dwrite->GetSystemFontCollection(&fonts))) {
-            fonts->FindFamilyName(L"Segoe Fluent Icons", &index, &found);
-        }
-        return found ? L"Segoe Fluent Icons" : L"Segoe MDL2 Assets";
-    }();
+    static const wchar_t* const font =
+        IsFontInstalled(L"Segoe Fluent Icons") ? L"Segoe Fluent Icons" : L"Segoe MDL2 Assets";
     return font;
 }
 
@@ -288,10 +298,11 @@ SIZE DrawOutlinedText(IDCompositionDevice* dcomp, IDCompositionVisual* visual, s
         return {};
     }
 
-    // The ink box (overhangs are relative to the maxWidth x 0 layout box) and the logical box, plus the
-    // outline, which reaches 1.1 stroke widths past the glyphs.
-    const float stroke = std::max(1.5f, fontSize * 0.08f);
-    const float pad = std::ceil(stroke * 1.1f) + 1;
+    // The ink box (overhangs are relative to the maxWidth x 0 layout box) and the logical box, plus the shadow,
+    // which reaches 3 standard deviations of its blur past its offset glyphs.
+    const float stroke = std::max(1.0f, fontSize * 0.03f), blur = std::max(1.5f, fontSize * 0.06f);
+    const float drop = std::round(fontSize * 0.03f);
+    const float pad = std::ceil(blur * 3 + drop) + 1;
     const float left = std::min(m.left, -o.left), top = std::min(m.top, -o.top);
     const float right = std::max(m.left + m.width, maxWidth + o.right), bottom = std::max(m.top + m.height, o.bottom);
     const UINT w = UINT(std::ceil(right - left + 2 * pad)), h = UINT(std::ceil(bottom - top + 2 * pad));
@@ -301,23 +312,44 @@ SIZE DrawOutlinedText(IDCompositionDevice* dcomp, IDCompositionVisual* visual, s
         visual->SetContent(nullptr);
         return {};
     }
-    const bool drawn = Paint(dcomp, visual, w, h, [&](ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F& base) {
-        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-        // A wide faint halo, a solid outline, then the white fill.
-        const struct {
-            float alpha, width;
-        } passes[] = {{0.35f, stroke * 2.2f}, {0.9f, stroke}, {1, 0}};
-        for (const auto& pass : passes) {
-            g.brush->SetColor(pass.width > 0 ? D2D1::ColorF(0, 0, 0, pass.alpha) : D2D1::ColorF(1, 1, 1, 1));
-            for (const Run& r : g.runs) {
-                dc->SetTransform(D2D1::Matrix3x2F::Translation(r.origin.x, r.origin.y) * base);
-                if (pass.width > 0) {
-                    dc->DrawGeometry(r.outline.Get(), g.brush.Get(), pass.width, g.round.Get());
-                } else {
-                    dc->FillGeometry(r.outline.Get(), g.brush.Get());
-                }
+    // Each pass over all runs: the glyphs filled (width 0) or stroked.
+    const auto drawRuns = [&](ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F& base, float width) {
+        for (const Run& r : g.runs) {
+            dc->SetTransform(D2D1::Matrix3x2F::Translation(r.origin.x, r.origin.y) * base);
+            if (width > 0) {
+                dc->DrawGeometry(r.outline.Get(), g.brush.Get(), width, g.round.Get());
+            } else {
+                dc->FillGeometry(r.outline.Get(), g.brush.Get());
             }
         }
+    };
+    // The glyphs' shapes, for the shadow effect to blur.
+    ComPtr<ID2D1CommandList> shapes;
+    ID2D1DeviceContext* context = g.context.Get();
+    if (SUCCEEDED(context->CreateCommandList(&shapes))) {
+        context->SetTarget(shapes.Get());
+        context->BeginDraw();
+        g.brush->SetColor(D2D1::ColorF(0, 0, 0, 1));
+        drawRuns(context, D2D1::Matrix3x2F::Identity(), stroke);
+        drawRuns(context, D2D1::Matrix3x2F::Identity(), 0);
+        if (FAILED(context->EndDraw()) || FAILED(shapes->Close())) shapes.Reset();
+        context->SetTarget(nullptr);
+    }
+    const bool drawn = Paint(dcomp, visual, w, h, [&](ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F& base) {
+        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+        // A soft drop shadow, a faint thin outline that keeps the edges on bright video, then the white fill.
+        if (shapes) {
+            g.shadow->SetInput(0, shapes.Get());
+            g.shadow->SetValue(D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION, blur);
+            g.shadow->SetValue(D2D1_SHADOW_PROP_COLOR, D2D1::Vector4F(0, 0, 0, 0.9f));
+            dc->SetTransform(D2D1::Matrix3x2F::Translation(drop * 0.5f, drop) * base);
+            dc->DrawImage(g.shadow.Get());
+            g.shadow->SetInput(0, nullptr);
+        }
+        g.brush->SetColor(D2D1::ColorF(0, 0, 0, 0.45f));
+        drawRuns(dc, base, stroke);
+        g.brush->SetColor(D2D1::ColorF(1, 1, 1, 1));
+        drawRuns(dc, base, 0);
     });
     g.runs.clear();
     return drawn ? SIZE{LONG(w), LONG(h)} : SIZE{};

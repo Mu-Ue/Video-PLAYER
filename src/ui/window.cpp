@@ -319,7 +319,7 @@ void DrawSubtitles() {
     }
     const RECT& v = g.videoRect;
     const float videoW = float(v.right - v.left);
-    const float fontSize = std::max(12.0f, TextScale() * 0.055f), margin = (v.bottom - v.top) * 0.06f;
+    const float fontSize = std::max(12.0f, TextScale() * 0.05f), margin = (v.bottom - v.top) * 0.06f;
     for (int top = 0; top < 2; ++top) {
         IDCompositionVisual* visual = top ? g.subtitleTop.Get() : g.subtitleBottom.Get();
         const SIZE s = DrawOutlinedText(g.dcomp.Get(), visual, text[top], spans[top], fontSize, videoW * 0.9f, true);
