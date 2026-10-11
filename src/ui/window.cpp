@@ -757,6 +757,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_ERASEBKGND:
             return 1;
+        case WM_NCHITTEST: {  // the menu bar, but for the File button, drags the window like the title bar
+            const LRESULT hit = DefWindowProcW(hwnd, msg, wp, lp);
+            POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            ScreenToClient(hwnd, &pt);
+            const RECT file = ControlRect(kFile);
+            return hit == HTCLIENT && pt.y < MenuBarHeight() && !PtInRect(&file, pt) ? HTCAPTION : hit;
+        }
         case WM_SIZE:
             if (wp != SIZE_MINIMIZED && g.dcomp) Layout();
             return 0;
