@@ -1,5 +1,6 @@
 #include "ui/window.h"
 
+#include <d3d11.h>
 #include <dcomp.h>
 #include <dwmapi.h>
 #include <dxgi1_2.h>
@@ -33,6 +34,7 @@ struct Window {
     int showCmd = SW_SHOWNORMAL;
     // Bottom to top: black background, video, subtitles at the bottom and top, seek / volume feedback, the
     // controls over the bottom of the video, and the menu bar, which the video doesn't overlap.
+    ComPtr<ID3D11Device> device;  // for composition and the overlay
     ComPtr<IDCompositionDevice> dcomp;
     ComPtr<IDCompositionTarget> target;
     ComPtr<IDCompositionVisual> root, background, video, subtitleBottom, subtitleTop, osd, controls, menuBar;
@@ -760,13 +762,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 // The visual tree, and an 8 x 8 black swap chain that is stretched behind the video. The window has no
-// redirection surface, so anything not covered would show through.
+// redirection surface, so anything not covered would show through. The UI draws on a device of its own, so it
+// never waits on, or stalls, the engine's decoding and presenting.
 bool InitComposition() {
-    ID3D11Device* device = GpuDevice();
     ComPtr<IDXGIDevice> dxgi;
     ComPtr<IDXGIAdapter> adapter;
     ComPtr<IDXGIFactory2> factory;
-    HRESULT hr = device->QueryInterface(IID_PPV_ARGS(&dxgi));
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                                   nullptr, 0, D3D11_SDK_VERSION, &g.device, nullptr, nullptr);
+    ID3D11Device* device = g.device.Get();
+    if (SUCCEEDED(hr)) hr = device->QueryInterface(IID_PPV_ARGS(&dxgi));
     if (SUCCEEDED(hr)) hr = DCompositionCreateDevice(dxgi.Get(), IID_PPV_ARGS(&g.dcomp));
     if (SUCCEEDED(hr)) hr = g.dcomp->CreateTargetForHwnd(g.hwnd, TRUE, &g.target);
     if (SUCCEEDED(hr)) hr = g.dcomp->CreateVisual(&g.root);
@@ -794,7 +799,6 @@ bool InitComposition() {
     desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
     if (SUCCEEDED(hr)) hr = factory->CreateSwapChainForComposition(device, &desc, nullptr, &g.black);
     if (SUCCEEDED(hr)) {
-        DeviceLock lock;
         ComPtr<ID3D11Texture2D> buffer;
         ComPtr<ID3D11RenderTargetView> view;
         ComPtr<ID3D11DeviceContext> context;
@@ -811,6 +815,7 @@ bool InitComposition() {
         g.background->SetContent(g.black.Get());
         g.background->SetBitmapInterpolationMode(DCOMPOSITION_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
         g.background->SetBorderMode(DCOMPOSITION_BORDER_MODE_HARD);
+        SetOverlayDevice(device);
     }
     return SUCCEEDED(hr);
 }

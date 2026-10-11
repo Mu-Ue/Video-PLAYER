@@ -1,7 +1,6 @@
 #pragma once
 
 #include <windows.h>
-#include <d3d11.h>
 
 #include <string>
 
@@ -9,20 +8,10 @@
 // parameter (the MF_MEDIA_ENGINE_ERR code for an error).
 constexpr UINT WM_APP_MEDIA = WM_APP + 1;
 
-// Creates the GPU device and Media Foundation's media engine, which decodes on the GPU and presents frames
-// itself, at the right time, into a swap chain for DirectComposition. Its events are posted to hwnd.
+// Creates a GPU device of its own and Media Foundation's media engine, which decodes on the GPU and presents
+// frames itself, at the right time, into a swap chain for DirectComposition. Its events are posted to hwnd.
 bool InitPlayer(HWND hwnd);
 void ShutdownPlayer();
-
-// The device the video is decoded on. Composition and the overlay use it too; its immediate context is shared
-// with the engine's threads, so hold a DeviceLock while using it.
-ID3D11Device* GpuDevice();
-struct DeviceLock {
-    DeviceLock();
-    ~DeviceLock();
-    DeviceLock(const DeviceLock&) = delete;
-    DeviceLock& operator=(const DeviceLock&) = delete;
-};
 
 // Starts loading and playing a local file; the outcome arrives as events. Fails if the file can't be opened.
 HRESULT OpenVideo(const std::wstring& path);

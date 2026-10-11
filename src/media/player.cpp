@@ -3,6 +3,7 @@
 #undef GetCurrentTime  // a 16-bit era winbase.h macro that would rename IMFMediaEngine::GetCurrentTime
 
 #include <audiosessiontypes.h>
+#include <d3d11.h>
 #include <mfapi.h>
 #include <mfmediaengine.h>
 #include <wrl/client.h>
@@ -97,11 +98,6 @@ void ShutdownPlayer() {
     if (g.started) MFShutdown();
     g.started = false;
 }
-
-ID3D11Device* GpuDevice() { return g.device.Get(); }
-
-DeviceLock::DeviceLock() { g.multithread->Enter(); }
-DeviceLock::~DeviceLock() { g.multithread->Leave(); }
 
 HRESULT OpenVideo(const std::wstring& path) {
     // A byte stream keeps the source a local file: the path is never parsed as a URL.

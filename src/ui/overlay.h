@@ -9,6 +9,11 @@
 
 #include "media/subtitles.h"
 
+struct ID3D11Device;
+
+// The device to draw with: the one the DirectComposition device was created on. Call before drawing.
+void SetOverlayDevice(ID3D11Device* device);
+
 // Draws text in white with a soft black outline into a new surface, sets it as the visual's content and returns
 // the surface's size in pixels. Empty text clears the visual. Lines wrap at maxWidth and are centered or
 // left-aligned. Direct2D and DirectWrite load on the first call that draws.

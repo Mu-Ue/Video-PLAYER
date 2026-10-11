@@ -2,13 +2,12 @@
 
 #include <d2d1_1.h>
 #include <d2d1_1helper.h>
+#include <d3d11.h>
 #include <dwrite.h>
 #include <wrl/client.h>
 
 #include <algorithm>
 #include <cmath>
-
-#include "media/player.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -20,6 +19,7 @@ struct Run {
 };
 
 struct {
+    ComPtr<ID3D11Device> device;
     ComPtr<ID2D1Factory1> factory;
     ComPtr<ID2D1DeviceContext> context;
     ComPtr<IDWriteFactory> dwrite;
@@ -85,7 +85,7 @@ bool Init() {
     ComPtr<IDXGIDevice> dxgi;
     ComPtr<ID2D1Device> device;
     HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, g.factory.GetAddressOf());
-    if (SUCCEEDED(hr)) hr = GpuDevice()->QueryInterface(IID_PPV_ARGS(&dxgi));
+    if (SUCCEEDED(hr)) hr = g.device.As(&dxgi);
     if (SUCCEEDED(hr)) hr = g.factory->CreateDevice(dxgi.Get(), &device);
     if (SUCCEEDED(hr)) hr = device->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &g.context);
     if (SUCCEEDED(hr)) {
@@ -179,7 +179,6 @@ ComPtr<IDCompositionSurface> Paint(IDCompositionDevice* dcomp, UINT w, UINT h, D
     if (FAILED(dcomp->CreateSurface(w, h, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_ALPHA_MODE_PREMULTIPLIED, &surface))) {
         return nullptr;
     }
-    DeviceLock lock;
     // The surface may be part of a larger shared texture, at offset.
     POINT offset;
     ComPtr<IDXGISurface> target;
@@ -207,6 +206,8 @@ ComPtr<IDCompositionSurface> Paint(IDCompositionDevice* dcomp, UINT w, UINT h, D
 }
 
 }  // namespace
+
+void SetOverlayDevice(ID3D11Device* device) { g.device = device; }
 
 SIZE DrawOutlinedText(IDCompositionDevice* dcomp, IDCompositionVisual* visual, std::wstring_view text,
                       const std::vector<StyleSpan>& spans, float fontSize, float maxWidth, bool center) {
