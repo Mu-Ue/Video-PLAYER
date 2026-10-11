@@ -18,14 +18,30 @@ struct Run {
     D2D1_POINT_2F origin;
 };
 
+// A visual's surface, kept and redrawn in place while the visual is redrawn.
+struct Target {
+    IDCompositionVisual* visual;
+    ComPtr<IDCompositionVirtualSurface> surface;
+    UINT width, height;
+};
+
 struct {
     ComPtr<ID3D11Device> device;
     ComPtr<ID2D1Factory1> factory;
     ComPtr<ID2D1DeviceContext> context;
     ComPtr<IDWriteFactory> dwrite;
     ComPtr<ID2D1SolidColorBrush> brush;
+    ComPtr<ID2D1LinearGradientBrush> shade;  // under the controls
     ComPtr<ID2D1StrokeStyle> round;
     std::vector<Run> runs;  // of the text being drawn
+    std::vector<Target> targets;
+    // The text formats of the bars and controls, for one DPI scale.
+    float scale = 0;
+    ComPtr<IDWriteTextFormat> menu, time, title, icons, number;
+    ComPtr<IDWriteInlineObject> ellipsis;
+    // The outlined text's format, for one size.
+    float textSize = 0;
+    ComPtr<IDWriteTextFormat> text;
 } g;
 
 // Collects each glyph run's outline, so all outlines are stroked before any is filled and no stroke covers a
@@ -98,21 +114,33 @@ bool Init() {
                                                                       D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND),
                                           nullptr, 0, &g.round);
     }
+    const D2D1_GRADIENT_STOP stops[] = {
+        {0, D2D1::ColorF(0, 0, 0, 0)}, {0.5f, D2D1::ColorF(0, 0, 0, 0.5f)}, {1, D2D1::ColorF(0, 0, 0, 0.85f)}};
+    ComPtr<ID2D1GradientStopCollection> collection;
+    if (SUCCEEDED(hr)) hr = g.context->CreateGradientStopCollection(stops, UINT32(std::size(stops)), &collection);
+    if (SUCCEEDED(hr)) {
+        hr = g.context->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties({0, 0}, {0, 1}),
+                                                  collection.Get(), &g.shade);
+    }
     if (FAILED(hr)) g.context.Reset();
     return SUCCEEDED(hr);
 }
 
 ComPtr<IDWriteTextLayout> CreateLayout(std::wstring_view text, const std::vector<StyleSpan>& spans, float fontSize,
                                        float maxWidth, bool center) {
-    ComPtr<IDWriteTextFormat> format;
-    ComPtr<IDWriteTextLayout> layout;
-    HRESULT hr = g.dwrite->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
-                                            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, fontSize, L"",
-                                            &format);
-    if (SUCCEEDED(hr)) {
-        format->SetTextAlignment(center ? DWRITE_TEXT_ALIGNMENT_CENTER : DWRITE_TEXT_ALIGNMENT_LEADING);
-        hr = g.dwrite->CreateTextLayout(text.data(), UINT32(text.size()), format.Get(), maxWidth, 0, &layout);
+    if (!g.text || g.textSize != fontSize) {
+        g.text.Reset();
+        if (FAILED(g.dwrite->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                                              DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, fontSize, L"",
+                                              &g.text))) {
+            return nullptr;
+        }
+        g.textSize = fontSize;
     }
+    ComPtr<IDWriteTextLayout> layout;
+    g.text->SetTextAlignment(center ? DWRITE_TEXT_ALIGNMENT_CENTER : DWRITE_TEXT_ALIGNMENT_LEADING);
+    const HRESULT hr =
+        g.dwrite->CreateTextLayout(text.data(), UINT32(text.size()), g.text.Get(), maxWidth, 0, &layout);
     if (FAILED(hr)) return nullptr;
     for (const StyleSpan& s : spans) {
         const DWRITE_TEXT_RANGE range{s.start, s.length};
@@ -150,6 +178,26 @@ const wchar_t* IconFont() {
     return font;
 }
 
+// Creates the bars' and controls' text formats for a DPI scale, unless they already are for it.
+bool SetScale(float scale) {
+    if (scale == g.scale) return true;
+    g.scale = 0;
+    g.menu = CreateFormat(L"Segoe UI", 12 * scale, false, DWRITE_TEXT_ALIGNMENT_CENTER);
+    g.time = CreateFormat(L"Segoe UI", 13 * scale, false, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    g.title = CreateFormat(L"Segoe UI", 15 * scale, true, DWRITE_TEXT_ALIGNMENT_CENTER);
+    g.icons = CreateFormat(IconFont(), 24 * scale, false, DWRITE_TEXT_ALIGNMENT_CENTER);
+    g.number = CreateFormat(L"Segoe UI", 9 * scale, true, DWRITE_TEXT_ALIGNMENT_CENTER);
+    g.ellipsis.Reset();
+    if (!g.menu || !g.time || !g.title || !g.icons || !g.number ||
+        FAILED(g.dwrite->CreateEllipsisTrimmingSign(g.title.Get(), &g.ellipsis))) {
+        return false;
+    }
+    const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
+    g.title->SetTrimming(&trimming, g.ellipsis.Get());
+    g.scale = scale;
+    return true;
+}
+
 D2D1_RECT_F RectF(const RECT& r) { return D2D1::RectF(float(r.left), float(r.top), float(r.right), float(r.bottom)); }
 
 // A circular arrow around center, open at the top, with its head at the top pointing back (dir -1) or forward.
@@ -172,17 +220,36 @@ void DrawReplayArrow(ID2D1DeviceContext* dc, D2D1_POINT_2F center, float radius,
     dc->FillGeometry(path.Get(), g.brush.Get());
 }
 
-// Creates a w x h surface and draws into it with draw(context, transform to the surface's pixels).
-template <typename Draw>
-ComPtr<IDCompositionSurface> Paint(IDCompositionDevice* dcomp, UINT w, UINT h, Draw draw) {
-    ComPtr<IDCompositionSurface> surface;
-    if (FAILED(dcomp->CreateSurface(w, h, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_ALPHA_MODE_PREMULTIPLIED, &surface))) {
-        return nullptr;
+// The visual's surface, sized w x h: the one it had, resized if need be, or a new one.
+IDCompositionSurface* SurfaceFor(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT w, UINT h) {
+    auto it = std::find_if(g.targets.begin(), g.targets.end(), [&](const Target& t) { return t.visual == visual; });
+    if (it == g.targets.end()) {
+        ComPtr<IDCompositionVirtualSurface> surface;
+        if (FAILED(dcomp->CreateVirtualSurface(w, h, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_ALPHA_MODE_PREMULTIPLIED,
+                                               &surface))) {
+            return nullptr;
+        }
+        g.targets.push_back({visual, std::move(surface), w, h});
+        return g.targets.back().surface.Get();
     }
+    if ((it->width != w || it->height != h) && FAILED(it->surface->Resize(w, h))) return nullptr;
+    it->width = w;
+    it->height = h;
+    return it->surface.Get();
+}
+
+// Redraws the visual's w x h surface with draw(context, transform to the surface's pixels) and shows it, or
+// clears the visual and returns false if that fails.
+template <typename Draw>
+bool Paint(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT w, UINT h, Draw draw) {
+    IDCompositionSurface* surface = SurfaceFor(dcomp, visual, w, h);
     // The surface may be part of a larger shared texture, at offset.
     POINT offset;
     ComPtr<IDXGISurface> target;
-    if (FAILED(surface->BeginDraw(nullptr, IID_PPV_ARGS(&target), &offset))) return nullptr;
+    if (!surface || FAILED(surface->BeginDraw(nullptr, IID_PPV_ARGS(&target), &offset))) {
+        visual->SetContent(nullptr);
+        return false;
+    }
     const D2D1_BITMAP_PROPERTIES1 props =
         D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
                                 D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
@@ -202,7 +269,8 @@ ComPtr<IDCompositionSurface> Paint(IDCompositionDevice* dcomp, UINT w, UINT h, D
         dc->SetTarget(nullptr);
     }
     surface->EndDraw();
-    return drawn ? surface : nullptr;
+    visual->SetContent(drawn ? surface : nullptr);
+    return drawn;
 }
 
 }  // namespace
@@ -211,12 +279,14 @@ void SetOverlayDevice(ID3D11Device* device) { g.device = device; }
 
 SIZE DrawOutlinedText(IDCompositionDevice* dcomp, IDCompositionVisual* visual, std::wstring_view text,
                       const std::vector<StyleSpan>& spans, float fontSize, float maxWidth, bool center) {
-    visual->SetContent(nullptr);
-    if (text.empty() || !Init()) return {};
-    const ComPtr<IDWriteTextLayout> layout = CreateLayout(text, spans, fontSize, maxWidth, center);
+    const ComPtr<IDWriteTextLayout> layout =
+        text.empty() || !Init() ? nullptr : CreateLayout(text, spans, fontSize, maxWidth, center);
     DWRITE_TEXT_METRICS m;
     DWRITE_OVERHANG_METRICS o;
-    if (!layout || FAILED(layout->GetMetrics(&m)) || FAILED(layout->GetOverhangMetrics(&o))) return {};
+    if (!layout || FAILED(layout->GetMetrics(&m)) || FAILED(layout->GetOverhangMetrics(&o))) {
+        visual->SetContent(nullptr);
+        return {};
+    }
 
     // The ink box (overhangs are relative to the maxWidth x 0 layout box) and the logical box, plus the
     // outline, which reaches 1.1 stroke widths past the glyphs.
@@ -227,9 +297,11 @@ SIZE DrawOutlinedText(IDCompositionDevice* dcomp, IDCompositionVisual* visual, s
     const UINT w = UINT(std::ceil(right - left + 2 * pad)), h = UINT(std::ceil(bottom - top + 2 * pad));
 
     g.runs.clear();
-    if (FAILED(layout->Draw(nullptr, &collector, pad - left, pad - top))) return {};
-    const ComPtr<IDCompositionSurface> surface = Paint(dcomp, w, h, [&](ID2D1DeviceContext* dc,
-                                                                        const D2D1_MATRIX_3X2_F& base) {
+    if (FAILED(layout->Draw(nullptr, &collector, pad - left, pad - top))) {
+        visual->SetContent(nullptr);
+        return {};
+    }
+    const bool drawn = Paint(dcomp, visual, w, h, [&](ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F& base) {
         dc->Clear(D2D1::ColorF(0, 0, 0, 0));
         // A wide faint halo, a solid outline, then the white fill.
         const struct {
@@ -248,21 +320,17 @@ SIZE DrawOutlinedText(IDCompositionDevice* dcomp, IDCompositionVisual* visual, s
         }
     });
     g.runs.clear();
-    if (!surface) return {};
-    visual->SetContent(surface.Get());
-    return {LONG(w), LONG(h)};
+    return drawn ? SIZE{LONG(w), LONG(h)} : SIZE{};
 }
 
 void DrawBar(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT width, UINT height, float scale,
              const std::vector<BarItem>& items) {
-    visual->SetContent(nullptr);
-    if (width == 0 || height == 0 || !Init()) return;
-    const ComPtr<IDWriteTextFormat> text = CreateFormat(L"Segoe UI", 12 * scale, false, DWRITE_TEXT_ALIGNMENT_CENTER);
-    if (!text) return;
-
+    if (width == 0 || height == 0 || !Init() || !SetScale(scale)) {
+        visual->SetContent(nullptr);
+        return;
+    }
     const float inset = std::round(3 * scale), radius = 4 * scale;
-    const ComPtr<IDCompositionSurface> surface = Paint(dcomp, width, height, [&](ID2D1DeviceContext* dc,
-                                                                                 const D2D1_MATRIX_3X2_F&) {
+    Paint(dcomp, visual, width, height, [&](ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F&) {
         dc->Clear(D2D1::ColorF(0x202020));  // the dark title bar's color
         dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         for (const BarItem& item : items) {
@@ -274,41 +342,23 @@ void DrawBar(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT width
                     g.brush.Get());
             }
             g.brush->SetColor(D2D1::ColorF(item.dim ? 0x707070 : 0xffffff));
-            dc->DrawText(item.text.data(), UINT32(item.text.size()), text.Get(), r, g.brush.Get(),
+            dc->DrawText(item.text.data(), UINT32(item.text.size()), g.menu.Get(), r, g.brush.Get(),
                          D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
     });
-    visual->SetContent(surface.Get());
 }
 
 void DrawControls(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT width, UINT height, float scale,
                   const Controls& c) {
-    visual->SetContent(nullptr);
-    if (width == 0 || height == 0 || !Init()) return;
-    const auto time = CreateFormat(L"Segoe UI", 13 * scale, false, DWRITE_TEXT_ALIGNMENT_TRAILING);
-    const auto title = CreateFormat(L"Segoe UI", 15 * scale, true, DWRITE_TEXT_ALIGNMENT_CENTER);
-    const auto icons = CreateFormat(IconFont(), 24 * scale, false, DWRITE_TEXT_ALIGNMENT_CENTER);
-    const auto number = CreateFormat(L"Segoe UI", 9 * scale, true, DWRITE_TEXT_ALIGNMENT_CENTER);
-    ComPtr<IDWriteInlineObject> ellipsis;
-    if (!time || !title || !icons || !number || FAILED(g.dwrite->CreateEllipsisTrimmingSign(title.Get(), &ellipsis))) {
+    if (width == 0 || height == 0 || !Init() || !SetScale(scale)) {
+        visual->SetContent(nullptr);
         return;
     }
-    const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
-    title->SetTrimming(&trimming, ellipsis.Get());
-
-    const ComPtr<IDCompositionSurface> surface = Paint(dcomp, width, height, [&](ID2D1DeviceContext* dc,
-                                                                                 const D2D1_MATRIX_3X2_F& base) {
+    Paint(dcomp, visual, width, height, [&](ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F& base) {
         dc->Clear(D2D1::ColorF(0, 0, 0, 0));
         dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-        const D2D1_GRADIENT_STOP stops[] = {
-            {0, D2D1::ColorF(0, 0, 0, 0)}, {0.5f, D2D1::ColorF(0, 0, 0, 0.5f)}, {1, D2D1::ColorF(0, 0, 0, 0.85f)}};
-        ComPtr<ID2D1GradientStopCollection> collection;
-        ComPtr<ID2D1LinearGradientBrush> shade;
-        if (SUCCEEDED(dc->CreateGradientStopCollection(stops, UINT32(std::size(stops)), &collection)) &&
-            SUCCEEDED(dc->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties({0, 0}, {0, float(height)}),
-                                                    collection.Get(), &shade))) {
-            dc->FillRectangle(D2D1::RectF(0, 0, float(width), float(height)), shade.Get());
-        }
+        g.shade->SetEndPoint({0, float(height)});
+        dc->FillRectangle(D2D1::RectF(0, 0, float(width), float(height)), g.shade.Get());
 
         // The rest of the track, the played part and the knob.
         const D2D1_RECT_F seek = RectF(c.seekBar);
@@ -321,9 +371,9 @@ void DrawControls(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT 
         dc->FillEllipse(D2D1::Ellipse({x, y}, knob, knob), g.brush.Get());
 
         g.brush->SetColor(D2D1::ColorF(0xffffff));
-        dc->DrawText(c.time.data(), UINT32(c.time.size()), time.Get(), RectF(c.timeRect), g.brush.Get(),
+        dc->DrawText(c.time.data(), UINT32(c.time.size()), g.time.Get(), RectF(c.timeRect), g.brush.Get(),
                      D2D1_DRAW_TEXT_OPTIONS_CLIP);
-        dc->DrawText(c.title.data(), UINT32(c.title.size()), title.Get(), RectF(c.titleRect), g.brush.Get(),
+        dc->DrawText(c.title.data(), UINT32(c.title.size()), g.title.Get(), RectF(c.titleRect), g.brush.Get(),
                      D2D1_DRAW_TEXT_OPTIONS_CLIP);
         for (const BarItem& item : c.buttons) {
             const D2D1_RECT_F r = RectF(item.rect);
@@ -331,9 +381,8 @@ void DrawControls(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT 
             dc->SetTransform(item.hot ? D2D1::Matrix3x2F::Scale(1.2f, 1.2f, center) * base : base);
             g.brush->SetColor(D2D1::ColorF(item.dim ? 0x808080 : 0xffffff));
             if (item.replay) DrawReplayArrow(dc, center, 11 * scale, 2 * scale, item.replay);
-            dc->DrawText(item.text.data(), UINT32(item.text.size()), item.replay ? number.Get() : icons.Get(), r,
-                         g.brush.Get());
+            dc->DrawText(item.text.data(), UINT32(item.text.size()), item.replay ? g.number.Get() : g.icons.Get(),
+                         r, g.brush.Get());
         }
     });
-    visual->SetContent(surface.Get());
 }

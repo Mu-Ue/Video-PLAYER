@@ -14,8 +14,8 @@ struct ID3D11Device;
 // The device to draw with: the one the DirectComposition device was created on. Call before drawing.
 void SetOverlayDevice(ID3D11Device* device);
 
-// Draws text in white with a soft black outline into a new surface, sets it as the visual's content and returns
-// the surface's size in pixels. Empty text clears the visual. Lines wrap at maxWidth and are centered or
+// Draws text in white with a soft black outline into the visual's surface, sets it as the visual's content and
+// returns the surface's size in pixels. Empty text clears the visual. Lines wrap at maxWidth and are centered or
 // left-aligned. Direct2D and DirectWrite load on the first call that draws.
 SIZE DrawOutlinedText(IDCompositionDevice* dcomp, IDCompositionVisual* visual, std::wstring_view text,
                       const std::vector<StyleSpan>& spans, float fontSize, float maxWidth, bool center);
@@ -29,8 +29,8 @@ struct BarItem {
     bool dim = false;  // disabled
 };
 
-// Draws a dark bar with the items into a new surface and sets it as the visual's content. Zero size clears the
-// visual. scale is the DPI over 96.
+// Draws a dark bar with the items into the visual's surface and sets it as the visual's content. Zero size clears
+// the visual. scale is the DPI over 96.
 void DrawBar(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT width, UINT height, float scale,
              const std::vector<BarItem>& items);
 
@@ -44,7 +44,7 @@ struct Controls {
     std::vector<BarItem> buttons;  // hot ones are drawn larger
 };
 
-// Draws the controls, over a gradient that darkens toward the bottom edge, into a new transparent surface and
-// sets it as the visual's content.
+// Draws the controls, over a gradient that darkens toward the bottom edge, into the visual's transparent surface
+// and sets it as the visual's content.
 void DrawControls(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT width, UINT height, float scale,
                   const Controls& controls);
