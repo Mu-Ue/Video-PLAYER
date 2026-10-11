@@ -3,6 +3,7 @@
 #undef GetCurrentTime  // a 16-bit era winbase.h macro that would rename IMFMediaEngine::GetCurrentTime
 
 #include <audiosessiontypes.h>
+#include <avrt.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <mfapi.h>
@@ -68,6 +69,9 @@ HRESULT CreateDevice() {
     }
     if (SUCCEEDED(hr)) hr = g.device.As(&g.multithread);
     if (SUCCEEDED(hr)) g.multithread->SetMultithreadProtected(TRUE);
+    // A present never waits behind older ones.
+    ComPtr<IDXGIDevice1> dxgi;
+    if (SUCCEEDED(hr) && SUCCEEDED(g.device.As(&dxgi))) dxgi->SetMaximumFrameLatency(1);
     return hr;
 }
 
@@ -104,6 +108,9 @@ bool PresentFrame() {
 // Once per compositor frame, presents the engine's frame for that moment if it is a new one. Nothing is queued
 // ahead, so pausing and seeking show on screen as soon as the engine has the frame.
 void RenderLoop() {
+    // Scheduled as playback, so frames stay on time while the CPU is busy.
+    DWORD task = 0;
+    const HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Playback", &task);
     // The compositor clock is Windows 11 only; Windows 10 waits for the vertical blank of the first monitor.
     using WaitFn = DWORD(WINAPI*)(UINT, const HANDLE*, DWORD);
     const auto waitClock = reinterpret_cast<WaitFn>(
@@ -124,11 +131,14 @@ void RenderLoop() {
         } else if (WaitForSingleObject(g.stop, 0) != WAIT_TIMEOUT) {
             break;
         }
-        AcquireSRWLockExclusive(&g.lock);
         LONGLONG pts;
-        if (g.chain && (g.engine->OnVideoStreamTick(&pts) == S_OK || g.redraw)) g.redraw = !PresentFrame();
-        ReleaseSRWLockExclusive(&g.lock);
+        if (g.engine->OnVideoStreamTick(&pts) == S_OK || g.redraw) {
+            AcquireSRWLockExclusive(&g.lock);
+            g.redraw = !g.chain || !PresentFrame();
+            ReleaseSRWLockExclusive(&g.lock);
+        }
     }
+    if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
 }
 
 }  // namespace
@@ -205,7 +215,7 @@ void SetVideoSize(int width, int height) {
         desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         desc.BufferCount = 2;
         desc.Scaling = DXGI_SCALING_STRETCH;
-        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
         if (SUCCEEDED(hr)) hr = factory->CreateSwapChainForComposition(g.device.Get(), &desc, nullptr, &g.chain);
     }
