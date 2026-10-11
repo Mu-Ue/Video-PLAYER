@@ -25,8 +25,9 @@ int DialogMain() {
     ofn.hwndOwner = IsWindow(owner) ? owner : nullptr;
     ofn.lpstrFile = buffer;
     ofn.nMaxFile = ARRAYSIZE(buffer);
-    ofn.lpstrFilter = kFileFilter;
-    ofn.lpstrTitle = kAppName;
+    const bool subtitles = argc >= 4 && wcscmp(argv[3], L"subtitles") == 0;
+    ofn.lpstrFilter = subtitles ? kSubtitleFilter : kFileFilter;
+    ofn.lpstrTitle = subtitles ? L"Add subtitle file" : kAppName;
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
     if (!GetOpenFileNameW(&ofn)) return 1;
     DWORD written = 0;
@@ -34,11 +35,12 @@ int DialogMain() {
     return 0;
 }
 
-std::wstring RunFileDialog(HWND owner) {
+std::wstring RunFileDialog(HWND owner, bool subtitles) {
     wchar_t exe[MAX_PATH * 4];
     const DWORD len = GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
     if (len == 0 || len == ARRAYSIZE(exe)) return {};
-    std::wstring cmd = L"\"" + std::wstring(exe) + L"\" --dialog " + std::to_wstring(UINT_PTR(owner));
+    std::wstring cmd = L"\"" + std::wstring(exe) + L"\" --dialog " + std::to_wstring(UINT_PTR(owner)) +
+                       (subtitles ? L" subtitles" : L"");
 
     // The pipe holds the longest path, so the helper never blocks writing it.
     SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};

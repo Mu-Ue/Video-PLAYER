@@ -17,17 +17,18 @@
 #include "media/subtitles.h"
 #include "platform/file_dialog.h"
 #include "ui/overlay.h"
+#include "ui/popup_menu.h"
 
 using Microsoft::WRL::ComPtr;
 
 namespace {
 
 enum : UINT_PTR { kSubtitleTimer = 1, kOsdTimer, kIdleTimer, kShowTimer };
-enum : UINT { kCmdOpen = 1 };
-// The button on the menu bar, then the controls: buttons left to right, the seek bar, the volume slider, and two
+enum : UINT { kCmdOpen = 1, kCmdAddSubtitles, kCmdShowSubtitles };
+// The buttons on the menu bar, then the controls: buttons left to right, the seek bar, the volume slider, and two
 // labels.
 enum Control {
-    kNone, kFile, kPlay, kBack, kForward, kVolume, kSubtitles, kFullscreen, kSeek, kVolumeBar, kTime, kTitle
+    kNone, kFile, kSubs, kPlay, kBack, kForward, kVolume, kSubtitles, kFullscreen, kSeek, kVolumeBar, kTime, kTitle
 };
 constexpr UINT kShowFallbackMs = 1000;  // show the window even if the video's size isn't known by then
 constexpr float kFadeSeconds = 0.2f;    // of the controls
@@ -54,7 +55,7 @@ struct Window {
     float subtitleHeight = 0;   // of the bottom ones
     std::wstring osdText;
     Control hot = kNone;    // under the mouse
-    bool menuOpen = false;  // the File menu is showing
+    Control menuOpen = kNone;  // kFile or kSubs while its menu is showing
     std::wstring title;     // the video's file name
     bool controlsShown = false;
     Controls drawn{};  // what the controls show, at drawnSize and drawnScale
@@ -82,6 +83,8 @@ struct Window {
 } g;
 
 std::wstring FileName(const std::wstring& path) { return path.substr(path.find_last_of(L"\\/") + 1); }
+
+bool IsMenuButton(Control c) { return c == kFile || c == kSubs; }
 
 bool IsSubtitleFile(const std::wstring& path) {
     return path.size() >= 4 && CompareStringOrdinal(path.c_str() + path.size() - 4, 4, L".srt", 4, TRUE) == CSTR_EQUAL;
@@ -121,6 +124,7 @@ RECT ControlRect(Control c) {
     RECT client;
     GetClientRect(g.hwnd, &client);
     if (c == kFile) return {0, 0, Px(40), MenuBarHeight()};
+    if (c == kSubs) return {Px(40), 0, Px(112), MenuBarHeight()};
     const int margin = Px(12), step = Px(56), slider = Px(64), time = Px(140);
     const int seekY = client.bottom - Px(80), rowY = client.bottom - Px(34), half = Px(24);
     const int sliderX = margin + 4 * step;  // right of the volume button
@@ -162,9 +166,10 @@ bool IsOnControls(POINT pt) { return g.controlsShown && pt.y >= ControlRect(kSee
 bool IsOnBar(POINT pt) { return pt.y < MenuBarHeight() || IsOnControls(pt); }
 
 Control HitTest(POINT pt) {
-    for (const Control c : {kFile, kPlay, kBack, kForward, kVolume, kSubtitles, kFullscreen, kSeek, kVolumeBar}) {
+    for (const Control c :
+         {kFile, kSubs, kPlay, kBack, kForward, kVolume, kSubtitles, kFullscreen, kSeek, kVolumeBar}) {
         const RECT r = ControlRect(c);
-        if (PtInRect(&r, pt) && (c == kFile || g.controlsShown)) return c;
+        if (PtInRect(&r, pt) && (IsMenuButton(c) || g.controlsShown)) return c;
     }
     return kNone;
 }
@@ -172,8 +177,10 @@ Control HitTest(POINT pt) {
 void DrawMenuBar() {
     RECT client;
     GetClientRect(g.hwnd, &client);
-    const BarItem file{ControlRect(kFile), L"File", 0, g.hot == kFile || g.menuOpen};
-    DrawBar(g.dcomp.Get(), g.menuBar.Get(), client.right, MenuBarHeight(), GetDpiForWindow(g.hwnd) / 96.0f, {file});
+    const BarItem file{ControlRect(kFile), L"File", 0, g.hot == kFile || g.menuOpen == kFile};
+    const BarItem subs{ControlRect(kSubs), L"Subtitles", 0, g.hot == kSubs || g.menuOpen == kSubs};
+    DrawBar(g.dcomp.Get(), g.menuBar.Get(), client.right, MenuBarHeight(), GetDpiForWindow(g.hwnd) / 96.0f,
+            {file, subs});
 }
 
 const wchar_t* VolumeGlyph() {
@@ -240,7 +247,7 @@ void UpdateControls() {
 
 void SetHot(Control c) {
     if (c == g.hot) return;
-    const bool menu = c == kFile || g.hot == kFile;
+    const bool menu = IsMenuButton(c) || IsMenuButton(g.hot);
     g.hot = c;
     if (menu) DrawMenuBar();
     if (g.controlsShown) DrawControls();
@@ -261,7 +268,7 @@ void SetControlsShown(bool shown) {
     g.controlsShown = shown;
     if (shown) {
         DrawControls();
-    } else if (g.hot != kFile) {
+    } else if (!IsMenuButton(g.hot)) {
         g.hot = kNone;
     }
     const float from = shown ? 0.0f : 1.0f, to = 1 - from;
@@ -516,28 +523,42 @@ void Open() {
     if (!path.empty()) OpenFiles({path});
 }
 
-void ShowFileMenu() {
+void AddSubtitles() {
+    const std::wstring path = RunFileDialog(g.hwnd, true);
+    if (!path.empty()) LoadSubtitleFile(path);
+}
+
+void ToggleSubtitles();
+
+// Shows the menu of a menu bar button, kFile or kSubs.
+void ShowMenu(Control which) {
     if (g.fullscreen) return;
-    const HMENU menu = CreatePopupMenu();
-    if (!menu) return;
-    AppendMenuW(menu, MF_STRING, kCmdOpen, L"&Open...\tCtrl+O");
-    const RECT r = ControlRect(kFile);
-    POINT pt{r.left, r.bottom};
-    ClientToScreen(g.hwnd, &pt);
-    g.menuOpen = true;
+    const MenuItem file[] = {{kCmdOpen, L"Open...", 'O', L"Ctrl+O"}};
+    // Opening a video clears its subtitles, so they are added to the one playing.
+    const MenuItem subs[] = {{kCmdAddSubtitles, L"Add subtitle file...", 'A', L"", HasVideo()},
+                             {},
+                             {kCmdShowSubtitles, L"Show subtitles", 'S', L"S", !g.subs.cues.empty(), g.subsOn}};
+    RECT anchor = ControlRect(which);
+    MapWindowPoints(g.hwnd, nullptr, reinterpret_cast<POINT*>(&anchor), 2);
+    g.menuOpen = which;
     DrawMenuBar();
     g.dcomp->Commit();
-    const UINT cmd = UINT(TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, g.hwnd, nullptr));
-    DestroyMenu(menu);
+    const UINT cmd = which == kFile ? ShowPopupMenu(g.hwnd, anchor, file, int(std::size(file)))
+                                    : ShowPopupMenu(g.hwnd, anchor, subs, int(std::size(subs)));
     // The menu had the mouse while it showed.
-    g.menuOpen = false;
+    g.menuOpen = kNone;
+    POINT pt;
     GetCursorPos(&pt);
     ScreenToClient(g.hwnd, &pt);
     g.hot = HitTest(pt);
     DrawMenuBar();
     if (g.controlsShown) DrawControls();
     g.dcomp->Commit();
-    if (cmd == kCmdOpen) Open();
+    switch (cmd) {
+        case kCmdOpen: Open(); break;
+        case kCmdAddSubtitles: AddSubtitles(); break;
+        case kCmdShowSubtitles: ToggleSubtitles(); break;
+    }
 }
 
 // Seeks to a time within the video and returns it; the caller shows it. While a seek is in flight the new one waits, replacing any
@@ -644,8 +665,8 @@ void ToggleFullscreen() {
 }
 
 void Press(Control c) {
-    if (c == kFile) {
-        ShowFileMenu();
+    if (IsMenuButton(c)) {
+        ShowMenu(c);
     } else if (c == kVolume) {
         ToggleMuted();
     } else if (c == kFullscreen) {
@@ -779,6 +800,7 @@ void OnDrop(HDROP drop) {
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (LRESULT result; HandlePopupMenuMessage(msg, wp, lp, result)) return result;
     switch (msg) {
         case WM_APP_MEDIA:
             OnMediaEvent(wp, lp);
@@ -788,12 +810,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_ERASEBKGND:
             return 1;
-        case WM_NCHITTEST: {  // the menu bar, but for the File button, drags the window like the title bar
+        case WM_NCHITTEST: {  // the menu bar, but for its buttons, drags the window like the title bar
             const LRESULT hit = DefWindowProcW(hwnd, msg, wp, lp);
             POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             ScreenToClient(hwnd, &pt);
-            const RECT file = ControlRect(kFile);
-            return hit == HTCLIENT && pt.y < MenuBarHeight() && !PtInRect(&file, pt) ? HTCAPTION : hit;
+            return hit == HTCLIENT && pt.y < MenuBarHeight() && !IsMenuButton(HitTest(pt)) ? HTCAPTION : hit;
         }
         case WM_SIZE:
             if (wp != SIZE_MINIMIZED && g.dcomp) Layout();
@@ -813,9 +834,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_KEYDOWN:
             OnKey(wp, (lp & (1 << 30)) != 0);
             return 0;
-        case WM_SYSCHAR:  // Alt+F
-            if (wp == 'f' || wp == 'F') {
-                ShowFileMenu();
+        case WM_SYSCHAR:  // Alt+F, Alt+S
+            if (wp == 'f' || wp == 'F' || wp == 's' || wp == 'S') {
+                ShowMenu((wp | 0x20) == 'f' ? kFile : kSubs);
                 return 0;
             }
             break;

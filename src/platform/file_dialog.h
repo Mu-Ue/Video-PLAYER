@@ -10,5 +10,6 @@
 // Entry point of the helper process.
 int DialogMain();
 
-// Shows the open dialog in a helper process, modal to owner; returns the chosen path, or an empty string.
-std::wstring RunFileDialog(HWND owner);
+// Shows the open dialog in a helper process, modal to owner, for subtitle files only if subtitles is set; returns
+// the chosen path, or an empty string.
+std::wstring RunFileDialog(HWND owner, bool subtitles = false);
