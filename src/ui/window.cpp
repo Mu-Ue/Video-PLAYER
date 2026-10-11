@@ -80,6 +80,7 @@ struct Window {
     WINDOWPLACEMENT placement{sizeof(WINDOWPLACEMENT)};  // of the window before it went fullscreen
     bool cursorHidden = false;  // while playing with the mouse idle
     LPARAM lastMouse = -1;
+    LONG lastClick = 0;  // message time of the last click on the video
 } g;
 
 std::wstring FileName(const std::wstring& path) { return path.substr(path.find_last_of(L"\\/") + 1); }
@@ -859,11 +860,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SetVolumeToX(pt.x);
             } else if (IsOnBar(pt)) {  // a double click there is just a second click
                 Press(c);
-            } else if (msg == WM_LBUTTONDOWN) {
-                if (HasVideo()) TogglePlay();
-            } else {  // the first click toggled playback; undo that
-                if (HasVideo()) TogglePlay();
+            } else if (msg == WM_LBUTTONDBLCLK &&
+                       static_cast<DWORD>(GetMessageTime() - g.lastClick) <= kDoubleClickMs) {
+                if (HasVideo()) TogglePlay();  // the first click toggled playback; undo that
                 ToggleFullscreen();
+            } else {  // also a double click slower than ours but within the system's
+                g.lastClick = GetMessageTime();
+                if (HasVideo()) TogglePlay();
             }
             return 0;
         }
