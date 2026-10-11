@@ -378,7 +378,8 @@ void DrawControls(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT 
         for (const BarItem& item : c.buttons) {
             const D2D1_RECT_F r = RectF(item.rect);
             const D2D1_POINT_2F center{(r.left + r.right) / 2, (r.top + r.bottom) / 2};
-            dc->SetTransform(item.hot ? D2D1::Matrix3x2F::Scale(1.2f, 1.2f, center) * base : base);
+            const float zoom = item.hot ? 1.2f : 1;
+            dc->SetTransform(D2D1::Matrix3x2F::Scale(item.mirror ? -zoom : zoom, zoom, center) * base);
             g.brush->SetColor(D2D1::ColorF(item.dim ? 0x808080 : 0xffffff));
             if (item.replay) DrawReplayArrow(dc, center, 11 * scale, 2 * scale, item.replay);
             dc->DrawText(item.text.data(), UINT32(item.text.size()), item.replay ? g.number.Get() : g.icons.Get(),

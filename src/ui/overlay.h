@@ -26,6 +26,7 @@ struct BarItem {
     int replay = 0;    // -1 or 1: a circular arrow back or forward around the text rather than a glyph
     bool hot = false;  // under the mouse
     bool dim = false;  // disabled
+    bool mirror = false;  // flipped left to right
     bool operator==(const BarItem&) const = default;
 };
 

@@ -179,7 +179,7 @@ bool DrawControls() {
         return r;
     };
     const auto button = [&](Control c, std::wstring text, bool dim, int replay = 0) {
-        return BarItem{rect(c), std::move(text), replay, g.hot == c && !dim, dim};
+        return BarItem{rect(c), std::move(text), replay, g.hot == c && !dim, dim, c == kFullscreen};
     };
     const double now = ShownTime(), duration = g.duration;
     const std::wstring step = std::to_wstring(std::lround(kSeekStep));
