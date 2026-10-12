@@ -815,6 +815,13 @@ void OnFrame() {
     if (std::exchange(g.previewMoved, false)) MovePreview(g.previewPoint);
 }
 
+// The video's swap chain size: the video v fitted to the window's monitor.
+SIZE ChainSize(SIZE v) {
+    MONITORINFO mi{sizeof(mi)};
+    GetMonitorInfoW(MonitorFromWindow(g.hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+    return Fit(v, mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top);
+}
+
 // Fits the video below the menu bar, keeping its aspect ratio. The engine renders it at the size it fills the
 // monitor at, which only changes with the video or the monitor, and composition scales that to the window, so
 // resizing and fullscreen take effect in the same frame as the window, with no wait on the engine.
@@ -830,9 +837,7 @@ void Layout() {
 
     const SIZE v = VideoSize();
     if (v.cx > 0 && v.cy > 0) {
-        MONITORINFO mi{sizeof(mi)};
-        GetMonitorInfoW(MonitorFromWindow(g.hwnd, MONITOR_DEFAULTTONEAREST), &mi);
-        const SIZE chain = Fit(v, mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top);
+        const SIZE chain = ChainSize(v);
         if (chain.cx != g.videoSize.cx || chain.cy != g.videoSize.cy || !g.attached) {
             SetVideoSize(chain.cx, chain.cy);
             g.videoSize = chain;
@@ -1388,9 +1393,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_SIZE:
             if (wp != SIZE_MINIMIZED && g.dcomp) Layout();
             return 0;
-        case WM_EXITSIZEMOVE:  // it may be on another monitor now
+        case WM_EXITSIZEMOVE:  // it may be on another monitor now, which the video's swap chain is sized for
         case WM_DISPLAYCHANGE:
-            if (!IsIconic(hwnd) && g.dcomp) Layout();
+            // A new size or DPI already laid it out through WM_SIZE.
+            if (!IsIconic(hwnd) && g.dcomp) {
+                const SIZE v = VideoSize(), chain = v.cx > 0 && v.cy > 0 ? ChainSize(v) : g.videoSize;
+                if (chain.cx != g.videoSize.cx || chain.cy != g.videoSize.cy) Layout();
+            }
             return 0;
         case WM_TIMER:
             switch (wp) {
