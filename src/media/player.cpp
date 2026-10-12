@@ -478,7 +478,7 @@ DWORD WaitPreview(HANDLE timer, LONGLONG until, LONGLONG frequency) {
 // Opens the files and shows the key frames the window wants, one at a time, always the latest. Nothing queues: each
 // wake reads what is wanted now. Decodes start on a beat of about kPreviewRestMs, so a sweep skips key frames instead
 // of decoding every one, or as soon as the mouse has rested kPreviewDwellMs in a span. A picture the mouse moved on
-// from while it decoded is dropped, never shown, and where the mouse is now is decoded at once.
+// from while it decoded is still shown, as the nearest there is, so a fast sweep updates as often as a slow one.
 void PreviewLoop() {
     const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
     HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
@@ -521,11 +521,9 @@ void PreviewLoop() {
         beat = NextBeat(start, f);
         const ComPtr<IMFSample> sample = ReadKeyFrame(reader.Get(), time);
         AcquireSRWLockShared(&g.previewLock);
-        const bool outdated = g.previewWanted != time || !g.previewPath.empty();
+        const bool reopened = !g.previewPath.empty();
         ReleaseSRWLockShared(&g.previewLock);
-        if (outdated) {  // the mouse moved on while it decoded: decode where it is now, at once
-            beat = 0;
-        } else if (sample) {
+        if (sample && !reopened) {  // shown even if the mouse moved on, so a fast sweep keeps up
             shown = time;
             PresentKeyFrame(sample.Get());
         }
