@@ -134,6 +134,7 @@ struct {
     ComPtr<IDXGISwapChain1> chain, previewChain;
     UINT width = 0, height = 0, previewWidth = 0, previewHeight = 0;
     std::atomic<bool> redraw = false;  // present the current frame even if it isn't new; set with Redraw
+    std::atomic<bool> frameWanted = false;  // post WM_APP_FRAME at the next frame; set with RequestFrame
     HANDLE stop = nullptr;             // tells the render thread and the previewer to exit
     HANDLE renderWake = nullptr;       // set on each engine event and redraw, while the render thread sleeps
     std::thread renderer;
@@ -239,6 +240,15 @@ void Redraw() {
     SetEvent(g.renderWake);
 }
 
+}  // namespace
+
+void RequestFrame() {
+    g.frameWanted = true;
+    SetEvent(g.renderWake);
+}
+
+namespace {
+
 // Once per compositor frame, presents the engine's frame for that moment if it is a new one. Nothing is queued
 // ahead, so pausing and seeking show on screen as soon as the engine has the frame. While paused, or with no video,
 // it sleeps once kIdleTicks frames have passed with nothing new, until an engine event or a redraw.
@@ -275,6 +285,7 @@ void RenderLoop() {
         }
         // An event that came while awake restarts the grace.
         idle = WaitForSingleObject(g.renderWake, 0) == WAIT_OBJECT_0 ? 0 : idle + 1;
+        if (g.frameWanted.exchange(false)) PostMessageW(g.notify.hwnd, WM_APP_FRAME, 0, 0);
         LONGLONG pts;
         if (g.engine->OnVideoStreamTick(&pts) == S_OK || g.redraw) {
             AcquireSRWLockExclusive(&g.lock);

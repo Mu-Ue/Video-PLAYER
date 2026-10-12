@@ -74,10 +74,14 @@ struct Window {
     ComPtr<IDCompositionVisual> previewShadow, previewFrame, previewImage, previewTime;
     ComPtr<IDCompositionRectangleClip> previewClip;
     bool previewShown = false;
+    bool framePending = false;  // the preview was placed this frame; a WM_APP_FRAME is coming
+    bool previewMoved = false;  // and the mouse has moved since, to previewPoint
+    POINT previewPoint{};
     int previewX = INT_MIN;  // the seek bar position it shows
     std::wstring previewText;
     SIZE previewTextSize{};
     SIZE previewShadowSize{};  // the frame size its shadow is drawn for
+    SIZE previewChainSize{};   // the picture size the frame is scaled for
     int previewShadowPad = -1;  // how far the shadow reaches past the frame, or -1 if not drawn
     ComPtr<IDCompositionEffectGroup> controlsFade, flashFade, osdFade;
     ComPtr<IDCompositionScaleTransform> flashScale;  // about the icon's center, then
@@ -742,31 +746,36 @@ void UpdatePreview(POINT pt) {
     if (chain.cx > 0 && chain.cy > 0) {
         const int side = std::clamp(int(TextScale() * 0.35f), Px(120), Px(320));
         const SIZE s = Fit(chain, side, side);
-        g.previewImage->SetContent(PreviewSwapChain());
-        g.previewImage->SetTransform(D2D_MATRIX_3X2_F{float(s.cx) / chain.cx, 0, 0, float(s.cy) / chain.cy, 0, 0});
+        // Its look only changes with its size, so a move just places it.
+        if (s.cx != g.previewShadowSize.cx || s.cy != g.previewShadowSize.cy || chain.cx != g.previewChainSize.cx ||
+            chain.cy != g.previewChainSize.cy) {
+            g.previewChainSize = chain;
+            g.previewImage->SetContent(PreviewSwapChain());
+            g.previewImage->SetTransform(D2D_MATRIX_3X2_F{float(s.cx) / chain.cx, 0, 0, float(s.cy) / chain.cy, 0, 0});
+            // Rounded like the menus, over a soft shadow.
+            const float r = float(Px(8));
+            if (s.cx != g.previewShadowSize.cx || s.cy != g.previewShadowSize.cy) {
+                g.previewShadowSize = s;
+                g.previewShadowPad = DrawPreviewShadow(g.dcomp.Get(), g.previewShadow.Get(),
+                                                       GetDpiForWindow(g.hwnd) / 96.0f, s, r);
+            }
+            IDCompositionRectangleClip* clip = g.previewClip.Get();
+            clip->SetRight(float(s.cx));
+            clip->SetBottom(float(s.cy));
+            clip->SetTopLeftRadiusX(r);
+            clip->SetTopLeftRadiusY(r);
+            clip->SetTopRightRadiusX(r);
+            clip->SetTopRightRadiusY(r);
+            clip->SetBottomLeftRadiusX(r);
+            clip->SetBottomLeftRadiusY(r);
+            clip->SetBottomRightRadiusX(r);
+            clip->SetBottomRightRadiusY(r);
+        }
         const float frameX = place(s.cx), frameY = float(timeTop - Px(6) - int(s.cy));
         g.previewFrame->SetOffsetX(frameX);
         g.previewFrame->SetOffsetY(frameY);
-        // Rounded like the menus, over a soft shadow.
-        const float r = float(Px(8));
-        if (s.cx != g.previewShadowSize.cx || s.cy != g.previewShadowSize.cy) {
-            g.previewShadowSize = s;
-            g.previewShadowPad = DrawPreviewShadow(g.dcomp.Get(), g.previewShadow.Get(),
-                                                   GetDpiForWindow(g.hwnd) / 96.0f, s, r);
-        }
         g.previewShadow->SetOffsetX(frameX - g.previewShadowPad);
         g.previewShadow->SetOffsetY(frameY - g.previewShadowPad);
-        IDCompositionRectangleClip* clip = g.previewClip.Get();
-        clip->SetRight(float(s.cx));
-        clip->SetBottom(float(s.cy));
-        clip->SetTopLeftRadiusX(r);
-        clip->SetTopLeftRadiusY(r);
-        clip->SetTopRightRadiusX(r);
-        clip->SetTopRightRadiusY(r);
-        clip->SetBottomLeftRadiusX(r);
-        clip->SetBottomLeftRadiusY(r);
-        clip->SetBottomRightRadiusX(r);
-        clip->SetBottomRightRadiusY(r);
     } else {  // audio only, or not loaded yet
         g.previewImage->SetContent(nullptr);
         g.previewShadow->SetContent(nullptr);
@@ -779,6 +788,24 @@ void UpdatePreview(POINT pt) {
         g.previewShown = true;
     }
     g.dcomp->Commit();
+}
+
+// UpdatePreview for a mouse move, at most once per frame shown: at once if it wasn't placed this frame, else at
+// the next frame, where the mouse is by then. A fast mouse reports far more often than frames are shown.
+void MovePreview(POINT pt) {
+    g.previewPoint = pt;
+    if (g.framePending) {
+        g.previewMoved = true;
+        return;
+    }
+    UpdatePreview(pt);
+    g.framePending = true;
+    RequestFrame();
+}
+
+void OnFrame() {
+    g.framePending = false;
+    if (std::exchange(g.previewMoved, false)) MovePreview(g.previewPoint);
 }
 
 // Fits the video below the menu bar, keeping its aspect ratio. The engine renders it at the size it fills the
@@ -1332,6 +1359,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_APP_SUBTITLE_CUE:
             OnSubtitleCue(wp, lp);
             return 0;
+        case WM_APP_FRAME:
+            OnFrame();
+            return 0;
         case WM_PAINT:  // everything is drawn by DirectComposition
             ValidateRect(hwnd, nullptr);
             return 0;
@@ -1436,7 +1466,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SetHot(HitTest({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}));
                 SetPanelHot({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
             }
-            UpdatePreview({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+            MovePreview({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
             return 0;
         case WM_MOUSELEAVE:
             g.tracking = false;

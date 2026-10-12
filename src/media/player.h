@@ -14,12 +14,16 @@ constexpr UINT WM_APP_SUBTITLE_TRACK = WM_APP + 2;
 // Posted as each cue of the selected subtitle track starts showing: wParam is the track's id, lParam a Cue* for
 // the window to delete.
 constexpr UINT WM_APP_SUBTITLE_CUE = WM_APP + 3;
+// Posted once at the next compositor frame after each RequestFrame.
+constexpr UINT WM_APP_FRAME = WM_APP + 4;
 
 // Creates a GPU device of its own, Media Foundation's media engine, which decodes on the GPU, and a thread that
 // presents each new frame into a swap chain for DirectComposition, once per compositor frame. The engine's events
 // are posted to hwnd.
 bool InitPlayer(HWND hwnd);
 void ShutdownPlayer();
+// Has WM_APP_FRAME posted at the next compositor frame, so the window can update once per frame shown.
+void RequestFrame();
 
 // Starts loading and playing a local file; the outcome arrives as events. Fails if the file can't be opened.
 HRESULT OpenVideo(const std::wstring& path);
