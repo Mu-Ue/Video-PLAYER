@@ -12,6 +12,7 @@ add_executable(Video-PLAYER WIN32
     src/media/player.cpp
     src/media/subtitles.cpp
     src/platform/file_dialog.cpp
+    src/platform/registration.cpp
     src/ui/overlay.cpp
     src/ui/popup_menu.cpp
     src/ui/window.cpp
@@ -24,11 +25,12 @@ target_compile_options(Video-PLAYER PRIVATE /W4 /permissive- /utf-8 /sdl /guard:
 # List the libraries explicitly instead of CMake's defaults (which import ole32.dll). onecore_apiset comes
 # last, so it only supplies the COM functions, which then bind straight to combase.dll.
 set(CMAKE_CXX_STANDARD_LIBRARIES "")
-target_link_libraries(Video-PLAYER PRIVATE delayimp kernel32 user32 gdi32 imm32 dwmapi shell32 comdlg32 oleaut32 uuid
-                      mfplat mfreadwrite mfuuid avrt d3d11 dxgi dcomp d2d1 dwrite dxguid onecore_apiset)
+target_link_libraries(Video-PLAYER PRIVATE delayimp kernel32 user32 gdi32 imm32 dwmapi advapi32 shell32 comdlg32
+                      oleaut32 uuid mfplat mfreadwrite mfuuid avrt d3d11 dxgi dcomp d2d1 dwrite dxguid onecore_apiset)
 # The file picker and dropped files load their DLLs on first use, and text drawing once the window lays out.
+# The registry is only touched by --register / --unregister.
 target_link_options(Video-PLAYER PRIVATE /DELAYLOAD:comdlg32.dll /DELAYLOAD:shell32.dll /DELAYLOAD:d2d1.dll
-                    /DELAYLOAD:dwrite.dll)
+                    /DELAYLOAD:dwrite.dll /DELAYLOAD:advapi32.dll)
 # Control-flow guard, shadow stack, and DLL imports from System32 only (no planted DLLs next to the exe).
 target_link_options(Video-PLAYER PRIVATE /GUARD:CF /CETCOMPAT /DEPENDENTLOADFLAG:0x800)
 # Spaces are not allowed in target names, only in the file name.

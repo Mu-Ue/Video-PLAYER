@@ -9,6 +9,9 @@ constexpr wchar_t kFileFilter[] =
     L"Videos\0*.mp4;*.m4v;*.mov;*.mkv;*.avi;*.wmv;*.webm;*.3gp;*.ts;*.m2ts\0"
     L"Subtitles\0*.srt\0";
 constexpr wchar_t kSubtitleFilter[] = L"Subtitles\0*.srt\0";
+// The types --register offers the player as the default app for; keep in step with kFileFilter.
+constexpr const wchar_t* kVideoExtensions[] = {L".mp4", L".m4v", L".mov", L".mkv", L".avi",
+                                               L".wmv", L".webm", L".3gp", L".ts", L".m2ts"};
 
 constexpr double kSeekStep = 5.0;     // seconds
 constexpr double kVolumeStep = 0.05;  // of full volume

@@ -5,7 +5,9 @@
 #include <string>
 #include <vector>
 
+#include "config.h"
 #include "platform/file_dialog.h"
+#include "platform/registration.h"
 #include "ui/window.h"
 
 namespace {
@@ -52,6 +54,15 @@ std::vector<std::wstring> ParseArgs(const wchar_t* s) {
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int showCmd) {
     HardenProcess();
     if (wcsncmp(cmdLine, L"--dialog ", 9) == 0) return DialogMain();
+    if (wcscmp(cmdLine, L"--register") == 0) {
+        if (RegisterApp()) return 0;
+        MessageBoxW(nullptr, L"Could not register the player with Windows.", kAppName, MB_ICONERROR);
+        return 1;
+    }
+    if (wcscmp(cmdLine, L"--unregister") == 0) {
+        UnregisterApp();
+        return 0;
+    }
 
     // The player has no text input, so never load the IME / text services stack (the file dialog runs
     // in its own process and keeps it).
