@@ -396,8 +396,7 @@ constexpr const wchar_t* kPanelTitles[] = {L"Audio", L"Subtitles"};
 void FillPanel() {
     std::vector<std::wstring>& audio = g.columns[0].rows;
     std::vector<std::wstring>& subtitles = g.columns[1].rows;
-    audio.clear();
-    if (g.audio.size() >= 2) audio = g.audio;
+    audio = g.audio;
     subtitles = {L"Off"};
     for (const SubtitleTrack& t : g.tracks) subtitles.push_back(t.label);
     const float scale = GetDpiForWindow(g.hwnd) / 96.0f;
