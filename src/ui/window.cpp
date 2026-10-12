@@ -748,6 +748,26 @@ void LoadSubtitleFile(const std::wstring& path) {
     if (IsWindowVisible(g.hwnd)) ShowOsd(L"Subtitles: " + g.tracks[size_t(index)].label);
 }
 
+// Adds the .srt files next to the video whose names start with its own, such as "Movie.en.srt", without showing
+// them.
+void AddSidecarSubtitles(const std::wstring& video) {
+    const size_t slash = video.find_last_of(L"\\/"), dot = video.find_last_of(L'.');
+    const size_t end = dot != std::wstring::npos && (slash == std::wstring::npos || dot > slash) ? dot : video.size();
+    WIN32_FIND_DATAW found;
+    const HANDLE find = FindFirstFileExW((video.substr(0, end) + L"*.srt").c_str(), FindExInfoBasic, &found,
+                                        FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+    if (find == INVALID_HANDLE_VALUE) return;
+    const std::wstring dir = video.substr(0, slash + 1);  // empty if there is no slash
+    int count = 0;
+    do {
+        // The pattern can also match longer extensions through 8.3 names.
+        if (!(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && IsSubtitleFile(found.cFileName)) {
+            AddSubtitleFile(dir + found.cFileName);
+        }
+    } while (++count < kMaxSidecarSubtitles && FindNextFileW(find, &found));
+    FindClose(find);
+}
+
 bool OpenVideoFile(const std::wstring& path) {
     const HRESULT hr = OpenVideo(path);
     if (FAILED(hr)) {
@@ -768,6 +788,7 @@ bool OpenVideoFile(const std::wstring& path) {
     for (MSG msg; PeekMessageW(&msg, g.hwnd, WM_APP_SUBTITLE_CUE, WM_APP_SUBTITLE_CUE, PM_REMOVE);) {
         delete reinterpret_cast<Cue*>(msg.lParam);
     }
+    AddSidecarSubtitles(path);
     UpdateSubtitles(false);
     HideOsd();
     SetWindowTextW(g.hwnd, FileName(path).c_str());

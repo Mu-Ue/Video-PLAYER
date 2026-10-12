@@ -21,7 +21,7 @@ Output: `build\Video-PLAYER.exe` (single file, no dependencies).
 "Video-PLAYER.exe" [video.mp4] [subtitles.srt]
 ```
 
-Plays the formats Windows supports (MP4, MOV, MKV, AVI, WMV, …). Drop a video or an `.srt` file on the window, use File → Open, or add subtitles to the playing video with Subtitles → Add subtitle file. Text subtitles built into an MKV are detected and start off; press `S` to show them. Moving the mouse shows the controls over the bottom of the video: a seek bar, play / pause, seek back / forward, volume, subtitles and fullscreen.
+Plays the formats Windows supports (MP4, MOV, MKV, AVI, WMV, …). Drop a video or an `.srt` file on the window, use File → Open, or add subtitles to the playing video with Subtitles → Add subtitle file. Text subtitles built into an MKV, and `.srt` files next to the video named like it (`Movie.en.srt`), are detected and start off; press `S` to show them, or pick an audio or subtitle track with the subtitles button. Moving the mouse shows the controls over the bottom of the video: a seek bar, play / pause, seek back / forward, volume, subtitles and fullscreen.
 
 | Input                  | Action                  |
 | ---------------------- | ----------------------- |
