@@ -727,6 +727,11 @@ bool UpdatePreview(POINT pt) {
     const int x = std::clamp(int(pt.x), left, right);
     // Centered on x, but kept over the bar.
     const auto place = [&](int width) { return float(std::clamp(x - width / 2, left, std::max(left, right - width))); };
+    const SIZE chain = PreviewSize();
+    // A move along y only leaves it where it is.
+    if (g.previewShown && x == g.previewX && chain.cx == g.previewChainSize.cx && chain.cy == g.previewChainSize.cy) {
+        return true;
+    }
     if (x != g.previewX) {
         g.previewX = x;
         const double seconds = double(x - left) / std::max(1, right - left) * g.duration;
@@ -742,7 +747,6 @@ bool UpdatePreview(POINT pt) {
     const int timeTop = int(seek.top + seek.bottom) / 2 - Px(14) - int(t.cy);
     g.previewTime->SetOffsetX(place(t.cx));
     g.previewTime->SetOffsetY(float(timeTop));
-    const SIZE chain = PreviewSize();
     if (chain.cx > 0 && chain.cy > 0) {
         const int side = std::clamp(int(TextScale() * 0.35f), Px(120), Px(320));
         const SIZE s = Fit(chain, side, side);
@@ -780,6 +784,7 @@ bool UpdatePreview(POINT pt) {
         g.previewImage->SetContent(nullptr);
         g.previewShadow->SetContent(nullptr);
         g.previewShadowSize = {};
+        g.previewChainSize = chain;
     }
     if (!g.previewShown) {
         g.controls->AddVisual(g.previewShadow.Get(), TRUE, nullptr);
