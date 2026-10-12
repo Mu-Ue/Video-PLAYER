@@ -8,7 +8,9 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
+#include <utility>
 
 using Microsoft::WRL::ComPtr;
 
@@ -315,6 +317,7 @@ struct {
     UINT height = 0;
     UINT pillWidth = 0;  // the label's background, as last drawn
     std::vector<ComPtr<IDCompositionVisual>> chars;
+    std::vector<std::pair<int, int>> shown;  // each char's glyph (-1 for none) and x, as last set
 } glyphs;
 
 bool DrawGlyphs(IDCompositionDevice* dcomp, float scale) {
@@ -358,6 +361,7 @@ bool DrawGlyphs(IDCompositionDevice* dcomp, float scale) {
     glyphs.height = h;
     glyphs.scale = scale;
     for (const auto& c : glyphs.chars) c->SetContent(glyphs.surface);
+    glyphs.shown.assign(glyphs.chars.size(), {-1, INT_MIN});  // the slices moved: set them all again
     return true;
 }
 
@@ -553,7 +557,8 @@ SIZE DrawTimeLabel(IDCompositionDevice* dcomp, IDCompositionVisual* visual, floa
         glyphs.pillWidth = drawn ? w : 0;
         if (!drawn) return {};
     }
-    // Each character shows its glyph's slice of the glyph surface, side by side.
+    // Each character shows its glyph's slice of the glyph surface, side by side. Only the characters that changed
+    // are set again; a sweep mostly changes the last digit or two.
     int x = int(w - total) / 2;
     size_t k = 0;
     for (; k < text.size(); ++k) {
@@ -562,14 +567,22 @@ SIZE DrawTimeLabel(IDCompositionDevice* dcomp, IDCompositionVisual* visual, floa
             if (FAILED(dcomp->CreateVisual(&v)) || FAILED(visual->AddVisual(v.Get(), TRUE, nullptr))) break;
             v->SetContent(glyphs.surface);
             glyphs.chars.push_back(std::move(v));
+            glyphs.shown.emplace_back(-1, INT_MIN);
         }
         const int i = glyph(text[k]);
-        const float left = float(i * glyphs.cell + glyphs.pad);
-        glyphs.chars[k]->SetOffsetX(x - left);
-        glyphs.chars[k]->SetClip(D2D1::RectF(left, 0, left + glyphs.advance[i], float(h)));
+        if (glyphs.shown[k] != std::pair{i, x}) {
+            glyphs.shown[k] = {i, x};
+            const float left = float(i * glyphs.cell + glyphs.pad);
+            glyphs.chars[k]->SetOffsetX(x - left);
+            glyphs.chars[k]->SetClip(D2D1::RectF(left, 0, left + glyphs.advance[i], float(h)));
+        }
         x += glyphs.advance[i];
     }
-    for (; k < glyphs.chars.size(); ++k) glyphs.chars[k]->SetClip(D2D1::RectF(0, 0, 0, 0));
+    for (; k < glyphs.chars.size(); ++k) {
+        if (glyphs.shown[k].first < 0) continue;
+        glyphs.shown[k] = {-1, INT_MIN};
+        glyphs.chars[k]->SetClip(D2D1::RectF(0, 0, 0, 0));
+    }
     return {LONG(w), LONG(h)};
 }
 
