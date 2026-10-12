@@ -46,7 +46,7 @@ struct SubtitleTrack {
 struct PanelColumn {
     std::vector<std::wstring> rows;
     int width = 0;   // in pixels
-    int scroll = 0;  // rows scrolled off the top
+    int scroll = 0;  // pixels scrolled off the top
 };
 
 // Where the track panel is, in client pixels.
@@ -84,7 +84,6 @@ struct Window {
     bool panelOpen = false;
     PanelColumn columns[2];
     int hotColumn = -1, hotRow = -1;
-    int wheel = 0;  // mouse wheel turns short of a row
     std::vector<size_t> shown;  // indices of the cues on screen
     float subtitleHeight = 0;   // of the bottom ones
     std::wstring osdText;
@@ -351,29 +350,33 @@ void UpdateControls() {
     if (g.controlsShown && DrawControls()) g.dcomp->Commit();
 }
 
-// The panel sits right above the seek bar at the right, as tall as its longest column or the room above allows.
-// Clamps the columns' scroll positions to it.
+// The panel sits right above the seek bar at the right, as tall as its longest column, up to seven and a half rows
+// (the half row hints that it scrolls) or the room above. A column that scrolls runs into the bottom edge, like
+// Netflix's. Clamps the columns' scroll positions to it.
 PanelGeometry PanelLayout() {
     RECT client;
     GetClientRect(g.hwnd, &client);
-    const int pad = Px(16), gap = Px(24), headerH = Px(32), rowH = Px(30);
+    // Netflix's spacing, at half the size of its panel on a 1.5x screen.
+    const int top = Px(6), side = Px(10), gap = Px(8), headerH = Px(44), rowH = Px(41);
     const int bottom = int(ControlRect(kSeek).top) - Px(4), right = int(client.right) - Px(12);
-    const int maxRows = std::max(1, (bottom - MenuBarHeight() - Px(8) - 2 * pad - headerH) / rowH);
-    int rows = 0, width = 2 * pad - gap;
+    const int maxH = std::clamp(bottom - MenuBarHeight() - Px(8) - top - headerH, rowH, rowH * 15 / 2);
+    int listH = 0, longest = 0, width = 2 * side - gap;
     for (const PanelColumn& c : g.columns) {
         if (c.rows.empty()) continue;
-        rows = std::max(rows, std::min(maxRows, int(c.rows.size())));
+        longest = std::max(longest, int(c.rows.size()) * rowH);
+        listH = std::min(maxH, longest);
         width += c.width + gap;
     }
-    PanelGeometry p{{right - width, bottom - 2 * pad - headerH - rows * rowH, right, bottom}, {}, rowH, headerH};
-    int x = p.panel.left + pad;
+    const int pad = longest > listH ? 0 : Px(6);
+    PanelGeometry p{{right - width, bottom - top - headerH - listH - pad, right, bottom}, {}, rowH, headerH};
+    int x = p.panel.left + side;
     for (int k = 0; k < 2; ++k) {
         PanelColumn& c = g.columns[k];
         if (c.rows.empty()) continue;
-        const int top = p.panel.top + pad + headerH;
-        p.rows[k] = {x, top, x + c.width, top + rows * rowH};
+        const int rowsTop = p.panel.top + top + headerH;
+        p.rows[k] = {x, rowsTop, x + c.width, rowsTop + listH};
         x += c.width + gap;
-        c.scroll = std::clamp(c.scroll, 0, std::max(0, int(c.rows.size()) - rows));
+        c.scroll = std::clamp(c.scroll, 0, std::max(0, int(c.rows.size()) * rowH - listH));
     }
     return p;
 }
@@ -383,7 +386,7 @@ int PanelColumnAt(const PanelGeometry& p, POINT pt, int& row) {
     row = -1;
     for (int k = 0; k < 2; ++k) {
         if (!PtInRect(&p.rows[k], pt)) continue;
-        row = (pt.y - p.rows[k].top) / p.rowH + g.columns[k].scroll;
+        row = (pt.y - p.rows[k].top + g.columns[k].scroll) / p.rowH;
         if (row >= int(g.columns[k].rows.size())) row = -1;
         return k;
     }
@@ -404,7 +407,8 @@ void FillPanel() {
         PanelColumn& c = g.columns[k];
         float w = TrackTextWidth(kPanelTitles[k], scale, true);
         for (const std::wstring& row : c.rows) w = std::max(w, TrackTextWidth(row, scale, false));
-        c.width = std::clamp(int(std::ceil(w)) + Px(26 + 12), Px(140), Px(320));
+        // The check mark's column, the text, and room before the scrollbar.
+        c.width = std::min(int(std::ceil(w)) + Px(30 + 34), Px(360));
     }
 }
 
@@ -426,9 +430,16 @@ void DrawPanel() {
         if (c.rows.empty()) continue;
         TrackColumn column{local({rows.left, rows.top - p.headerH, rows.right, rows.top}), kPanelTitles[k],
                            local(rows), {}};
-        const int shown = (rows.bottom - rows.top) / p.rowH;
-        for (int i = c.scroll; i < std::min(int(c.rows.size()), c.scroll + shown); ++i) {
-            const int y = rows.top + (i - c.scroll) * p.rowH;
+        const int listH = rows.bottom - rows.top, totalH = int(c.rows.size()) * p.rowH;
+        column.more = totalH - c.scroll > listH;
+        if (totalH > listH) {  // a scrollbar thumb along the right edge
+            const int trackTop = rows.top + Px(5), track = listH - Px(10);
+            const int y = trackTop + MulDiv(track, c.scroll, totalH);
+            column.thumb = local({rows.right - Px(1), y, rows.right, y + MulDiv(track, listH, totalH)});
+        }
+        for (int i = c.scroll / p.rowH; i < int(c.rows.size()); ++i) {
+            const int y = rows.top + i * p.rowH - c.scroll;
+            if (y >= rows.bottom) break;
             BarItem item{local({rows.left, y, rows.right, y + p.rowH}), c.rows[size_t(i)]};
             item.hot = k == g.hotColumn && i == g.hotRow;
             item.checked = i == checked[k];
@@ -1259,12 +1270,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             ScreenToClient(hwnd, &pt);
             int row;
-            const int column = g.panelOpen ? PanelColumnAt(PanelLayout(), pt, row) : -1;
+            if (!g.panelOpen) return 0;
+            const PanelGeometry p = PanelLayout();
+            const int column = PanelColumnAt(p, pt, row);
             if (column < 0) return 0;
-            g.wheel += GET_WHEEL_DELTA_WPARAM(wp);
-            const int steps = g.wheel / WHEEL_DELTA;
-            g.wheel -= steps * WHEEL_DELTA;
-            g.columns[column].scroll -= steps;
+            // Two rows a notch, and smoothly for the finer steps of touchpads and free-spinning wheels.
+            g.columns[column].scroll -= MulDiv(GET_WHEEL_DELTA_WPARAM(wp), 2 * p.rowH, WHEEL_DELTA);
             g.hotColumn = -1;  // makes SetPanelHot redraw at the new scroll position
             SetPanelHot(pt);
             return 0;

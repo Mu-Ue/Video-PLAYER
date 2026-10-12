@@ -61,10 +61,12 @@ struct TrackColumn {
     std::wstring title;
     RECT rows;
     std::vector<BarItem> items;
+    bool more = false;  // rows below, faded out at the bottom
+    RECT thumb{};       // the scrollbar's thumb; empty if the rows fit
 };
 
-// Draws the audio and subtitle track panel, a rounded dark box with the columns side by side, into the visual's
-// surface and sets it as the visual's content.
+// Draws the audio and subtitle track panel, a dark box with the columns side by side, into the visual's surface
+// and sets it as the visual's content.
 void DrawTrackPanel(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT width, UINT height, float scale,
                     const std::vector<TrackColumn>& columns);
 

@@ -14,6 +14,8 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
+constexpr UINT32 kPanelColor = 0x262626;  // Netflix's
+
 struct Run {
     ComPtr<ID2D1PathGeometry> outline;
     D2D1_POINT_2F origin;
@@ -33,6 +35,7 @@ struct {
     ComPtr<IDWriteFactory> dwrite;
     ComPtr<ID2D1SolidColorBrush> brush;
     ComPtr<ID2D1LinearGradientBrush> shade;  // under the controls
+    ComPtr<ID2D1LinearGradientBrush> fade;   // over the bottom of a track panel column that scrolls
     ComPtr<ID2D1StrokeStyle> round;
     ComPtr<ID2D1Effect> shadow;  // under the outlined text
     std::vector<Run> runs;  // of the text being drawn
@@ -125,6 +128,13 @@ bool Init() {
         hr = g.context->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties({0, 0}, {0, 1}),
                                                   collection.Get(), &g.shade);
     }
+    const D2D1_GRADIENT_STOP fade[] = {{0, D2D1::ColorF(kPanelColor, 0)}, {1, D2D1::ColorF(kPanelColor, 1)}};
+    collection.Reset();
+    if (SUCCEEDED(hr)) hr = g.context->CreateGradientStopCollection(fade, UINT32(std::size(fade)), &collection);
+    if (SUCCEEDED(hr)) {
+        hr = g.context->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties({0, 0}, {0, 1}),
+                                                  collection.Get(), &g.fade);
+    }
     if (FAILED(hr)) g.context.Reset();
     return SUCCEEDED(hr);
 }
@@ -137,7 +147,7 @@ bool IsFontInstalled(const wchar_t* family) {
     return found;
 }
 
-// Netflix's subtitle font if installed, else the closest one Windows has.
+// Netflix's font, for the subtitles and the track panel, if installed, else the closest one Windows has.
 const wchar_t* SubtitleFont() {
     static const wchar_t* const font = IsFontInstalled(L"Netflix Sans") ? L"Netflix Sans" : L"Segoe UI";
     return font;
@@ -168,9 +178,9 @@ ComPtr<IDWriteTextLayout> CreateLayout(std::wstring_view text, const std::vector
 }
 
 // A single line of text centered vertically in its box.
-ComPtr<IDWriteTextFormat> CreateFormat(const wchar_t* family, float size, bool bold, DWRITE_TEXT_ALIGNMENT align) {
+ComPtr<IDWriteTextFormat> CreateFormat(const wchar_t* family, float size, DWRITE_FONT_WEIGHT weight,
+                                       DWRITE_TEXT_ALIGNMENT align) {
     ComPtr<IDWriteTextFormat> format;
-    const DWRITE_FONT_WEIGHT weight = bold ? DWRITE_FONT_WEIGHT_SEMI_BOLD : DWRITE_FONT_WEIGHT_NORMAL;
     if (FAILED(g.dwrite->CreateTextFormat(family, nullptr, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
                                           size, L"", &format))) {
         return nullptr;
@@ -192,14 +202,16 @@ const wchar_t* IconFont() {
 bool SetScale(float scale) {
     if (scale == g.scale) return true;
     g.scale = 0;
-    g.menu = CreateFormat(L"Segoe UI", 12 * scale, false, DWRITE_TEXT_ALIGNMENT_CENTER);
-    g.time = CreateFormat(L"Segoe UI", 13 * scale, false, DWRITE_TEXT_ALIGNMENT_LEADING);
-    g.title = CreateFormat(L"Segoe UI", 15 * scale, true, DWRITE_TEXT_ALIGNMENT_CENTER);
-    g.icons = CreateFormat(IconFont(), 24 * scale, false, DWRITE_TEXT_ALIGNMENT_CENTER);
-    g.number = CreateFormat(L"Segoe UI", 9 * scale, true, DWRITE_TEXT_ALIGNMENT_CENTER);
-    g.header = CreateFormat(L"Segoe UI", 14 * scale, true, DWRITE_TEXT_ALIGNMENT_LEADING);
-    g.row = CreateFormat(L"Segoe UI", 13 * scale, false, DWRITE_TEXT_ALIGNMENT_LEADING);
-    g.check = CreateFormat(IconFont(), 12 * scale, false, DWRITE_TEXT_ALIGNMENT_CENTER);
+    constexpr auto normal = DWRITE_FONT_WEIGHT_NORMAL, semibold = DWRITE_FONT_WEIGHT_SEMI_BOLD;
+    g.menu = CreateFormat(L"Segoe UI", 12 * scale, normal, DWRITE_TEXT_ALIGNMENT_CENTER);
+    g.time = CreateFormat(L"Segoe UI", 13 * scale, normal, DWRITE_TEXT_ALIGNMENT_LEADING);
+    g.title = CreateFormat(L"Segoe UI", 15 * scale, semibold, DWRITE_TEXT_ALIGNMENT_CENTER);
+    g.icons = CreateFormat(IconFont(), 24 * scale, normal, DWRITE_TEXT_ALIGNMENT_CENTER);
+    g.number = CreateFormat(L"Segoe UI", 9 * scale, semibold, DWRITE_TEXT_ALIGNMENT_CENTER);
+    // Netflix's proportions: headers 1.4 times the rows.
+    g.header = CreateFormat(SubtitleFont(), 21 * scale, DWRITE_FONT_WEIGHT_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING);
+    g.row = CreateFormat(SubtitleFont(), 15 * scale, normal, DWRITE_TEXT_ALIGNMENT_LEADING);
+    g.check = CreateFormat(IconFont(), 16 * scale, normal, DWRITE_TEXT_ALIGNMENT_CENTER);
     g.ellipsis.Reset();
     g.rowEllipsis.Reset();
     if (!g.menu || !g.time || !g.title || !g.icons || !g.number || !g.header || !g.row || !g.check ||
@@ -444,22 +456,15 @@ void DrawTrackPanel(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UIN
         visual->SetContent(nullptr);
         return;
     }
-    const float check = 26 * scale, radius = 4 * scale;
+    // Like Netflix's: a plain box, white headers, gray rows that turn white when selected or under the mouse.
+    const float check = 30 * scale, fade = 50 * scale;
     Paint(dcomp, visual, width, height, [&](ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F&) {
         dc->Clear(D2D1::ColorF(0, 0, 0, 0));
         dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-        g.brush->SetColor(D2D1::ColorF(0x262626, 0.95f));
-        dc->FillRoundedRectangle(
-            D2D1::RoundedRect(D2D1::RectF(0, 0, float(width), float(height)), 2 * radius, 2 * radius), g.brush.Get());
-        for (size_t k = 0; k < columns.size(); ++k) {
-            const TrackColumn& c = columns[k];
+        g.brush->SetColor(D2D1::ColorF(kPanelColor));
+        dc->FillRectangle(D2D1::RectF(0, 0, float(width), float(height)), g.brush.Get());
+        for (const TrackColumn& c : columns) {
             const D2D1_RECT_F rows = RectF(c.rows);
-            if (k > 0) {  // a divider halfway from the previous column
-                const float x = std::round((float(columns[k - 1].rows.right) + rows.left) / 2);
-                g.brush->SetColor(D2D1::ColorF(0x404040));
-                dc->FillRectangle(D2D1::RectF(x, rows.top, x + std::max(1.0f, std::round(scale)), rows.bottom),
-                                  g.brush.Get());
-            }
             D2D1_RECT_F header = RectF(c.header);
             header.left += check;
             g.brush->SetColor(D2D1::ColorF(0xffffff));
@@ -468,10 +473,6 @@ void DrawTrackPanel(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UIN
             dc->PushAxisAlignedClip(rows, D2D1_ANTIALIAS_MODE_ALIASED);
             for (const BarItem& item : c.items) {
                 const D2D1_RECT_F r = RectF(item.rect);
-                if (item.hot) {
-                    g.brush->SetColor(D2D1::ColorF(0x3a3a3a));
-                    dc->FillRoundedRectangle(D2D1::RoundedRect(r, radius, radius), g.brush.Get());
-                }
                 g.brush->SetColor(D2D1::ColorF(item.checked || item.hot ? 0xffffff : 0xb3b3b3));
                 if (item.checked) {
                     dc->DrawText(L"\xE73E", 1, g.check.Get(), D2D1::RectF(r.left, r.top, r.left + check, r.bottom),
@@ -481,7 +482,16 @@ void DrawTrackPanel(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UIN
                              D2D1::RectF(r.left + check, r.top, r.right - 8 * scale, r.bottom), g.brush.Get(),
                              D2D1_DRAW_TEXT_OPTIONS_CLIP);
             }
+            if (c.more) {  // the rows below fade into the box
+                g.fade->SetStartPoint({0, rows.bottom - fade});
+                g.fade->SetEndPoint({0, rows.bottom});
+                dc->FillRectangle(D2D1::RectF(rows.left, rows.bottom - fade, rows.right, rows.bottom), g.fade.Get());
+            }
             dc->PopAxisAlignedClip();
+            if (c.thumb.bottom > c.thumb.top) {
+                g.brush->SetColor(D2D1::ColorF(0x414141));
+                dc->FillRectangle(RectF(c.thumb), g.brush.Get());
+            }
         }
     });
 }
