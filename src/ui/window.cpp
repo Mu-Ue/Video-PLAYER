@@ -25,7 +25,7 @@ using Microsoft::WRL::ComPtr;
 namespace {
 
 enum : UINT_PTR { kSubtitleTimer = 1, kOsdTimer, kIdleTimer, kShowTimer };
-enum : UINT { kCmdOpen = 1, kCmdAddSubtitles, kCmdShowSubtitles };
+enum : UINT { kCmdOpen = 1, kCmdAddSubtitles };
 // The buttons on the menu bar, then the controls: buttons left to right, the seek bar, the volume slider, and two
 // labels.
 enum Control {
@@ -554,16 +554,12 @@ void OnSubtitleCue(LPARAM cue) {
     if (g.embeddedSubs && AddCue(g.subs, std::move(*owned))) UpdateSubtitles(true);
 }
 
-void ToggleSubtitles();
-
 // Shows the menu of a menu bar button, kFile or kSubs.
 void ShowMenu(Control which) {
     if (g.fullscreen) return;
     const MenuItem file[] = {{kCmdOpen, L"Open...", 'O', L"Ctrl+O"}};
     // Opening a video clears its subtitles, so they are added to the one playing.
-    const MenuItem subs[] = {{kCmdAddSubtitles, L"Add subtitle file...", 'A', L"", HasVideo()},
-                             {},
-                             {kCmdShowSubtitles, L"Show subtitles", 'S', L"S", HasSubtitles(), g.subsOn}};
+    const MenuItem subs[] = {{kCmdAddSubtitles, L"Add subtitle file...", 'A', L"", HasVideo()}};
     RECT anchor = ControlRect(which);
     MapWindowPoints(g.hwnd, nullptr, reinterpret_cast<POINT*>(&anchor), 2);
     g.menuOpen = which;
@@ -583,7 +579,6 @@ void ShowMenu(Control which) {
     switch (cmd) {
         case kCmdOpen: Open(); break;
         case kCmdAddSubtitles: AddSubtitles(); break;
-        case kCmdShowSubtitles: ToggleSubtitles(); break;
     }
 }
 
