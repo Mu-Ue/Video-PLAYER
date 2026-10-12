@@ -14,7 +14,7 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
-constexpr UINT32 kPanelColor = 0x262626;  // Netflix's
+constexpr UINT32 kPanelColor = 0x202020;  // the dark title bar's
 
 struct Run {
     ComPtr<ID2D1PathGeometry> outline;
@@ -381,7 +381,7 @@ void DrawBar(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT width
     }
     const float inset = std::round(3 * scale), radius = 4 * scale;
     Paint(dcomp, visual, width, height, [&](ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F&) {
-        dc->Clear(D2D1::ColorF(0x202020));  // the dark title bar's color
+        dc->Clear(D2D1::ColorF(kPanelColor));
         dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         for (const BarItem& item : items) {
             const D2D1_RECT_F r = RectF(item.rect);
