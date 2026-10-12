@@ -412,7 +412,7 @@ void DrawControls(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT 
 
         // The rest of the track, the played part and the knob.
         const D2D1_RECT_F seek = RectF(c.seekBar);
-        const float y = (seek.top + seek.bottom) / 2, half = (c.seekHot ? 3 : 2) * scale;
+        const float y = (seek.top + seek.bottom) / 2, half = (c.seekHot ? 4 : 2.5f) * scale;
         const float x = seek.left + float(c.progress) * (seek.right - seek.left), knob = (c.seekHot ? 8 : 6) * scale;
         g.brush->SetColor(D2D1::ColorF(1, 1, 1, 0.35f));
         dc->FillRectangle(D2D1::RectF(x, y - half, seek.right, y + half), g.brush.Get());

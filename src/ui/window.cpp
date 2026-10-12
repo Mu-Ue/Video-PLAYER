@@ -255,7 +255,7 @@ RECT ControlRect(Control c) {
     const int seekY = client.bottom - Px(80), rowY = client.bottom - Px(34), half = Px(24);
     const int sliderX = margin + 4 * step;  // right of the volume button
     switch (c) {
-        case kSeek: return {margin, seekY - Px(10), client.right - margin, seekY + Px(10)};
+        case kSeek: return {margin, seekY - Px(16), client.right - margin, seekY + Px(16)};
         case kVolumeBar: return {sliderX, rowY - half, sliderX + (VolumeExpanded() ? slider : 0), rowY + half};
         case kTime: {
             const int x = int(ControlRect(kVolumeBar).right) + Px(8);
