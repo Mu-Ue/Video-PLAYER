@@ -114,22 +114,25 @@ struct {
     ComPtr<IMFTimedText> timedText;  // null if unsupported
     std::vector<DWORD> audioStreams;  // the engine's stream index of each audio track
     // The seek bar preview: a thread that decodes just the key frame the window wants. The window hands it a file
-    // to open or a key frame to show under previewLock, then sets previewWake.
+    // to open or a key frame to decode under previewLock, then sets previewWake; it hands back the picture there.
     std::thread previewer;
     HANDLE previewWake = nullptr;
     SRWLOCK previewLock = SRWLOCK_INIT;
     std::wstring previewPath;
-    LONGLONG previewWanted = -1;  // the key frame to show, in 100 ns units, or -1
-    double previewBucket = -1;    // the window's last span of kPreviewSpan seconds
-    LONGLONG previewAsked = -1;   // and its key frame, as last put in previewWanted
+    LONGLONG previewWanted = -1;  // the key frame to decode, in 100 ns units, or -1
+    LONGLONG readyTime = -1;      // a decoded picture waiting for the window, and its key frame
+    ComPtr<ID3D11Texture2D> ready;
+    ComPtr<ID3D11Texture2D> taken;  // the last one the window took, alive while it opens it
+    double previewBucket = -1;      // the window's last span
+    LONGLONG previewKey = -1;       // and its key frame
     // A second parser of the open file, which knows where its key frames are; null if the format doesn't say.
     ComPtr<IMFMediaSource> keySource;
     ComPtr<IMFSeekInfo> keyFrames;
     bool started = false;  // MFStartup succeeded
-    // The swap chains, guarded by lock: the render thread presents into the video's and the window thread sizes it;
-    // the previewer sizes and presents into the preview's.
+    // The swap chain, guarded by lock: the render thread presents into it and the window thread sizes it. The
+    // previewer sets the preview's size under it too.
     SRWLOCK lock = SRWLOCK_INIT;
-    ComPtr<IDXGISwapChain1> chain, previewChain;
+    ComPtr<IDXGISwapChain1> chain;
     UINT width = 0, height = 0, previewWidth = 0, previewHeight = 0;
     std::atomic<bool> redraw = false;  // present the current frame even if it isn't new; set with Redraw
     std::atomic<bool> frameWanted = false;  // post WM_APP_FRAME at the next frame; set with RequestFrame
@@ -416,40 +419,45 @@ ComPtr<IMFSample> ReadKeyFrame(IMFSourceReader* reader, LONGLONG time) {
     return sample;
 }
 
-// Presents a decoded frame in the preview's swap chain.
-void PresentKeyFrame(IMFSample* sample) {
+// Copies a decoded frame into a texture of its own, the preview's size, shared with the window's device; null if
+// it can't. The keyed mutex hands it over with key 1 once the copy is done. Only the previewer calls it.
+ComPtr<ID3D11Texture2D> KeepKeyFrame(IMFSample* sample) {
     ComPtr<IMFMediaBuffer> buffer;
     ComPtr<IMFDXGIBuffer> dxgi;
     ComPtr<ID3D11Texture2D> texture;
     UINT index = 0;
     if (!sample || FAILED(sample->GetBufferByIndex(0, &buffer)) || FAILED(buffer.As(&dxgi)) ||
         FAILED(dxgi->GetResource(IID_PPV_ARGS(&texture))) || FAILED(dxgi->GetSubresourceIndex(&index))) {
-        return;
+        return nullptr;
     }
     D3D11_TEXTURE2D_DESC desc;
     texture->GetDesc(&desc);
-    if (desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) return;
+    if (desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) return nullptr;
+    const UINT w = g.previewWidth, h = g.previewHeight;  // only the previewer sets them
+    const D3D11_TEXTURE2D_DESC keep{w, h, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT,
+                                    D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 0,
+                                    D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX};
+    ComPtr<ID3D11Texture2D> kept;
+    ComPtr<IDXGIKeyedMutex> mutex;
+    if (FAILED(g.device->CreateTexture2D(&keep, nullptr, &kept)) || FAILED(kept.As(&mutex)) ||
+        mutex->AcquireSync(0, INFINITE) != S_OK) {
+        return nullptr;
+    }
     ComPtr<ID3D11DeviceContext> context;
     g.device->GetImmediateContext(&context);
-    AcquireSRWLockExclusive(&g.lock);
-    ComPtr<ID3D11Texture2D> target;
-    if (g.previewChain && SUCCEEDED(g.previewChain->GetBuffer(0, IID_PPV_ARGS(&target)))) {
-        const D3D11_BOX box{0, 0, 0, std::min(desc.Width, g.previewWidth), std::min(desc.Height, g.previewHeight), 1};
-        context->CopySubresourceRegion(target.Get(), 0, 0, 0, 0, texture.Get(), index, &box);
-        target.Reset();
-        g.previewChain->Present(0, 0);
-    }
-    ReleaseSRWLockExclusive(&g.lock);
+    const D3D11_BOX box{0, 0, 0, std::min(desc.Width, w), std::min(desc.Height, h), 1};
+    context->CopySubresourceRegion(kept.Get(), 0, 0, 0, 0, texture.Get(), index, &box);
+    mutex->ReleaseSync(1);
+    return kept;
 }
 
-// Opens the files and shows the key frames the window wants, one at a time, always the latest. Nothing queues: each
-// wake reads what is wanted now, and it decodes back to back while that changes. The window asks at most once per
-// frame shown. A picture the mouse moved on from while it decoded is still shown, as the nearest there is, so a fast
-// sweep updates as often as a slow one.
+// Opens the files and decodes the key frames the window wants, one at a time, always the latest. Nothing queues:
+// each wake reads what is wanted now, and it decodes back to back while that changes. Each picture is handed to the
+// window, which keeps it, even if the mouse moved on while it decoded.
 void PreviewLoop() {
     const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
     ComPtr<IMFSourceReader> reader;
-    LONGLONG shown = -1;  // the key frame on screen, in 100 ns units
+    LONGLONG done = -1;  // the key frame last decoded, or tried, in 100 ns units
     const HANDLE events[] = {g.stop, g.previewWake};
     for (;;) {
         AcquireSRWLockExclusive(&g.previewLock);
@@ -459,29 +467,27 @@ void PreviewLoop() {
         if (!path.empty()) {
             UINT w = 0, h = 0;
             reader = OpenPreviewReader(path, w, h);
-            shown = -1;
+            done = -1;
             AcquireSRWLockExclusive(&g.lock);
-            g.previewWidth = g.previewHeight = 0;
-            if (reader && SUCCEEDED(SizeChain(g.previewChain, w, h))) {
-                g.previewWidth = w;
-                g.previewHeight = h;
-            } else {  // audio only, or a format it can't shrink: no previews
-                reader.Reset();
-            }
+            g.previewWidth = reader ? w : 0;  // audio only, or a format it can't shrink: no previews
+            g.previewHeight = reader ? h : 0;
             ReleaseSRWLockExclusive(&g.lock);
         }
-        if (!reader || time < 0 || time == shown) {
+        if (!reader || time < 0 || time == done) {
             if (WaitForMultipleObjects(2, events, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) break;
             continue;
         }
-        const ComPtr<IMFSample> sample = ReadKeyFrame(reader.Get(), time);
-        AcquireSRWLockShared(&g.previewLock);
-        const bool reopened = !g.previewPath.empty();
-        ReleaseSRWLockShared(&g.previewLock);
-        if (sample && !reopened) {  // shown even if the mouse moved on, so a fast sweep keeps up
-            shown = time;
-            PresentKeyFrame(sample.Get());
+        done = time;  // a key frame it can't decode isn't tried again and again
+        const ComPtr<ID3D11Texture2D> picture = KeepKeyFrame(ReadKeyFrame(reader.Get(), time).Get());
+        if (!picture) continue;
+        AcquireSRWLockExclusive(&g.previewLock);
+        const bool reopened = !g.previewPath.empty();  // a picture of the previous file
+        if (!reopened) {
+            g.readyTime = time;
+            g.ready = picture;
         }
+        ReleaseSRWLockExclusive(&g.previewLock);
+        if (!reopened) PostMessageW(g.notify.hwnd, WM_APP_PREVIEW, 0, 0);
     }
     reader.Reset();
     if (com) CoUninitialize();
@@ -508,7 +514,8 @@ void ShutdownPlayer() {
     if (g.renderer.joinable()) g.renderer.join();
     if (g.previewer.joinable()) g.previewer.join();
     g.chain.Reset();
-    g.previewChain.Reset();
+    g.ready.Reset();
+    g.taken.Reset();
     CloseKeyFrames();
     g.timedText.Reset();
     if (g.engine) g.engine->Shutdown();
@@ -536,35 +543,42 @@ HRESULT OpenVideo(const std::wstring& path) {
     AcquireSRWLockExclusive(&g.previewLock);
     g.previewPath = path;
     g.previewWanted = -1;
+    g.ready.Reset();
     ReleaseSRWLockExclusive(&g.previewLock);
     g.previewBucket = -1;
-    g.previewAsked = -1;
+    g.previewKey = -1;
     SetEvent(g.previewWake);
     return hr;
 }
 
-void SeekPreview(double seconds, double duration) {
+LONGLONG PreviewKeyFrame(double seconds, double duration) {
     // A span grows with the video, so a sweep of the bar shows as many pictures however long it is; moves within
-    // one decode nothing new.
+    // one look up nothing.
     const double span = std::max(kMinPreviewSpan, duration / kPreviewCount);
     const double bucket = std::floor(seconds / span);
-    if (bucket == g.previewBucket) return;
+    if (bucket == g.previewBucket) return g.previewKey;
     g.previewBucket = bucket;
-    // The key frame nearest the span's middle, which needs no decoding up to it. Spans can share one.
-    const LONGLONG time = std::llround(NearestKeyFrame(g.keyFrames.Get(), (bucket + 0.5) * span) * 1e7);
-    if (time == g.previewAsked) return;
-    g.previewAsked = time;
+    // Spans can share a key frame.
+    g.previewKey = std::llround(NearestKeyFrame(g.keyFrames.Get(), (bucket + 0.5) * span) * 1e7);
+    return g.previewKey;
+}
+
+void DecodePreview(LONGLONG time) {
     AcquireSRWLockExclusive(&g.previewLock);
     g.previewWanted = time;
     ReleaseSRWLockExclusive(&g.previewLock);
     SetEvent(g.previewWake);
 }
 
-IUnknown* PreviewSwapChain() {
-    AcquireSRWLockShared(&g.lock);
-    IUnknown* chain = g.previewChain.Get();
-    ReleaseSRWLockShared(&g.lock);
-    return chain;
+HANDLE TakePreviewPicture(LONGLONG& time) {
+    AcquireSRWLockExclusive(&g.previewLock);
+    g.taken = std::move(g.ready);
+    time = g.readyTime;
+    ReleaseSRWLockExclusive(&g.previewLock);
+    ComPtr<IDXGIResource> resource;
+    HANDLE handle = nullptr;
+    if (!g.taken || FAILED(g.taken.As(&resource)) || FAILED(resource->GetSharedHandle(&handle))) return nullptr;
+    return handle;
 }
 
 SIZE PreviewSize() {

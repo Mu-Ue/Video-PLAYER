@@ -16,6 +16,8 @@ constexpr UINT WM_APP_SUBTITLE_TRACK = WM_APP + 2;
 constexpr UINT WM_APP_SUBTITLE_CUE = WM_APP + 3;
 // Posted once at the next compositor frame after each RequestFrame.
 constexpr UINT WM_APP_FRAME = WM_APP + 4;
+// Posted when a seek bar preview picture DecodePreview asked for is ready for TakePreviewPicture.
+constexpr UINT WM_APP_PREVIEW = WM_APP + 5;
 
 // Creates a GPU device of its own, Media Foundation's media engine, which decodes on the GPU, and a thread that
 // presents each new frame into a swap chain for DirectComposition, once per compositor frame. The engine's events
@@ -50,13 +52,16 @@ void SetVideoSize(int width, int height);
 // The swap chain, as content for a DirectComposition visual, or null before SetVideoSize.
 IUnknown* VideoSwapChain();
 
-// Shows one picture for each 1/200 of the video (1 second at least): on entering a new span, a thread of its own
-// decodes the key frame nearest its middle, alone and shrunk, into the preview's swap chain. If it is still busy,
-// only the latest is decoded next. The window asks at most once per frame shown.
-void SeekPreview(double seconds, double duration);
-// The preview's swap chain, as content for a DirectComposition visual, and its size; null and 0 x 0 until the
-// video has loaded.
-IUnknown* PreviewSwapChain();
+// The seek bar preview shows one picture for each 1/200 of the video (1 second at least): the key frame nearest
+// the span's middle, which needs no decoding up to it. Returns that key frame for a time, in 100 ns units.
+LONGLONG PreviewKeyFrame(double seconds, double duration);
+// Has a thread of its own decode a key frame from PreviewKeyFrame, alone and shrunk to PreviewSize, then post
+// WM_APP_PREVIEW. If it is still busy, only the latest asked is decoded next.
+void DecodePreview(LONGLONG time);
+// The picture WM_APP_PREVIEW announced and its key frame: a PreviewSize texture shared through this handle, whose
+// keyed mutex hands it over with key 1, valid until the next call; null if none is waiting.
+HANDLE TakePreviewPicture(LONGLONG& time);
+// The preview pictures' size; 0 x 0 until the video has loaded, or if it has no previews.
 SIZE PreviewSize();
 
 bool IsPlaying();

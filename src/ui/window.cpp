@@ -13,6 +13,7 @@
 #include <climits>
 #include <cmath>
 #include <memory>
+#include <unordered_map>
 
 #include "config.h"
 #include "media/player.h"
@@ -81,7 +82,11 @@ struct Window {
     std::wstring previewText;
     SIZE previewTextSize{};
     SIZE previewShadowSize{};  // the frame size its shadow is drawn for
-    SIZE previewChainSize{};   // the picture size the frame is scaled for
+    SIZE previewPictureSize{};  // the picture size the frame is scaled for
+    // Each picture decoded for the preview, by key frame in 100 ns units, until the next file: a sweep over it again
+    // decodes nothing. There are at most 200 of 320 px.
+    std::unordered_map<LONGLONG, ComPtr<IDCompositionSurface>> previewPictures;
+    LONGLONG previewWanted = -1, previewOnScreen = -1;  // key frames
     int previewShadowPad = -1;  // how far the shadow reaches past the frame, or -1 if not drawn
     ComPtr<IDCompositionEffectGroup> controlsFade, flashFade, osdFade;
     ComPtr<IDCompositionScaleTransform> flashScale;  // about the icon's center, then
@@ -707,6 +712,59 @@ SIZE Fit(SIZE v, int w, int h) {
     return {std::max(1L, LONG(std::lround(v.cx * scale))), std::max(1L, LONG(std::lround(v.cy * scale)))};
 }
 
+// Shows the picture of a key frame if it is kept, else has it decoded; WM_APP_PREVIEW brings it.
+void WantPreviewPicture(LONGLONG time) {
+    if (time == g.previewWanted) return;
+    g.previewWanted = time;
+    if (const auto it = g.previewPictures.find(time); it != g.previewPictures.end()) {
+        g.previewImage->SetContent(it->second.Get());
+        g.previewOnScreen = time;
+    } else {
+        DecodePreview(time);
+    }
+}
+
+// Copies a picture the previewer shared into a surface of its own on the window's device; null if it can't.
+ComPtr<IDCompositionSurface> CopyPreviewPicture(HANDLE handle) {
+    ComPtr<ID3D11Texture2D> shared, target;
+    ComPtr<IDXGIKeyedMutex> mutex;
+    if (FAILED(g.device->OpenSharedResource(handle, IID_PPV_ARGS(&shared))) || FAILED(shared.As(&mutex)) ||
+        mutex->AcquireSync(1, 1000) != S_OK) {
+        return nullptr;
+    }
+    D3D11_TEXTURE2D_DESC desc;
+    shared->GetDesc(&desc);
+    ComPtr<IDCompositionSurface> surface;
+    POINT at;
+    bool copied = SUCCEEDED(g.dcomp->CreateSurface(desc.Width, desc.Height, DXGI_FORMAT_B8G8R8A8_UNORM,
+                                                   DXGI_ALPHA_MODE_IGNORE, &surface)) &&
+                  SUCCEEDED(surface->BeginDraw(nullptr, IID_PPV_ARGS(&target), &at));
+    if (copied) {
+        ComPtr<ID3D11DeviceContext> context;
+        g.device->GetImmediateContext(&context);
+        context->CopySubresourceRegion(target.Get(), 0, at.x, at.y, 0, shared.Get(), 0, nullptr);
+        target.Reset();
+        copied = SUCCEEDED(surface->EndDraw());
+    }
+    mutex->ReleaseSync(0);
+    return copied ? surface : nullptr;
+}
+
+// Keeps a decoded picture, and shows it unless the wanted one already shows: one the mouse moved on from while it
+// decoded is still the nearest there is, so a fast sweep updates as often as a slow one.
+void OnPreviewPicture() {
+    LONGLONG time;
+    const HANDLE handle = TakePreviewPicture(time);
+    if (!handle) return;
+    const ComPtr<IDCompositionSurface> surface = CopyPreviewPicture(handle);
+    if (!surface) return;
+    g.previewPictures.emplace(time, surface);
+    if (g.previewOnScreen == g.previewWanted) return;
+    g.previewImage->SetContent(surface.Get());
+    g.previewOnScreen = time;
+    g.dcomp->Commit();
+}
+
 // While the mouse is on the seek bar, or dragging it, shows the frame and the time at pt's x above it, like
 // YouTube's; else hides them. Returns whether they show.
 bool UpdatePreview(POINT pt) {
@@ -727,15 +785,16 @@ bool UpdatePreview(POINT pt) {
     const int x = std::clamp(int(pt.x), left, right);
     // Centered on x, but kept over the bar.
     const auto place = [&](int width) { return float(std::clamp(x - width / 2, left, std::max(left, right - width))); };
-    const SIZE chain = PreviewSize();
+    const SIZE picture = PreviewSize();
     // A move along y only leaves it where it is.
-    if (g.previewShown && x == g.previewX && chain.cx == g.previewChainSize.cx && chain.cy == g.previewChainSize.cy) {
+    if (g.previewShown && x == g.previewX && picture.cx == g.previewPictureSize.cx &&
+        picture.cy == g.previewPictureSize.cy) {
         return true;
     }
     if (x != g.previewX) {
         g.previewX = x;
         const double seconds = double(x - left) / std::max(1, right - left) * g.duration;
-        SeekPreview(seconds, g.duration);
+        WantPreviewPicture(PreviewKeyFrame(seconds, g.duration));
         if (std::wstring text = FormatTime(seconds); text != g.previewText) {
             g.previewText = std::move(text);
             g.previewTextSize =
@@ -747,15 +806,15 @@ bool UpdatePreview(POINT pt) {
     const int timeTop = int(seek.top + seek.bottom) / 2 - Px(14) - int(t.cy);
     g.previewTime->SetOffsetX(place(t.cx));
     g.previewTime->SetOffsetY(float(timeTop));
-    if (chain.cx > 0 && chain.cy > 0) {
+    if (picture.cx > 0 && picture.cy > 0) {
         const int side = std::clamp(int(TextScale() * 0.35f), Px(120), Px(320));
-        const SIZE s = Fit(chain, side, side);
+        const SIZE s = Fit(picture, side, side);
         // Its look only changes with its size, so a move just places it.
-        if (s.cx != g.previewShadowSize.cx || s.cy != g.previewShadowSize.cy || chain.cx != g.previewChainSize.cx ||
-            chain.cy != g.previewChainSize.cy) {
-            g.previewChainSize = chain;
-            g.previewImage->SetContent(PreviewSwapChain());
-            g.previewImage->SetTransform(D2D_MATRIX_3X2_F{float(s.cx) / chain.cx, 0, 0, float(s.cy) / chain.cy, 0, 0});
+        if (s.cx != g.previewShadowSize.cx || s.cy != g.previewShadowSize.cy ||
+            picture.cx != g.previewPictureSize.cx || picture.cy != g.previewPictureSize.cy) {
+            g.previewPictureSize = picture;
+            g.previewImage->SetTransform(
+                D2D_MATRIX_3X2_F{float(s.cx) / picture.cx, 0, 0, float(s.cy) / picture.cy, 0, 0});
             // Rounded like the menus, over a soft shadow.
             const float r = float(Px(8));
             if (s.cx != g.previewShadowSize.cx || s.cy != g.previewShadowSize.cy) {
@@ -784,7 +843,7 @@ bool UpdatePreview(POINT pt) {
         g.previewImage->SetContent(nullptr);
         g.previewShadow->SetContent(nullptr);
         g.previewShadowSize = {};
-        g.previewChainSize = chain;
+        g.previewPictureSize = picture;
     }
     if (!g.previewShown) {
         g.controls->AddVisual(g.previewShadow.Get(), TRUE, nullptr);
@@ -999,6 +1058,9 @@ bool OpenVideoFile(const std::wstring& path) {
     g.title = FileName(path);
     g.title = g.title.substr(0, g.title.find_last_of(L'.'));
     UpdateControls();
+    g.previewPictures.clear();
+    g.previewWanted = g.previewOnScreen = -1;
+    g.previewImage->SetContent(nullptr);
     g.previewX = INT_MIN;
     UpdatePreview({});  // hides it until the duration is known
     return true;
@@ -1373,6 +1435,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_APP_FRAME:
             OnFrame();
+            return 0;
+        case WM_APP_PREVIEW:
+            OnPreviewPicture();
             return 0;
         case WM_PAINT:  // everything is drawn by DirectComposition
             ValidateRect(hwnd, nullptr);
