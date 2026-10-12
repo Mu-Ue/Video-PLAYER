@@ -58,8 +58,9 @@ void DrawControls(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT 
 // slash through it if asked, and sets it as the visual's content.
 void DrawFlash(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT size, std::wstring_view glyph, bool slash);
 
-// Draws text in white on a dark pill fitted to it, the seek bar preview's time, into the visual's surface, sets it
-// as the visual's content and returns its size in pixels.
+// Shows a time (digits and colons) in white on a dark pill fitted to it, the seek bar preview's, in the visual and
+// returns its size in pixels. The digits are drawn once and shown by child visuals, so a new time draws nothing
+// unless the pill's width changes. For one visual only.
 SIZE DrawTimeLabel(IDCompositionDevice* dcomp, IDCompositionVisual* visual, float scale, std::wstring_view text);
 
 // Draws the soft shadow of a frame x radius rounded rect, the seek bar preview's, into the visual's surface, sets it

@@ -44,6 +44,7 @@ struct {
     float scale = 0;
     ComPtr<IDWriteTextFormat> menu, time, title, icons, number, header, row, check;
     ComPtr<IDWriteInlineObject> ellipsis, rowEllipsis;
+    ComPtr<IDWriteTypography> tabular;  // digits all one width, null until first used
     // The outlined text's format, for one size.
     float textSize = 0;
     ComPtr<IDWriteTextFormat> text;
@@ -301,6 +302,65 @@ bool Paint(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT w, UINT
     return drawn;
 }
 
+// The time label's glyphs, kGlyphs drawn once per scale into the surface of a visual of their own, a cell apart.
+// The label shows each character as a slice of it, so a new time only moves visuals and draws nothing.
+constexpr wchar_t kGlyphs[] = L"0123456789:";
+constexpr int kGlyphCount = int(std::size(kGlyphs)) - 1;
+struct {
+    float scale = 0;
+    ComPtr<IDCompositionVisual> owner;  // never shown
+    IDCompositionSurface* surface = nullptr;
+    int cell = 0, pad = 0;
+    int advance[kGlyphCount]{};  // in whole pixels, so every glyph lands on the pixel grid
+    UINT height = 0;
+    UINT pillWidth = 0;  // the label's background, as last drawn
+    std::vector<ComPtr<IDCompositionVisual>> chars;
+} glyphs;
+
+bool DrawGlyphs(IDCompositionDevice* dcomp, float scale) {
+    if (glyphs.surface && glyphs.scale == scale) return true;
+    glyphs.surface = nullptr;
+    glyphs.pillWidth = 0;
+    if (!glyphs.owner && FAILED(dcomp->CreateVisual(&glyphs.owner))) return false;
+    // Digits of one width keep the label one size while the time under the mouse changes.
+    if (!g.tabular && SUCCEEDED(g.dwrite->CreateTypography(&g.tabular)) &&
+        FAILED(g.tabular->AddFontFeature({DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, 1}))) {
+        g.tabular.Reset();
+    }
+    const UINT h = UINT(std::round(26 * scale));
+    ComPtr<IDWriteTextLayout> layouts[kGlyphCount];
+    int widest = 0;
+    for (int i = 0; i < kGlyphCount; ++i) {
+        DWRITE_TEXT_METRICS m;
+        if (FAILED(g.dwrite->CreateTextLayout(&kGlyphs[i], 1, g.time.Get(), 1e6f, float(h), &layouts[i]))) {
+            return false;
+        }
+        if (g.tabular) layouts[i]->SetTypography(g.tabular.Get(), {0, 1});
+        if (FAILED(layouts[i]->GetMetrics(&m))) return false;
+        glyphs.advance[i] = int(std::lround(m.widthIncludingTrailingWhitespace));
+        widest = std::max(widest, glyphs.advance[i]);
+    }
+    const int pad = int(std::ceil(2 * scale)), cell = widest + 2 * pad;  // room for strokes past the advance
+    const bool drawn = Paint(dcomp, glyphs.owner.Get(), UINT(cell * kGlyphCount), h,
+                             [&](ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F&) {
+                                 dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+                                 dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+                                 g.brush->SetColor(D2D1::ColorF(0xffffff));
+                                 for (int i = 0; i < kGlyphCount; ++i) {
+                                     dc->DrawTextLayout(D2D1::Point2F(float(i * cell + pad), 0), layouts[i].Get(),
+                                                        g.brush.Get());
+                                 }
+                             });
+    if (!drawn) return false;
+    glyphs.surface = SurfaceFor(dcomp, glyphs.owner.Get(), UINT(cell * kGlyphCount), h);
+    glyphs.cell = cell;
+    glyphs.pad = pad;
+    glyphs.height = h;
+    glyphs.scale = scale;
+    for (const auto& c : glyphs.chars) c->SetContent(glyphs.surface);
+    return true;
+}
+
 }  // namespace
 
 void SetOverlayDevice(ID3D11Device* device) { g.device = device; }
@@ -475,26 +535,42 @@ void DrawFlash(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT siz
 }
 
 SIZE DrawTimeLabel(IDCompositionDevice* dcomp, IDCompositionVisual* visual, float scale, std::wstring_view text) {
-    ComPtr<IDWriteTextLayout> layout;
-    DWRITE_TEXT_METRICS m;
-    if (!Init() || !SetScale(scale) ||
-        FAILED(g.dwrite->CreateTextLayout(text.data(), UINT32(text.size()), g.time.Get(), 1e6f, 0, &layout)) ||
-        FAILED(layout->GetMetrics(&m))) {
+    if (!Init() || !SetScale(scale) || !DrawGlyphs(dcomp, scale)) {
         visual->SetContent(nullptr);
         return {};
     }
-    const UINT w = UINT(std::ceil(m.width + 20 * scale)), h = UINT(std::round(26 * scale));
-    const bool drawn = Paint(dcomp, visual, w, h, [&](ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F&) {
-        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-        dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-        const float r = h / 2.0f;
-        g.brush->SetColor(D2D1::ColorF(kPanelColor, 0.9f));
-        dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(0, 0, float(w), float(h)), r, r), g.brush.Get());
-        g.brush->SetColor(D2D1::ColorF(0xffffff));
-        dc->DrawText(text.data(), UINT32(text.size()), g.time.Get(),
-                     D2D1::RectF((w - m.width) / 2, 0, float(w), float(h)), g.brush.Get());
-    });
-    return drawn ? SIZE{LONG(w), LONG(h)} : SIZE{};
+    const auto glyph = [](wchar_t c) { return c >= L'0' && c <= L'9' ? c - L'0' : 10; };
+    int total = 0;
+    for (const wchar_t c : text) total += glyphs.advance[glyph(c)];
+    const UINT w = UINT(std::ceil(total + 20 * scale)), h = glyphs.height;
+    if (w != glyphs.pillWidth) {
+        const bool drawn = Paint(dcomp, visual, w, h, [&](ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F&) {
+            dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+            const float r = h / 2.0f;
+            g.brush->SetColor(D2D1::ColorF(kPanelColor, 0.9f));
+            dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(0, 0, float(w), float(h)), r, r), g.brush.Get());
+        });
+        glyphs.pillWidth = drawn ? w : 0;
+        if (!drawn) return {};
+    }
+    // Each character shows its glyph's slice of the glyph surface, side by side.
+    int x = int(w - total) / 2;
+    size_t k = 0;
+    for (; k < text.size(); ++k) {
+        if (k == glyphs.chars.size()) {
+            ComPtr<IDCompositionVisual> v;
+            if (FAILED(dcomp->CreateVisual(&v)) || FAILED(visual->AddVisual(v.Get(), TRUE, nullptr))) break;
+            v->SetContent(glyphs.surface);
+            glyphs.chars.push_back(std::move(v));
+        }
+        const int i = glyph(text[k]);
+        const float left = float(i * glyphs.cell + glyphs.pad);
+        glyphs.chars[k]->SetOffsetX(x - left);
+        glyphs.chars[k]->SetClip(D2D1::RectF(left, 0, left + glyphs.advance[i], float(h)));
+        x += glyphs.advance[i];
+    }
+    for (; k < glyphs.chars.size(); ++k) glyphs.chars[k]->SetClip(D2D1::RectF(0, 0, 0, 0));
+    return {LONG(w), LONG(h)};
 }
 
 int DrawPreviewShadow(IDCompositionDevice* dcomp, IDCompositionVisual* visual, float scale, SIZE frame, float radius) {
