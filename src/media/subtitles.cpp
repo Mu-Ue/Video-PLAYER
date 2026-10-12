@@ -209,6 +209,20 @@ bool LoadSubtitles(const std::wstring& path, Subtitles& subs) {
     return true;
 }
 
+bool AddCue(Subtitles& subs, Cue cue) {
+    auto& cues = subs.cues;
+    const auto at = std::upper_bound(cues.begin(), cues.end(), cue.start,
+                                     [](double time, const Cue& c) { return time < c.start; });
+    for (auto it = at; it != cues.begin() && (it - 1)->start == cue.start;) {
+        --it;
+        if (it->end == cue.end && it->text == cue.text) return false;
+    }
+    const size_t i = size_t(cues.insert(at, std::move(cue)) - cues.begin());
+    subs.reach.resize(cues.size());
+    for (size_t k = i; k < cues.size(); ++k) subs.reach[k] = std::max(k ? subs.reach[k - 1] : 0.0, cues[k].end);
+    return true;
+}
+
 double ActiveCues(const Subtitles& subs, double t, std::vector<size_t>& active) {
     active.clear();
     const auto& cues = subs.cues;

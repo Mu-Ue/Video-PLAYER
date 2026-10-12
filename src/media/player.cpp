@@ -14,7 +14,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <memory>
 #include <thread>
+
+#include "config.h"
+#include "media/subtitles.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -42,12 +46,68 @@ class Notify final : public IMFMediaEngineNotify {
     }
 };
 
+// Forwards the cues of the video's own subtitles, also from Media Foundation threads, as they start showing.
+class TextNotify final : public IMFTimedTextNotify {
+  public:
+    HWND hwnd = nullptr;
+
+    STDMETHODIMP QueryInterface(REFIID riid, void** object) override {
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IMFTimedTextNotify)) {
+            *object = static_cast<IMFTimedTextNotify*>(this);
+            return S_OK;
+        }
+        *object = nullptr;
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return 2; }
+    STDMETHODIMP_(ULONG) Release() override { return 1; }
+    void STDMETHODCALLTYPE TrackAdded(DWORD) override { PostMessageW(hwnd, WM_APP_SUBTITLE_TRACK, 0, 0); }
+    void STDMETHODCALLTYPE TrackRemoved(DWORD) override {}
+    void STDMETHODCALLTYPE TrackSelected(DWORD, BOOL) override {}
+    void STDMETHODCALLTYPE TrackReadyStateChanged(DWORD) override {}
+    void STDMETHODCALLTYPE Error(MF_TIMED_TEXT_ERROR_CODE, HRESULT, DWORD) override {}
+    void STDMETHODCALLTYPE Reset() override {}
+    void STDMETHODCALLTYPE Cue(MF_TIMED_TEXT_CUE_EVENT event, double, IMFTimedTextCue* cue) override {
+        if (event != MF_TIMED_TEXT_CUE_EVENT_ACTIVE || !cue) return;
+        auto out = std::make_unique<::Cue>();
+        out->start = cue->GetStartTime();
+        out->end = out->start + cue->GetDuration();
+        for (DWORD i = 0; i < cue->GetLineCount() && out->text.size() < kMaxCueChars; ++i) {
+            ComPtr<IMFTimedTextFormattedText> line;
+            LPWSTR text = nullptr;
+            if (FAILED(cue->GetLine(i, &line)) || FAILED(line->GetText(&text)) || !text) continue;
+            if (!out->text.empty()) out->text += L'\n';
+            const UINT32 at = UINT32(out->text.size());
+            out->text.append(text, std::min(wcslen(text), kMaxCueChars - at));
+            CoTaskMemFree(text);
+            const UINT32 length = UINT32(out->text.size()) - at;
+            for (DWORD k = 0; k < line->GetSubformattingCount(); ++k) {
+                DWORD first, count;
+                ComPtr<IMFTimedTextStyle> style;
+                auto font = MF_TIMED_TEXT_FONT_STYLE_NORMAL;
+                BOOL bold = FALSE;
+                if (FAILED(line->GetSubformatting(k, &first, &count, &style)) || !style || first >= length) continue;
+                style->GetFontStyle(&font);
+                style->GetBold(&bold);
+                const bool italic = font != MF_TIMED_TEXT_FONT_STYLE_NORMAL;
+                if (italic || bold) {
+                    out->spans.push_back({at + first, std::min<UINT32>(count, length - first), italic, bold != FALSE});
+                }
+            }
+        }
+        if (out->text.empty() || !(out->end > out->start)) return;
+        if (PostMessageW(hwnd, WM_APP_SUBTITLE_CUE, 0, LPARAM(out.get()))) out.release();
+    }
+};
+
 struct {
     Notify notify;
+    TextNotify textNotify;
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D10Multithread> multithread;
     ComPtr<IMFDXGIDeviceManager> manager;
     ComPtr<IMFMediaEngineEx> engine;
+    ComPtr<IMFTimedText> timedText;  // null if unsupported
     // A second parser of the open file, which knows where its key frames are; null if the format doesn't say.
     ComPtr<IMFMediaSource> keySource;
     ComPtr<IMFSeekInfo> keyFrames;
@@ -96,6 +156,12 @@ HRESULT CreateEngine() {
     ComPtr<IMFMediaEngine> engine;
     if (SUCCEEDED(hr)) hr = factory->CreateInstance(0, attributes.Get(), &engine);
     if (SUCCEEDED(hr)) hr = engine.As(&g.engine);
+    ComPtr<IMFGetService> service;
+    if (SUCCEEDED(hr) && SUCCEEDED(engine.As(&service)) &&
+        SUCCEEDED(service->GetService(MF_MEDIA_ENGINE_TIMEDTEXT, IID_PPV_ARGS(&g.timedText))) &&
+        FAILED(g.timedText->RegisterNotifications(&g.textNotify))) {
+        g.timedText.Reset();
+    }
     return hr;
 }
 
@@ -190,7 +256,7 @@ double NearestKeyFrame(double seconds) {
 }  // namespace
 
 bool InitPlayer(HWND hwnd) {
-    g.notify.hwnd = hwnd;
+    g.notify.hwnd = g.textNotify.hwnd = hwnd;
     if (FAILED(CreateDevice())) return false;
     g.started = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
     if (!g.started || FAILED(CreateEngine())) return false;
@@ -207,6 +273,7 @@ void ShutdownPlayer() {
     }
     g.chain.Reset();
     CloseKeyFrames();
+    g.timedText.Reset();
     if (g.engine) g.engine->Shutdown();
     g.engine.Reset();
     g.manager.Reset();
@@ -231,6 +298,13 @@ HRESULT OpenVideo(const std::wstring& path) {
 }
 
 bool HasVideo() { return g.engine && g.engine->HasVideo(); }
+
+bool SelectSubtitleTrack() {
+    ComPtr<IMFTimedTextTrackList> tracks;
+    ComPtr<IMFTimedTextTrack> track;
+    return g.timedText && SUCCEEDED(g.timedText->GetTextTracks(&tracks)) && tracks->GetLength() > 0 &&
+           SUCCEEDED(tracks->GetTrack(0, &track)) && SUCCEEDED(g.timedText->SelectTrack(track->GetId(), TRUE));
+}
 
 SIZE VideoSize() {
     DWORD w = 0, h = 0;

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <memory>
 
 #include "config.h"
 #include "media/player.h"
@@ -50,6 +51,7 @@ struct Window {
 
     bool sized = false;  // the window has been sized to a video
     Subtitles subs;
+    bool embeddedSubs = false;  // subs are the video's own, which grow as its cues show
     bool subsOn = true;
     std::vector<size_t> shown;  // indices of the cues on screen
     float subtitleHeight = 0;   // of the bottom ones
@@ -86,6 +88,8 @@ struct Window {
 std::wstring FileName(const std::wstring& path) { return path.substr(path.find_last_of(L"\\/") + 1); }
 
 bool IsMenuButton(Control c) { return c == kFile || c == kSubs; }
+
+bool HasSubtitles() { return g.embeddedSubs || !g.subs.cues.empty(); }
 
 bool IsSubtitleFile(const std::wstring& path) {
     return path.size() >= 4 && CompareStringOrdinal(path.c_str() + path.size() - 4, 4, L".srt", 4, TRUE) == CSTR_EQUAL;
@@ -227,7 +231,7 @@ bool DrawControls() {
         g.title,
         {button(kPlay, g.playing ? L"\xE769" : L"\xF5B0", off), button(kBack, step, off, -1),
          button(kForward, step, off, 1), button(kVolume, VolumeGlyph(), false),
-         button(kSubtitles, L"\xE7F0", off || g.subs.cues.empty()),
+         button(kSubtitles, L"\xE7F0", off || !HasSubtitles()),
          button(kFullscreen, g.fullscreen ? L"\xE73F" : L"\xE740", false)}};
     g.controls->SetOffsetY(float(top));
     const SIZE size{client.right, h};
@@ -483,6 +487,7 @@ void LoadSubtitleFile(const std::wstring& path) {
         ShowError(L"Can't open the subtitles \"" + FileName(path) + L"\".\n\nIt isn't a readable SRT file.");
         return;
     }
+    g.embeddedSubs = false;  // the file replaces them
     g.subsOn = true;
     UpdateSubtitles(true);
     UpdateControls();
@@ -501,6 +506,11 @@ bool OpenVideoFile(const std::wstring& path) {
     g.duration = NAN;
     g.seekBusy = g.seekQueued = g.seekCheck = false;
     g.subs = {};
+    g.embeddedSubs = false;
+    // Drop any cues of the previous video still queued.
+    for (MSG msg; PeekMessageW(&msg, g.hwnd, WM_APP_SUBTITLE_CUE, WM_APP_SUBTITLE_CUE, PM_REMOVE);) {
+        delete reinterpret_cast<Cue*>(msg.lParam);
+    }
     UpdateSubtitles(false);
     HideOsd();
     SetWindowTextW(g.hwnd, FileName(path).c_str());
@@ -529,6 +539,21 @@ void AddSubtitles() {
     if (!path.empty()) LoadSubtitleFile(path);
 }
 
+// The video has subtitles of its own, unless a file was added. They start off, as they are often in another
+// language or for the hard of hearing.
+void OnSubtitleTrack() {
+    if (HasSubtitles() || !SelectSubtitleTrack()) return;
+    g.embeddedSubs = true;
+    g.subsOn = false;
+    UpdateControls();
+    ShowOsd(L"Subtitles available (S)");
+}
+
+void OnSubtitleCue(LPARAM cue) {
+    const std::unique_ptr<Cue> owned(reinterpret_cast<Cue*>(cue));
+    if (g.embeddedSubs && AddCue(g.subs, std::move(*owned))) UpdateSubtitles(true);
+}
+
 void ToggleSubtitles();
 
 // Shows the menu of a menu bar button, kFile or kSubs.
@@ -538,7 +563,7 @@ void ShowMenu(Control which) {
     // Opening a video clears its subtitles, so they are added to the one playing.
     const MenuItem subs[] = {{kCmdAddSubtitles, L"Add subtitle file...", 'A', L"", HasVideo()},
                              {},
-                             {kCmdShowSubtitles, L"Show subtitles", 'S', L"S", !g.subs.cues.empty(), g.subsOn}};
+                             {kCmdShowSubtitles, L"Show subtitles", 'S', L"S", HasSubtitles(), g.subsOn}};
     RECT anchor = ControlRect(which);
     MapWindowPoints(g.hwnd, nullptr, reinterpret_cast<POINT*>(&anchor), 2);
     g.menuOpen = which;
@@ -618,7 +643,7 @@ void ToggleMuted() {
 }
 
 void ToggleSubtitles() {
-    if (g.subs.cues.empty()) return;
+    if (!HasSubtitles()) return;
     g.subsOn = !g.subsOn;
     UpdateSubtitles(false);
     ShowOsd(g.subsOn ? L"Subtitles on" : L"Subtitles off");
@@ -805,6 +830,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_APP_MEDIA:
             OnMediaEvent(wp, lp);
+            return 0;
+        case WM_APP_SUBTITLE_TRACK:
+            OnSubtitleTrack();
+            return 0;
+        case WM_APP_SUBTITLE_CUE:
+            OnSubtitleCue(lp);
             return 0;
         case WM_PAINT:  // everything is drawn by DirectComposition
             ValidateRect(hwnd, nullptr);

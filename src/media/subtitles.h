@@ -26,6 +26,9 @@ struct Subtitles {
 // Reads an SRT file in UTF-8, UTF-16 or the ANSI code page. Returns false if it can't be read or has no cues.
 bool LoadSubtitles(const std::wstring& path, Subtitles& subs);
 
+// Adds a cue in start order, unless the same one is already there; returns true if added.
+bool AddCue(Subtitles& subs, Cue cue);
+
 // Sets active to the indices of the cues showing at time t, in start order, and returns the next time this
 // changes (+infinity if never).
 double ActiveCues(const Subtitles& subs, double t, std::vector<size_t>& active);
