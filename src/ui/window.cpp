@@ -75,9 +75,7 @@ struct Window {
     ComPtr<IDCompositionVisual> previewShadow, previewFrame, previewImage, previewTime;
     ComPtr<IDCompositionRectangleClip> previewClip;
     bool previewShown = false;
-    bool framePending = false;  // the preview was placed this frame; a WM_APP_FRAME is coming
-    bool previewMoved = false;  // and the mouse has moved since, to previewPoint
-    POINT previewPoint{};
+    bool previewChanged = false;  // its picture changed since the last commit; a WM_APP_FRAME is coming
     int previewX = INT_MIN;  // the seek bar position it shows
     std::wstring previewText;
     SIZE previewTextSize{};
@@ -751,7 +749,8 @@ ComPtr<IDCompositionSurface> CopyPreviewPicture(HANDLE handle) {
 }
 
 // Keeps a decoded picture, and shows it unless the wanted one already shows: one the mouse moved on from while it
-// decoded is still the nearest there is, so a fast sweep updates as often as a slow one.
+// decoded is still the nearest there is, so a fast sweep updates as often as a slow one. It shows with the next
+// frame's placing, as a second commit in a frame waits for the next one.
 void OnPreviewPicture() {
     LONGLONG time;
     const HANDLE handle = TakePreviewPicture(time);
@@ -762,7 +761,10 @@ void OnPreviewPicture() {
     if (g.previewOnScreen == g.previewWanted) return;
     g.previewImage->SetContent(surface.Get());
     g.previewOnScreen = time;
-    g.dcomp->Commit();
+    if (g.previewShown) {
+        g.previewChanged = true;
+        RequestFrame();
+    }
 }
 
 // While the mouse is on the seek bar, or dragging it, shows the frame and the time at pt's x above it, like
@@ -789,8 +791,10 @@ bool UpdatePreview(POINT pt) {
     // A move along y only leaves it where it is.
     if (g.previewShown && x == g.previewX && picture.cx == g.previewPictureSize.cx &&
         picture.cy == g.previewPictureSize.cy) {
+        if (std::exchange(g.previewChanged, false)) g.dcomp->Commit();  // a new picture
         return true;
     }
+    g.previewChanged = false;  // committed below
     if (x != g.previewX) {
         g.previewX = x;
         const double seconds = double(x - left) / std::max(1, right - left) * g.duration;
@@ -855,23 +859,20 @@ bool UpdatePreview(POINT pt) {
     return true;
 }
 
-// UpdatePreview for a mouse move, at most once per frame shown: at once if it wasn't placed this frame, else at
-// the next frame, where the mouse is by then. A fast mouse reports far more often than frames are shown. A hidden
-// preview needs no pacing, so it doesn't wake the render thread.
+// UpdatePreview for a mouse move. A shown preview moves once per frame shown, just before it, to where the mouse is
+// by then: a fast mouse reports far more often than frames are shown. A hidden one needs no pacing.
 void MovePreview(POINT pt) {
-    g.previewPoint = pt;
-    if (g.framePending) {
-        g.previewMoved = true;
-        return;
+    if (g.previewShown) {
+        RequestFrame();
+    } else {
+        UpdatePreview(pt);
     }
-    if (!UpdatePreview(pt)) return;
-    g.framePending = true;
-    RequestFrame();
 }
 
 void OnFrame() {
-    g.framePending = false;
-    if (std::exchange(g.previewMoved, false)) MovePreview(g.previewPoint);
+    POINT pt;
+    if (!g.previewShown || !GetCursorPos(&pt) || !ScreenToClient(g.hwnd, &pt)) return;
+    UpdatePreview(pt);
 }
 
 // The video's swap chain size: the video v fitted to the window's monitor.

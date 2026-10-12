@@ -5,6 +5,7 @@
 #include <audiosessiontypes.h>
 #include <avrt.h>
 #include <d3d11_4.h>
+#include <dcomp.h>
 #include <dxgi1_2.h>
 #include <mfapi.h>
 #include <mfidl.h>
@@ -139,7 +140,7 @@ struct {
     ComPtr<IDXGISwapChain1> chain;
     UINT width = 0, height = 0, previewWidth = 0, previewHeight = 0;
     std::atomic<bool> redraw = false;  // present the current frame even if it isn't new; set with Redraw
-    std::atomic<bool> frameWanted = false;  // post WM_APP_FRAME at the next frame; set with RequestFrame
+    std::atomic<bool> frameWanted = false;  // post WM_APP_FRAME before the next frame; set with RequestFrame
     HANDLE stop = nullptr;             // tells the render thread and the previewer to exit
     HANDLE renderWake = nullptr;       // set on each engine event and redraw, while the render thread sleeps
     std::thread renderer;
@@ -254,6 +255,30 @@ void RequestFrame() {
 
 namespace {
 
+// Waits until shortly before the compositor frame after the one at tick, a performance counter time, so the window
+// can update as late as it can and still make that frame; at once if it can't tell when that is. Returns false if
+// told to stop.
+bool WaitBeforeNextFrame(IDCompositionDevice* clock, HANDLE timer, LONGLONG tick) {
+    DCOMPOSITION_FRAME_STATISTICS stats;
+    if (!clock || !timer || FAILED(clock->GetFrameStatistics(&stats)) || stats.timeFrequency.QuadPart <= 0 ||
+        !stats.currentCompositionRate.Numerator) {
+        return true;
+    }
+    const LONGLONG freq = stats.timeFrequency.QuadPart;
+    const LONGLONG next =
+        tick + freq * stats.currentCompositionRate.Denominator / stats.currentCompositionRate.Numerator;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    // Until 2 ms before it, for the window and the compositor, in 100 ns units and at most 50 ms.
+    const LONGLONG wait = std::min((next - now.QuadPart - freq / 500) * 10'000'000 / freq, 500000LL);
+    if (wait <= 0) return true;
+    LARGE_INTEGER due;
+    due.QuadPart = -wait;  // relative
+    if (!SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0)) return true;
+    const HANDLE events[] = {g.stop, timer};
+    return WaitForMultipleObjects(2, events, FALSE, INFINITE) != WAIT_OBJECT_0;
+}
+
 // Once per compositor frame, presents the engine's frame for that moment if it is a new one. Nothing is queued
 // ahead, so pausing and seeking show on screen as soon as the engine has the frame. While paused, or with no video,
 // it sleeps once kIdleTicks frames have passed with nothing new, until an engine event or a redraw.
@@ -272,8 +297,15 @@ void RenderLoop() {
         ComPtr<IDXGIAdapter> adapter;
         if (SUCCEEDED(g.device.As(&dxgi)) && SUCCEEDED(dxgi->GetAdapter(&adapter))) adapter->EnumOutputs(0, &output);
     }
+    // A device just to tell when the next frame is. Without it or a fine timer, WM_APP_FRAME is posted at once.
+    ComPtr<IDCompositionDevice> clock;
+    if (ComPtr<IDXGIDevice> dxgi; SUCCEEDED(g.device.As(&dxgi))) {
+        DCompositionCreateDevice(dxgi.Get(), IID_PPV_ARGS(&clock));
+    }
+    const HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    constexpr int kLatchTicks = 30;  // frames to keep waiting for WM_APP_FRAME's moment after the last request
     const HANDLE events[] = {g.stop, g.renderWake};
-    int idle = 0;
+    int idle = 0, latchGrace = 0;
     for (;;) {
         if (idle >= kIdleTicks && (!g.engine->HasVideo() || (g.engine->IsPaused() && !g.redraw))) {
             if (WaitForMultipleObjects(2, events, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) break;
@@ -288,9 +320,10 @@ void RenderLoop() {
         } else if (WaitForSingleObject(g.stop, 0) != WAIT_TIMEOUT) {
             break;
         }
+        LARGE_INTEGER tick;
+        QueryPerformanceCounter(&tick);
         // An event that came while awake restarts the grace.
         idle = WaitForSingleObject(g.renderWake, 0) == WAIT_OBJECT_0 ? 0 : idle + 1;
-        if (g.frameWanted.exchange(false)) PostMessageW(g.notify.hwnd, WM_APP_FRAME, 0, 0);
         LONGLONG pts;
         if (g.engine->OnVideoStreamTick(&pts) == S_OK || g.redraw) {
             AcquireSRWLockExclusive(&g.lock);
@@ -298,7 +331,19 @@ void RenderLoop() {
             ReleaseSRWLockExclusive(&g.lock);
             if (!g.redraw) idle = 0;
         }
+        // Then waits for the next frame's latest moment while frames are wanted, and a little after, as a request
+        // that comes just after a frame begins would otherwise wait out the next one.
+        if (g.frameWanted || latchGrace > 0) {
+            if (!WaitBeforeNextFrame(clock.Get(), timer, tick.QuadPart)) break;
+            if (g.frameWanted.exchange(false)) {
+                latchGrace = kLatchTicks;
+                PostMessageW(g.notify.hwnd, WM_APP_FRAME, 0, 0);
+            } else {
+                --latchGrace;
+            }
+        }
     }
+    if (timer) CloseHandle(timer);
     if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
 }
 

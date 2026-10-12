@@ -14,7 +14,7 @@ constexpr UINT WM_APP_SUBTITLE_TRACK = WM_APP + 2;
 // Posted as each cue of the selected subtitle track starts showing: wParam is the track's id, lParam a Cue* for
 // the window to delete.
 constexpr UINT WM_APP_SUBTITLE_CUE = WM_APP + 3;
-// Posted once at the next compositor frame after each RequestFrame.
+// Posted once shortly before the next compositor frame after each RequestFrame.
 constexpr UINT WM_APP_FRAME = WM_APP + 4;
 // Posted when a seek bar preview picture DecodePreview asked for is ready for TakePreviewPicture.
 constexpr UINT WM_APP_PREVIEW = WM_APP + 5;
@@ -24,7 +24,8 @@ constexpr UINT WM_APP_PREVIEW = WM_APP + 5;
 // are posted to hwnd.
 bool InitPlayer(HWND hwnd);
 void ShutdownPlayer();
-// Has WM_APP_FRAME posted at the next compositor frame, so the window can update once per frame shown.
+// Has WM_APP_FRAME posted shortly before the next compositor frame, so the window can update once per frame
+// shown, as late as it can.
 void RequestFrame();
 
 // Starts loading and playing a local file; the outcome arrives as events. Fails if the file can't be opened.
