@@ -708,8 +708,8 @@ SIZE Fit(SIZE v, int w, int h) {
 }
 
 // While the mouse is on the seek bar, or dragging it, shows the frame and the time at pt's x above it, like
-// YouTube's; else hides them.
-void UpdatePreview(POINT pt) {
+// YouTube's; else hides them. Returns whether they show.
+bool UpdatePreview(POINT pt) {
     const bool show = g.controlsShown && g.duration > 0 && (g.drag == kSeek || (!g.drag && g.hot == kSeek));
     if (!show) {
         if (g.previewShown) {
@@ -719,7 +719,7 @@ void UpdatePreview(POINT pt) {
             g.previewShown = false;
             g.dcomp->Commit();
         }
-        return;
+        return false;
     }
     RECT seek = ControlRect(kSeek);
     OffsetRect(&seek, 0, -ControlsTop());
@@ -788,17 +788,19 @@ void UpdatePreview(POINT pt) {
         g.previewShown = true;
     }
     g.dcomp->Commit();
+    return true;
 }
 
 // UpdatePreview for a mouse move, at most once per frame shown: at once if it wasn't placed this frame, else at
-// the next frame, where the mouse is by then. A fast mouse reports far more often than frames are shown.
+// the next frame, where the mouse is by then. A fast mouse reports far more often than frames are shown. A hidden
+// preview needs no pacing, so it doesn't wake the render thread.
 void MovePreview(POINT pt) {
     g.previewPoint = pt;
     if (g.framePending) {
         g.previewMoved = true;
         return;
     }
-    UpdatePreview(pt);
+    if (!UpdatePreview(pt)) return;
     g.framePending = true;
     RequestFrame();
 }
