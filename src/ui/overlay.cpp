@@ -474,6 +474,29 @@ void DrawFlash(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT siz
     });
 }
 
+SIZE DrawTimeLabel(IDCompositionDevice* dcomp, IDCompositionVisual* visual, float scale, std::wstring_view text) {
+    ComPtr<IDWriteTextLayout> layout;
+    DWRITE_TEXT_METRICS m;
+    if (!Init() || !SetScale(scale) ||
+        FAILED(g.dwrite->CreateTextLayout(text.data(), UINT32(text.size()), g.time.Get(), 1e6f, 0, &layout)) ||
+        FAILED(layout->GetMetrics(&m))) {
+        visual->SetContent(nullptr);
+        return {};
+    }
+    const UINT w = UINT(std::ceil(m.width + 20 * scale)), h = UINT(std::round(26 * scale));
+    const bool drawn = Paint(dcomp, visual, w, h, [&](ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F&) {
+        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+        dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        const float r = h / 2.0f;
+        g.brush->SetColor(D2D1::ColorF(kPanelColor, 0.9f));
+        dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(0, 0, float(w), float(h)), r, r), g.brush.Get());
+        g.brush->SetColor(D2D1::ColorF(0xffffff));
+        dc->DrawText(text.data(), UINT32(text.size()), g.time.Get(),
+                     D2D1::RectF((w - m.width) / 2, 0, float(w), float(h)), g.brush.Get());
+    });
+    return drawn ? SIZE{LONG(w), LONG(h)} : SIZE{};
+}
+
 void DrawTrackPanel(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT width, UINT height, float scale,
                     const std::vector<TrackColumn>& columns) {
     if (width == 0 || height == 0 || !Init() || !SetScale(scale)) {

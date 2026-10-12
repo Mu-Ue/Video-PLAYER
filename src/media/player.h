@@ -14,6 +14,8 @@ constexpr UINT WM_APP_SUBTITLE_TRACK = WM_APP + 2;
 // Posted as each cue of the selected subtitle track starts showing: wParam is the track's id, lParam a Cue* for
 // the window to delete.
 constexpr UINT WM_APP_SUBTITLE_CUE = WM_APP + 3;
+// Posted for each event of the seek bar preview's engine: wParam is the MF_MEDIA_ENGINE_EVENT.
+constexpr UINT WM_APP_PREVIEW = WM_APP + 4;
 
 // Creates a GPU device of its own, Media Foundation's media engine, which decodes on the GPU, and a thread that
 // presents each new frame into a swap chain for DirectComposition, once per compositor frame. The engine's events
@@ -45,6 +47,15 @@ SIZE VideoSize();  // display size in pixels, or 0 x 0
 void SetVideoSize(int width, int height);
 // The swap chain, as content for a DirectComposition visual, or null before SetVideoSize.
 IUnknown* VideoSwapChain();
+
+// A second, silent engine on the open video shows previews of it: hand it its WM_APP_PREVIEW events.
+void OnPreviewEvent(WPARAM event);
+// Starts seeking the preview to the key frame nearest a time; its frame then shows in the preview's swap chain.
+void SeekPreview(double seconds);
+// The preview's swap chain, as content for a DirectComposition visual, and its size; null and 0 x 0 until the
+// video has loaded.
+IUnknown* PreviewSwapChain();
+SIZE PreviewSize();
 
 bool IsPlaying();
 void SetPlaying(bool playing);  // playing from the start if it has ended

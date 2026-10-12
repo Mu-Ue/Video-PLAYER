@@ -10,6 +10,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <memory>
 
@@ -63,12 +64,19 @@ struct Window {
     int showCmd = SW_SHOWNORMAL;
     // Bottom to top: black background, video, subtitles at the bottom and top, seek / volume feedback, the icon
     // popped up in the middle, the controls over the bottom of the video, the track panel above them, and the menu
-    // bar, which the video doesn't overlap.
+    // bar, which the video doesn't overlap. The seek bar preview is part of the controls.
     ComPtr<ID3D11Device> device;  // for composition and the overlay
     ComPtr<IDCompositionDevice> dcomp;
     ComPtr<IDCompositionTarget> target;
     ComPtr<IDCompositionVisual> root, background, video, subtitleBottom, subtitleTop, osd, flash, controls, panel,
         menuBar;
+    // The preview's frame, its rounded clip and the scaled image in it, and its time below.
+    ComPtr<IDCompositionVisual> previewFrame, previewImage, previewTime;
+    ComPtr<IDCompositionRectangleClip> previewClip;
+    bool previewShown = false;
+    int previewX = INT_MIN;  // the seek bar position it shows
+    std::wstring previewText;
+    SIZE previewTextSize{};
     ComPtr<IDCompositionEffectGroup> controlsFade, flashFade, osdFade;
     ComPtr<IDCompositionScaleTransform> flashScale;  // about the icon's center, then
     ComPtr<IDCompositionTranslateTransform> flashMove;  // to the middle of the video
@@ -226,6 +234,13 @@ int Px(int dips) { return MulDiv(dips, GetDpiForWindow(g.hwnd), 96); }
 int MenuBarHeight() { return g.fullscreen ? 0 : Px(26); }
 int ControlsHeight() { return Px(150); }
 
+// The top of the controls' visual, in client pixels.
+int ControlsTop() {
+    RECT client;
+    GetClientRect(g.hwnd, &client);
+    return client.bottom - std::min(ControlsHeight(), int(client.bottom));
+}
+
 // The volume slider opens right of the volume button while the mouse is on either, or dragging the slider.
 bool VolumeExpanded() { return g.hot == kVolume || g.hot == kVolumeBar || g.drag == kVolumeBar; }
 
@@ -307,7 +322,7 @@ double ShownTime() { return g.seekBusy || g.drag == kSeek ? g.seekTarget : Playb
 bool DrawControls() {
     RECT client;
     GetClientRect(g.hwnd, &client);
-    const int h = std::min(ControlsHeight(), int(client.bottom)), top = client.bottom - h;
+    const int top = ControlsTop(), h = client.bottom - top;
     const float scale = GetDpiForWindow(g.hwnd) / 96.0f;
     const bool off = !HasVideo();
     const auto rect = [&](Control c) {
@@ -684,6 +699,72 @@ SIZE Fit(SIZE v, int w, int h) {
     return {std::max(1L, LONG(std::lround(v.cx * scale))), std::max(1L, LONG(std::lround(v.cy * scale)))};
 }
 
+// While the mouse is on the seek bar, or dragging it, shows the frame and the time at pt's x above it, like
+// YouTube's; else hides them.
+void UpdatePreview(POINT pt) {
+    const bool show = g.controlsShown && g.duration > 0 && (g.drag == kSeek || (!g.drag && g.hot == kSeek));
+    if (!show) {
+        if (g.previewShown) {
+            g.controls->RemoveVisual(g.previewFrame.Get());
+            g.controls->RemoveVisual(g.previewTime.Get());
+            g.previewShown = false;
+            g.dcomp->Commit();
+        }
+        return;
+    }
+    RECT seek = ControlRect(kSeek);
+    OffsetRect(&seek, 0, -ControlsTop());
+    const int left = seek.left, right = seek.right;
+    const int x = std::clamp(int(pt.x), left, right);
+    // Centered on x, but kept over the bar.
+    const auto place = [&](int width) { return float(std::clamp(x - width / 2, left, std::max(left, right - width))); };
+    if (x != g.previewX) {
+        g.previewX = x;
+        const double seconds = double(x - left) / std::max(1, right - left) * g.duration;
+        SeekPreview(seconds);
+        if (std::wstring text = FormatTime(seconds); text != g.previewText) {
+            g.previewText = std::move(text);
+            g.previewTextSize =
+                DrawTimeLabel(g.dcomp.Get(), g.previewTime.Get(), GetDpiForWindow(g.hwnd) / 96.0f, g.previewText);
+        }
+    }
+    // The time just above the track, and the frame above it.
+    const SIZE t = g.previewTextSize;
+    const int timeTop = int(seek.top + seek.bottom) / 2 - Px(14) - int(t.cy);
+    g.previewTime->SetOffsetX(place(t.cx));
+    g.previewTime->SetOffsetY(float(timeTop));
+    const SIZE chain = PreviewSize();
+    if (chain.cx > 0 && chain.cy > 0) {
+        const int side = std::clamp(int(TextScale() * 0.35f), Px(120), Px(320));
+        const SIZE s = Fit(chain, side, side);
+        g.previewImage->SetContent(PreviewSwapChain());
+        g.previewImage->SetTransform(D2D_MATRIX_3X2_F{float(s.cx) / chain.cx, 0, 0, float(s.cy) / chain.cy, 0, 0});
+        g.previewFrame->SetOffsetX(place(s.cx));
+        g.previewFrame->SetOffsetY(float(timeTop - Px(6) - int(s.cy)));
+        // Rounded like the menus.
+        const float r = float(Px(8));
+        IDCompositionRectangleClip* clip = g.previewClip.Get();
+        clip->SetRight(float(s.cx));
+        clip->SetBottom(float(s.cy));
+        clip->SetTopLeftRadiusX(r);
+        clip->SetTopLeftRadiusY(r);
+        clip->SetTopRightRadiusX(r);
+        clip->SetTopRightRadiusY(r);
+        clip->SetBottomLeftRadiusX(r);
+        clip->SetBottomLeftRadiusY(r);
+        clip->SetBottomRightRadiusX(r);
+        clip->SetBottomRightRadiusY(r);
+    } else {  // audio only, or not loaded yet
+        g.previewImage->SetContent(nullptr);
+    }
+    if (!g.previewShown) {
+        g.controls->AddVisual(g.previewFrame.Get(), TRUE, nullptr);
+        g.controls->AddVisual(g.previewTime.Get(), TRUE, nullptr);
+        g.previewShown = true;
+    }
+    g.dcomp->Commit();
+}
+
 // Fits the video below the menu bar, keeping its aspect ratio. The engine renders it at the size it fills the
 // monitor at, which only changes with the video or the monitor, and composition scales that to the window, so
 // resizing and fullscreen take effect in the same frame as the window, with no wait on the engine.
@@ -722,6 +803,8 @@ void Layout() {
         FillPanel();  // for a new DPI
         DrawPanel();
     }
+    g.previewText.clear();  // redrawn on the next move, for a new DPI or size
+    g.previewX = INT_MIN;
     UpdateSubtitles(true);
     if (!g.osdText.empty()) DrawOsd();
     g.dcomp->Commit();
@@ -860,6 +943,8 @@ bool OpenVideoFile(const std::wstring& path) {
     g.title = FileName(path);
     g.title = g.title.substr(0, g.title.find_last_of(L'.'));
     UpdateControls();
+    g.previewX = INT_MIN;
+    UpdatePreview({});  // hides it until the duration is known
     return true;
 }
 
@@ -1064,6 +1149,7 @@ void ToggleFullscreen() {
         SetWindowPos(g.hwnd, nullptr, 0, 0, 0, 0,
                      SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER);
     }
+    UpdatePreview({});
     Wake();
 }
 
@@ -1225,6 +1311,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_APP_SUBTITLE_CUE:
             OnSubtitleCue(wp, lp);
             return 0;
+        case WM_APP_PREVIEW:
+            OnPreviewEvent(wp);
+            return 0;
         case WM_PAINT:  // everything is drawn by DirectComposition
             ValidateRect(hwnd, nullptr);
             return 0;
@@ -1308,6 +1397,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (drag == kSeek) SeekToX(GET_X_LPARAM(lp), false);  // lands on the exact frame
                 ReleaseCapture();
                 SetHot(HitTest({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}));  // closes the volume slider if left
+                UpdatePreview({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
             }
             return 0;
         case WM_CAPTURECHANGED:
@@ -1328,11 +1418,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SetHot(HitTest({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}));
                 SetPanelHot({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
             }
+            UpdatePreview({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
             return 0;
         case WM_MOUSELEAVE:
             g.tracking = false;
             SetHot(kNone);
             SetPanelHot({-1, -1});
+            UpdatePreview({});
             if (g.playing && !g.drag && !g.panelOpen) SetControlsShown(false);
             return 0;
         case WM_MOUSEWHEEL: {  // scrolls the panel column under the mouse
@@ -1410,6 +1502,17 @@ bool InitComposition() {
         hr = g.dcomp->CreateTransformGroup(steps, UINT(std::size(steps)), &transform);
         if (SUCCEEDED(hr)) hr = g.flash->SetTransform(transform.Get());
     }
+    // The preview's visuals are added to the controls while it shows.
+    for (IDCompositionVisual** v :
+         {g.previewFrame.GetAddressOf(), g.previewImage.GetAddressOf(), g.previewTime.GetAddressOf()}) {
+        if (SUCCEEDED(hr)) hr = g.dcomp->CreateVisual(v);
+    }
+    if (SUCCEEDED(hr)) hr = g.previewFrame->AddVisual(g.previewImage.Get(), FALSE, nullptr);
+    if (SUCCEEDED(hr)) hr = g.dcomp->CreateRectangleClip(&g.previewClip);
+    if (SUCCEEDED(hr)) hr = g.previewClip->SetLeft(0.0f);
+    if (SUCCEEDED(hr)) hr = g.previewClip->SetTop(0.0f);
+    if (SUCCEEDED(hr)) hr = g.previewFrame->SetClip(g.previewClip.Get());
+    if (SUCCEEDED(hr)) hr = g.previewImage->SetBitmapInterpolationMode(DCOMPOSITION_BITMAP_INTERPOLATION_MODE_LINEAR);
     if (SUCCEEDED(hr)) hr = g.target->SetRoot(g.root.Get());
 
     if (SUCCEEDED(hr)) hr = dxgi->GetAdapter(&adapter);

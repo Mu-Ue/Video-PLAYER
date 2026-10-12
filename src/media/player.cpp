@@ -24,11 +24,12 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
-// Forwards engine events, which arrive on Media Foundation threads, to the window thread. Lives for the
+// Forwards engine events, which arrive on Media Foundation threads, to the window thread as msg. Lives for the
 // whole process, so it needs no reference counting.
 class Notify final : public IMFMediaEngineNotify {
   public:
     HWND hwnd = nullptr;
+    UINT msg = WM_APP_MEDIA;
 
     STDMETHODIMP QueryInterface(REFIID riid, void** object) override {
         if (riid == __uuidof(IUnknown) || riid == __uuidof(IMFMediaEngineNotify)) {
@@ -41,7 +42,7 @@ class Notify final : public IMFMediaEngineNotify {
     STDMETHODIMP_(ULONG) AddRef() override { return 2; }
     STDMETHODIMP_(ULONG) Release() override { return 1; }
     STDMETHODIMP EventNotify(DWORD event, DWORD_PTR param1, DWORD) override {
-        PostMessageW(hwnd, WM_APP_MEDIA, event, LPARAM(param1));
+        PostMessageW(hwnd, msg, event, LPARAM(param1));
         return S_OK;
     }
 };
@@ -101,7 +102,7 @@ class TextNotify final : public IMFTimedTextNotify {
 };
 
 struct {
-    Notify notify;
+    Notify notify, previewNotify;
     TextNotify textNotify;
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D10Multithread> multithread;
@@ -109,15 +110,19 @@ struct {
     ComPtr<IMFMediaEngineEx> engine;
     ComPtr<IMFTimedText> timedText;  // null if unsupported
     std::vector<DWORD> audioStreams;  // the engine's stream index of each audio track
+    // A second engine on the same file, paused, muted and without audio, which seeks to show seek bar previews.
+    ComPtr<IMFMediaEngineEx> preview;
+    bool previewBusy = false, previewQueued = false;  // one seek in flight, the latest one waiting
+    double previewTarget = 0;
     // A second parser of the open file, which knows where its key frames are; null if the format doesn't say.
     ComPtr<IMFMediaSource> keySource;
     ComPtr<IMFSeekInfo> keyFrames;
     bool started = false;  // MFStartup succeeded
     // The video's swap chain, guarded by lock: the render thread presents into it, the window thread sizes it.
     SRWLOCK lock = SRWLOCK_INIT;
-    ComPtr<IDXGISwapChain1> chain;
-    UINT width = 0, height = 0;
-    std::atomic<bool> redraw = false;  // present the current frame even if it isn't new
+    ComPtr<IDXGISwapChain1> chain, previewChain;
+    UINT width = 0, height = 0, previewWidth = 0, previewHeight = 0;
+    std::atomic<bool> redraw = false, previewRedraw = false;  // present the current frame even if it isn't new
     HANDLE stop = nullptr;              // tells the render thread to exit
     std::thread renderer;
 } g;
@@ -140,13 +145,10 @@ HRESULT CreateDevice() {
     return hr;
 }
 
-HRESULT CreateEngine() {
-    UINT token = 0;
-    HRESULT hr = MFCreateDXGIDeviceManager(&token, &g.manager);
-    if (SUCCEEDED(hr)) hr = g.manager->ResetDevice(g.device.Get(), token);
+HRESULT CreateEngine(IMFMediaEngineNotify* notify, ComPtr<IMFMediaEngineEx>& out) {
     ComPtr<IMFAttributes> attributes;
-    if (SUCCEEDED(hr)) hr = MFCreateAttributes(&attributes, 4);
-    if (SUCCEEDED(hr)) hr = attributes->SetUnknown(MF_MEDIA_ENGINE_CALLBACK, &g.notify);
+    HRESULT hr = MFCreateAttributes(&attributes, 4);
+    if (SUCCEEDED(hr)) hr = attributes->SetUnknown(MF_MEDIA_ENGINE_CALLBACK, notify);
     if (SUCCEEDED(hr)) hr = attributes->SetUnknown(MF_MEDIA_ENGINE_DXGI_MANAGER, g.manager.Get());
     if (SUCCEEDED(hr)) hr = attributes->SetUINT32(MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM);
     if (SUCCEEDED(hr)) hr = attributes->SetUINT32(MF_MEDIA_ENGINE_AUDIO_CATEGORY, AudioCategory_Movie);
@@ -156,9 +158,19 @@ HRESULT CreateEngine() {
     }
     ComPtr<IMFMediaEngine> engine;
     if (SUCCEEDED(hr)) hr = factory->CreateInstance(0, attributes.Get(), &engine);
-    if (SUCCEEDED(hr)) hr = engine.As(&g.engine);
+    if (SUCCEEDED(hr)) hr = engine.As(&out);
+    return hr;
+}
+
+HRESULT CreateEngines() {
+    UINT token = 0;
+    HRESULT hr = MFCreateDXGIDeviceManager(&token, &g.manager);
+    if (SUCCEEDED(hr)) hr = g.manager->ResetDevice(g.device.Get(), token);
+    if (SUCCEEDED(hr)) hr = CreateEngine(&g.notify, g.engine);
+    if (SUCCEEDED(hr)) hr = CreateEngine(&g.previewNotify, g.preview);
+    if (SUCCEEDED(hr)) hr = g.preview->SetMuted(TRUE);
     ComPtr<IMFGetService> service;
-    if (SUCCEEDED(hr) && SUCCEEDED(engine.As(&service)) &&
+    if (SUCCEEDED(hr) && SUCCEEDED(g.engine.As(&service)) &&
         SUCCEEDED(service->GetService(MF_MEDIA_ENGINE_TIMEDTEXT, IID_PPV_ARGS(&g.timedText))) &&
         FAILED(g.timedText->RegisterNotifications(&g.textNotify))) {
         g.timedText.Reset();
@@ -166,14 +178,49 @@ HRESULT CreateEngine() {
     return hr;
 }
 
-// Copies the engine's current frame into the swap chain and presents it.
-bool PresentFrame() {
+// Copies the engine's current frame into the w x h swap chain and presents it.
+bool PresentFrame(IMFMediaEngineEx* engine, IDXGISwapChain1* chain, UINT w, UINT h) {
     ComPtr<ID3D11Texture2D> buffer;
-    if (FAILED(g.chain->GetBuffer(0, IID_PPV_ARGS(&buffer)))) return false;
-    const RECT dest{0, 0, LONG(g.width), LONG(g.height)};
+    if (FAILED(chain->GetBuffer(0, IID_PPV_ARGS(&buffer)))) return false;
+    const RECT dest{0, 0, LONG(w), LONG(h)};
     const MFARGB black{0, 0, 0, 255};
-    if (FAILED(g.engine->TransferVideoFrame(buffer.Get(), nullptr, &dest, &black))) return false;
-    return SUCCEEDED(g.chain->Present(0, 0));
+    if (FAILED(engine->TransferVideoFrame(buffer.Get(), nullptr, &dest, &black))) return false;
+    return SUCCEEDED(chain->Present(0, 0));
+}
+
+// Sizes a swap chain for DirectComposition, creating it on the first call. Call with lock held.
+HRESULT SizeChain(ComPtr<IDXGISwapChain1>& chain, UINT width, UINT height) {
+    if (chain) return chain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
+    ComPtr<IDXGIDevice> dxgi;
+    ComPtr<IDXGIAdapter> adapter;
+    ComPtr<IDXGIFactory2> factory;
+    HRESULT hr = g.device.As(&dxgi);
+    if (SUCCEEDED(hr)) hr = dxgi->GetAdapter(&adapter);
+    if (SUCCEEDED(hr)) hr = adapter->GetParent(IID_PPV_ARGS(&factory));
+    DXGI_SWAP_CHAIN_DESC1 desc{};
+    desc.Width = width;
+    desc.Height = height;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    desc.BufferCount = 2;
+    desc.Scaling = DXGI_SCALING_STRETCH;
+    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+    if (SUCCEEDED(hr)) hr = factory->CreateSwapChainForComposition(g.device.Get(), &desc, nullptr, &chain);
+    return hr;
+}
+
+// The engine's video display size in pixels, or 0 x 0.
+SIZE DisplaySize(IMFMediaEngineEx* engine) {
+    DWORD w = 0, h = 0;
+    if (!engine || !engine->HasVideo() || FAILED(engine->GetNativeVideoSize(&w, &h)) || !w || !h) return {};
+    // The picture aspect ratio differs from w:h for non-square pixels (anamorphic video): stretch the width.
+    DWORD ax = 0, ay = 0;
+    if (SUCCEEDED(engine->GetVideoAspectRatio(&ax, &ay)) && ax && ay && UINT64(ax) * h != UINT64(ay) * w) {
+        w = DWORD(std::lround(double(h) * ax / ay));
+    }
+    return {LONG(w), LONG(h)};
 }
 
 // Once per compositor frame, presents the engine's frame for that moment if it is a new one. Nothing is queued
@@ -205,7 +252,13 @@ void RenderLoop() {
         LONGLONG pts;
         if (g.engine->OnVideoStreamTick(&pts) == S_OK || g.redraw) {
             AcquireSRWLockExclusive(&g.lock);
-            g.redraw = !g.chain || !PresentFrame();
+            g.redraw = !g.chain || !PresentFrame(g.engine.Get(), g.chain.Get(), g.width, g.height);
+            ReleaseSRWLockExclusive(&g.lock);
+        }
+        if (g.preview->OnVideoStreamTick(&pts) == S_OK || g.previewRedraw) {
+            AcquireSRWLockExclusive(&g.lock);
+            g.previewRedraw = !g.previewChain ||
+                              !PresentFrame(g.preview.Get(), g.previewChain.Get(), g.previewWidth, g.previewHeight);
             ReleaseSRWLockExclusive(&g.lock);
         }
     }
@@ -275,10 +328,11 @@ double NearestKeyFrame(double seconds) {
 }  // namespace
 
 bool InitPlayer(HWND hwnd) {
-    g.notify.hwnd = g.textNotify.hwnd = hwnd;
+    g.notify.hwnd = g.previewNotify.hwnd = g.textNotify.hwnd = hwnd;
+    g.previewNotify.msg = WM_APP_PREVIEW;
     if (FAILED(CreateDevice())) return false;
     g.started = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
-    if (!g.started || FAILED(CreateEngine())) return false;
+    if (!g.started || FAILED(CreateEngines())) return false;
     g.stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!g.stop) return false;
     g.renderer = std::thread(RenderLoop);
@@ -291,10 +345,13 @@ void ShutdownPlayer() {
         g.renderer.join();
     }
     g.chain.Reset();
+    g.previewChain.Reset();
     CloseKeyFrames();
     g.timedText.Reset();
     if (g.engine) g.engine->Shutdown();
     g.engine.Reset();
+    if (g.preview) g.preview->Shutdown();
+    g.preview.Reset();
     g.manager.Reset();
     if (g.started) MFShutdown();
     g.started = false;
@@ -312,9 +369,77 @@ HRESULT OpenVideo(const std::wstring& path) {
     SysFreeString(name);
     g.redraw = true;  // the first frame, even if it never plays
     if (SUCCEEDED(hr)) hr = g.engine->Play();
-    if (SUCCEEDED(hr)) OpenKeyFrames(path);
+    if (FAILED(hr)) return hr;
+    OpenKeyFrames(path);
+    // The preview engine reads the file on its own; if it can't, there are just no previews.
+    g.previewBusy = g.previewQueued = false;
+    ComPtr<IMFByteStream> previewStream;
+    name = SysAllocString(path.c_str());
+    if (name && SUCCEEDED(MFCreateFile(MF_ACCESSMODE_READ, MF_OPENMODE_FAIL_IF_NOT_EXIST, MF_FILEFLAGS_NONE,
+                                       path.c_str(), &previewStream))) {
+        g.preview->SetSourceFromByteStream(previewStream.Get(), name);
+    }
+    SysFreeString(name);
     return hr;
 }
+
+void OnPreviewEvent(WPARAM event) {
+    if (event == MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA) {
+        // Video only, so seeks decode no audio.
+        DWORD count = 0;
+        if (SUCCEEDED(g.preview->GetNumberOfStreams(&count))) {
+            for (DWORD i = 0; i < count; ++i) {
+                PROPVARIANT type;
+                PropVariantInit(&type);
+                const bool audio = SUCCEEDED(g.preview->GetStreamAttribute(i, MF_MT_MAJOR_TYPE, &type)) &&
+                                   type.vt == VT_CLSID && type.puuid && *type.puuid == MFMediaType_Audio;
+                PropVariantClear(&type);
+                if (audio) g.preview->SetStreamSelection(i, FALSE);
+            }
+            g.preview->ApplyStreamSelections();
+        }
+        // Fitted to 512 x 512, about the largest it shows.
+        const SIZE v = DisplaySize(g.preview.Get());
+        AcquireSRWLockExclusive(&g.lock);
+        g.previewWidth = g.previewHeight = 0;
+        if (v.cx > 0 && v.cy > 0) {
+            const double scale = 512.0 / std::max(v.cx, v.cy);
+            const UINT w = UINT(std::max(1L, std::lround(v.cx * scale)));
+            const UINT h = UINT(std::max(1L, std::lround(v.cy * scale)));
+            if (SUCCEEDED(SizeChain(g.previewChain, w, h))) {
+                g.previewWidth = w;
+                g.previewHeight = h;
+                g.previewRedraw = true;
+            }
+        }
+        ReleaseSRWLockExclusive(&g.lock);
+    } else if (event == MF_MEDIA_ENGINE_EVENT_SEEKED) {
+        g.previewBusy = false;
+        if (g.previewQueued) {
+            g.previewQueued = false;
+            SeekPreview(g.previewTarget);
+        }
+    }
+}
+
+void SeekPreview(double seconds) {
+    g.previewTarget = seconds;
+    if (g.previewBusy) {
+        g.previewQueued = true;
+        return;
+    }
+    g.previewBusy = true;
+    // Straight to a key frame, which needs no decoding up to the time.
+    if (g.keyFrames) {
+        g.preview->SetCurrentTimeEx(NearestKeyFrame(seconds) + 0.0005, MF_MEDIA_ENGINE_SEEK_MODE_NORMAL);
+    } else {
+        g.preview->SetCurrentTimeEx(seconds, MF_MEDIA_ENGINE_SEEK_MODE_APPROXIMATE);
+    }
+}
+
+IUnknown* PreviewSwapChain() { return g.previewChain.Get(); }
+
+SIZE PreviewSize() { return {LONG(g.previewWidth), LONG(g.previewHeight)}; }
 
 bool HasVideo() { return g.engine && g.engine->HasVideo(); }
 
@@ -371,41 +496,11 @@ bool SelectSubtitleTrack(DWORD id) {
     return SUCCEEDED(g.timedText->SelectTrack(id, TRUE));
 }
 
-SIZE VideoSize() {
-    DWORD w = 0, h = 0;
-    if (!HasVideo() || FAILED(g.engine->GetNativeVideoSize(&w, &h)) || !w || !h) return {};
-    // The picture aspect ratio differs from w:h for non-square pixels (anamorphic video): stretch the width.
-    DWORD ax = 0, ay = 0;
-    if (SUCCEEDED(g.engine->GetVideoAspectRatio(&ax, &ay)) && ax && ay && UINT64(ax) * h != UINT64(ay) * w) {
-        w = DWORD(std::lround(double(h) * ax / ay));
-    }
-    return {LONG(w), LONG(h)};
-}
+SIZE VideoSize() { return DisplaySize(g.engine.Get()); }
 
 void SetVideoSize(int width, int height) {
     AcquireSRWLockExclusive(&g.lock);
-    HRESULT hr;
-    if (g.chain) {
-        hr = g.chain->ResizeBuffers(0, UINT(width), UINT(height), DXGI_FORMAT_UNKNOWN, 0);
-    } else {
-        ComPtr<IDXGIDevice> dxgi;
-        ComPtr<IDXGIAdapter> adapter;
-        ComPtr<IDXGIFactory2> factory;
-        hr = g.device.As(&dxgi);
-        if (SUCCEEDED(hr)) hr = dxgi->GetAdapter(&adapter);
-        if (SUCCEEDED(hr)) hr = adapter->GetParent(IID_PPV_ARGS(&factory));
-        DXGI_SWAP_CHAIN_DESC1 desc{};
-        desc.Width = UINT(width);
-        desc.Height = UINT(height);
-        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        desc.SampleDesc.Count = 1;
-        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        desc.BufferCount = 2;
-        desc.Scaling = DXGI_SCALING_STRETCH;
-        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-        if (SUCCEEDED(hr)) hr = factory->CreateSwapChainForComposition(g.device.Get(), &desc, nullptr, &g.chain);
-    }
+    const HRESULT hr = SizeChain(g.chain, UINT(width), UINT(height));
     if (SUCCEEDED(hr)) {
         g.width = UINT(width);
         g.height = UINT(height);

@@ -58,6 +58,10 @@ void DrawControls(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT 
 // slash through it if asked, and sets it as the visual's content.
 void DrawFlash(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT size, std::wstring_view glyph, bool slash);
 
+// Draws text in white on a dark pill fitted to it, the seek bar preview's time, into the visual's surface, sets it
+// as the visual's content and returns its size in pixels.
+SIZE DrawTimeLabel(IDCompositionDevice* dcomp, IDCompositionVisual* visual, float scale, std::wstring_view text);
+
 // A column of the track panel: a header over rows, which are clipped to the rows rect. In pixels from the panel's
 // top left.
 struct TrackColumn {
