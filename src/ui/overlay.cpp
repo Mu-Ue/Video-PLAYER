@@ -462,7 +462,10 @@ void DrawTrackPanel(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UIN
         dc->Clear(D2D1::ColorF(0, 0, 0, 0));
         dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         g.brush->SetColor(D2D1::ColorF(kPanelColor));
-        dc->FillRectangle(D2D1::RectF(0, 0, float(width), float(height)), g.brush.Get());
+        // Rounded like the menus, whose corners Windows rounds by 8 pixels.
+        const float radius = 8 * scale;
+        dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(0, 0, float(width), float(height)), radius, radius),
+                                 g.brush.Get());
         for (const TrackColumn& c : columns) {
             const D2D1_RECT_F rows = RectF(c.rows);
             D2D1_RECT_F header = RectF(c.header);
