@@ -26,11 +26,12 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
-// Forwards engine events, which arrive on Media Foundation threads, to the window thread as msg. Lives for the
-// whole process, so it needs no reference counting.
+// Forwards engine events, which arrive on Media Foundation threads, to the window thread as msg, and wakes the
+// render thread. Lives for the whole process, so it needs no reference counting.
 class Notify final : public IMFMediaEngineNotify {
   public:
     HWND hwnd = nullptr;
+    HANDLE wake = nullptr;
 
     STDMETHODIMP QueryInterface(REFIID riid, void** object) override {
         if (riid == __uuidof(IUnknown) || riid == __uuidof(IMFMediaEngineNotify)) {
@@ -44,6 +45,7 @@ class Notify final : public IMFMediaEngineNotify {
     STDMETHODIMP_(ULONG) Release() override { return 1; }
     STDMETHODIMP EventNotify(DWORD event, DWORD_PTR param1, DWORD) override {
         PostMessageW(hwnd, WM_APP_MEDIA, event, LPARAM(param1));
+        if (wake) SetEvent(wake);
         return S_OK;
     }
 };
@@ -128,8 +130,9 @@ struct {
     SRWLOCK lock = SRWLOCK_INIT;
     ComPtr<IDXGISwapChain1> chain, previewChain;
     UINT width = 0, height = 0, previewWidth = 0, previewHeight = 0;
-    std::atomic<bool> redraw = false;  // present the current frame even if it isn't new
+    std::atomic<bool> redraw = false;  // present the current frame even if it isn't new; set with Redraw
     HANDLE stop = nullptr;             // tells the render thread and the previewer to exit
+    HANDLE renderWake = nullptr;       // set on each engine event and redraw, while the render thread sleeps
     std::thread renderer;
 } g;
 
@@ -227,9 +230,17 @@ SIZE DisplaySize(IMFMediaEngineEx* engine) {
     return {LONG(w), LONG(h)};
 }
 
+// Has the render thread present the current frame even if it isn't new.
+void Redraw() {
+    g.redraw = true;
+    SetEvent(g.renderWake);
+}
+
 // Once per compositor frame, presents the engine's frame for that moment if it is a new one. Nothing is queued
-// ahead, so pausing and seeking show on screen as soon as the engine has the frame.
+// ahead, so pausing and seeking show on screen as soon as the engine has the frame. While paused, or with no video,
+// it sleeps once kIdleTicks frames have passed with nothing new, until an engine event or a redraw.
 void RenderLoop() {
+    constexpr int kIdleTicks = 60;  // grace for a frame still on its way after an event
     // Scheduled as playback, so frames stay on time while the CPU is busy.
     DWORD task = 0;
     const HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Playback", &task);
@@ -243,7 +254,13 @@ void RenderLoop() {
         ComPtr<IDXGIAdapter> adapter;
         if (SUCCEEDED(g.device.As(&dxgi)) && SUCCEEDED(dxgi->GetAdapter(&adapter))) adapter->EnumOutputs(0, &output);
     }
+    const HANDLE events[] = {g.stop, g.renderWake};
+    int idle = 0;
     for (;;) {
+        if (idle >= kIdleTicks && (!g.engine->HasVideo() || (g.engine->IsPaused() && !g.redraw))) {
+            if (WaitForMultipleObjects(2, events, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) break;
+            idle = 0;
+        }
         if (waitClock) {
             const DWORD r = waitClock(1, &g.stop, INFINITE);
             if (r == WAIT_OBJECT_0) break;
@@ -253,11 +270,14 @@ void RenderLoop() {
         } else if (WaitForSingleObject(g.stop, 0) != WAIT_TIMEOUT) {
             break;
         }
+        // An event that came while awake restarts the grace.
+        idle = WaitForSingleObject(g.renderWake, 0) == WAIT_OBJECT_0 ? 0 : idle + 1;
         LONGLONG pts;
         if (g.engine->OnVideoStreamTick(&pts) == S_OK || g.redraw) {
             AcquireSRWLockExclusive(&g.lock);
             g.redraw = !g.chain || !PresentFrame(g.engine.Get(), g.chain.Get(), g.width, g.height);
             ReleaseSRWLockExclusive(&g.lock);
+            if (!g.redraw) idle = 0;
         }
     }
     if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
@@ -446,7 +466,8 @@ bool InitPlayer(HWND hwnd) {
     if (!g.started || FAILED(CreateEngines())) return false;
     g.stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g.previewWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!g.stop || !g.previewWake) return false;
+    g.renderWake = g.notify.wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g.stop || !g.previewWake || !g.renderWake) return false;
     g.renderer = std::thread(RenderLoop);
     g.previewer = std::thread(PreviewLoop);
     return true;
@@ -477,7 +498,7 @@ HRESULT OpenVideo(const std::wstring& path) {
     if (!name) return E_OUTOFMEMORY;
     hr = g.engine->SetSourceFromByteStream(stream.Get(), name);
     SysFreeString(name);
-    g.redraw = true;  // the first frame, even if it never plays
+    Redraw();  // the first frame, even if it never plays
     if (SUCCEEDED(hr)) hr = g.engine->Play();
     if (FAILED(hr)) return hr;
     OpenKeyFrames(path);
@@ -580,7 +601,7 @@ void SetVideoSize(int width, int height) {
     if (SUCCEEDED(hr)) {
         g.width = UINT(width);
         g.height = UINT(height);
-        g.redraw = true;  // at the new size, even while paused
+        Redraw();  // at the new size, even while paused
     }
     ReleaseSRWLockExclusive(&g.lock);
 }
