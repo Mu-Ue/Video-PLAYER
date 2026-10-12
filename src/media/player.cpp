@@ -4,7 +4,7 @@
 
 #include <audiosessiontypes.h>
 #include <avrt.h>
-#include <d3d11.h>
+#include <d3d11_4.h>
 #include <dxgi1_2.h>
 #include <mfapi.h>
 #include <mfidl.h>
@@ -117,6 +117,10 @@ struct {
     // to open or a key frame to decode under previewLock, then sets previewWake; it hands back the picture there.
     std::thread previewer;
     HANDLE previewWake = nullptr;
+    // Signals previewDone when the previewer's GPU work is done; null if the device has no fences.
+    ComPtr<ID3D11Fence> previewFence;
+    HANDLE previewDone = nullptr;
+    UINT64 previewFenceValue = 0;
     SRWLOCK previewLock = SRWLOCK_INIT;
     std::wstring previewPath;
     LONGLONG previewWanted = -1;  // the key frame to decode, in 100 ns units, or -1
@@ -448,6 +452,14 @@ ComPtr<ID3D11Texture2D> KeepKeyFrame(IMFSample* sample) {
     const D3D11_BOX box{0, 0, 0, std::min(desc.Width, w), std::min(desc.Height, h), 1};
     context->CopySubresourceRegion(kept.Get(), 0, 0, 0, 0, texture.Get(), index, &box);
     mutex->ReleaseSync(1);
+    // Waits until the GPU has decoded and copied it: the window would wait for that on its own thread, and miss
+    // frames. Without a fence, it at least sends the work to the GPU now.
+    ComPtr<ID3D11DeviceContext4> context4;
+    const bool fenced = g.previewFence && SUCCEEDED(context.As(&context4)) &&
+                        SUCCEEDED(context4->Signal(g.previewFence.Get(), ++g.previewFenceValue)) &&
+                        SUCCEEDED(g.previewFence->SetEventOnCompletion(g.previewFenceValue, g.previewDone));
+    context->Flush();
+    if (fenced) WaitForSingleObject(g.previewDone, 1000);
     return kept;
 }
 
@@ -504,6 +516,11 @@ bool InitPlayer(HWND hwnd) {
     g.previewWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g.renderWake = g.notify.wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!g.stop || !g.previewWake || !g.renderWake) return false;
+    ComPtr<ID3D11Device5> device5;
+    g.previewDone = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (g.previewDone && SUCCEEDED(g.device.As(&device5))) {
+        device5->CreateFence(0, D3D11_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.previewFence));
+    }
     g.renderer = std::thread(RenderLoop);
     g.previewer = std::thread(PreviewLoop);
     return true;
@@ -513,6 +530,7 @@ void ShutdownPlayer() {
     if (g.stop) SetEvent(g.stop);
     if (g.renderer.joinable()) g.renderer.join();
     if (g.previewer.joinable()) g.previewer.join();
+    g.previewFence.Reset();
     g.chain.Reset();
     g.ready.Reset();
     g.taken.Reset();
