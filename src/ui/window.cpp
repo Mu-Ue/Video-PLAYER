@@ -70,13 +70,15 @@ struct Window {
     ComPtr<IDCompositionTarget> target;
     ComPtr<IDCompositionVisual> root, background, video, subtitleBottom, subtitleTop, osd, flash, controls, panel,
         menuBar;
-    // The preview's frame, its rounded clip and the scaled image in it, and its time below.
-    ComPtr<IDCompositionVisual> previewFrame, previewImage, previewTime;
+    // The preview's shadow, its frame, its rounded clip and the scaled image in it, and its time below.
+    ComPtr<IDCompositionVisual> previewShadow, previewFrame, previewImage, previewTime;
     ComPtr<IDCompositionRectangleClip> previewClip;
     bool previewShown = false;
     int previewX = INT_MIN;  // the seek bar position it shows
     std::wstring previewText;
     SIZE previewTextSize{};
+    SIZE previewShadowSize{};  // the frame size its shadow is drawn for
+    int previewShadowPad = -1;  // how far the shadow reaches past the frame, or -1 if not drawn
     ComPtr<IDCompositionEffectGroup> controlsFade, flashFade, osdFade;
     ComPtr<IDCompositionScaleTransform> flashScale;  // about the icon's center, then
     ComPtr<IDCompositionTranslateTransform> flashMove;  // to the middle of the video
@@ -705,6 +707,7 @@ void UpdatePreview(POINT pt) {
     const bool show = g.controlsShown && g.duration > 0 && (g.drag == kSeek || (!g.drag && g.hot == kSeek));
     if (!show) {
         if (g.previewShown) {
+            g.controls->RemoveVisual(g.previewShadow.Get());
             g.controls->RemoveVisual(g.previewFrame.Get());
             g.controls->RemoveVisual(g.previewTime.Get());
             g.previewShown = false;
@@ -739,10 +742,18 @@ void UpdatePreview(POINT pt) {
         const SIZE s = Fit(chain, side, side);
         g.previewImage->SetContent(PreviewSwapChain());
         g.previewImage->SetTransform(D2D_MATRIX_3X2_F{float(s.cx) / chain.cx, 0, 0, float(s.cy) / chain.cy, 0, 0});
-        g.previewFrame->SetOffsetX(place(s.cx));
-        g.previewFrame->SetOffsetY(float(timeTop - Px(6) - int(s.cy)));
-        // Rounded like the menus.
+        const float frameX = place(s.cx), frameY = float(timeTop - Px(6) - int(s.cy));
+        g.previewFrame->SetOffsetX(frameX);
+        g.previewFrame->SetOffsetY(frameY);
+        // Rounded like the menus, over a soft shadow.
         const float r = float(Px(8));
+        if (s.cx != g.previewShadowSize.cx || s.cy != g.previewShadowSize.cy) {
+            g.previewShadowSize = s;
+            g.previewShadowPad = DrawPreviewShadow(g.dcomp.Get(), g.previewShadow.Get(),
+                                                   GetDpiForWindow(g.hwnd) / 96.0f, s, r);
+        }
+        g.previewShadow->SetOffsetX(frameX - g.previewShadowPad);
+        g.previewShadow->SetOffsetY(frameY - g.previewShadowPad);
         IDCompositionRectangleClip* clip = g.previewClip.Get();
         clip->SetRight(float(s.cx));
         clip->SetBottom(float(s.cy));
@@ -756,9 +767,12 @@ void UpdatePreview(POINT pt) {
         clip->SetBottomRightRadiusY(r);
     } else {  // audio only, or not loaded yet
         g.previewImage->SetContent(nullptr);
+        g.previewShadow->SetContent(nullptr);
+        g.previewShadowSize = {};
     }
     if (!g.previewShown) {
-        g.controls->AddVisual(g.previewFrame.Get(), TRUE, nullptr);
+        g.controls->AddVisual(g.previewShadow.Get(), TRUE, nullptr);
+        g.controls->AddVisual(g.previewFrame.Get(), TRUE, g.previewShadow.Get());
         g.controls->AddVisual(g.previewTime.Get(), TRUE, nullptr);
         g.previewShown = true;
     }
@@ -804,6 +818,7 @@ void Layout() {
         DrawPanel();
     }
     g.previewText.clear();  // redrawn on the next move, for a new DPI or size
+    g.previewShadowSize = {};
     g.previewX = INT_MIN;
     UpdateSubtitles(true);
     if (!g.osdText.empty()) DrawOsd();
@@ -1504,7 +1519,8 @@ bool InitComposition() {
     }
     // The preview's visuals are added to the controls while it shows.
     for (IDCompositionVisual** v :
-         {g.previewFrame.GetAddressOf(), g.previewImage.GetAddressOf(), g.previewTime.GetAddressOf()}) {
+         {g.previewShadow.GetAddressOf(), g.previewFrame.GetAddressOf(), g.previewImage.GetAddressOf(),
+          g.previewTime.GetAddressOf()}) {
         if (SUCCEEDED(hr)) hr = g.dcomp->CreateVisual(v);
     }
     if (SUCCEEDED(hr)) hr = g.previewFrame->AddVisual(g.previewImage.Get(), FALSE, nullptr);

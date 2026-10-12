@@ -62,6 +62,10 @@ void DrawFlash(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT siz
 // as the visual's content and returns its size in pixels.
 SIZE DrawTimeLabel(IDCompositionDevice* dcomp, IDCompositionVisual* visual, float scale, std::wstring_view text);
 
+// Draws the soft shadow of a frame x radius rounded rect, the seek bar preview's, into the visual's surface, sets it
+// as the visual's content and returns how far the surface reaches past the rect on each side, or -1 if not drawn.
+int DrawPreviewShadow(IDCompositionDevice* dcomp, IDCompositionVisual* visual, float scale, SIZE frame, float radius);
+
 // A column of the track panel: a header over rows, which are clipped to the rows rect. In pixels from the panel's
 // top left.
 struct TrackColumn {

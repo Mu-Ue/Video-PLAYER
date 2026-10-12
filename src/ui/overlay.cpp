@@ -497,6 +497,41 @@ SIZE DrawTimeLabel(IDCompositionDevice* dcomp, IDCompositionVisual* visual, floa
     return drawn ? SIZE{LONG(w), LONG(h)} : SIZE{};
 }
 
+int DrawPreviewShadow(IDCompositionDevice* dcomp, IDCompositionVisual* visual, float scale, SIZE frame, float radius) {
+    // The rect's shape, for the shadow effect to blur.
+    ComPtr<ID2D1CommandList> shape;
+    bool recorded = frame.cx > 0 && frame.cy > 0 && Init() && SUCCEEDED(g.context->CreateCommandList(&shape));
+    if (recorded) {
+        ID2D1DeviceContext* context = g.context.Get();
+        context->SetTarget(shape.Get());
+        context->BeginDraw();
+        context->SetTransform(D2D1::Matrix3x2F::Identity());
+        g.brush->SetColor(D2D1::ColorF(0, 0, 0, 1));
+        context->FillRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(0, 0, float(frame.cx), float(frame.cy)), radius, radius), g.brush.Get());
+        recorded = SUCCEEDED(context->EndDraw()) && SUCCEEDED(shape->Close());
+        context->SetTarget(nullptr);
+    }
+    if (!recorded) {
+        visual->SetContent(nullptr);
+        return -1;
+    }
+    // Faint and soft, a little lower than the frame, like Netflix's.
+    const float blur = 8 * scale, drop = 2 * scale;
+    const int pad = int(std::ceil(3 * blur + drop));
+    const bool drawn = Paint(dcomp, visual, UINT(frame.cx + 2 * pad), UINT(frame.cy + 2 * pad),
+                             [&](ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F& base) {
+                                 dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+                                 g.shadow->SetInput(0, shape.Get());
+                                 g.shadow->SetValue(D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION, blur);
+                                 g.shadow->SetValue(D2D1_SHADOW_PROP_COLOR, D2D1::Vector4F(0, 0, 0, 0.5f));
+                                 dc->SetTransform(D2D1::Matrix3x2F::Translation(float(pad), pad + drop) * base);
+                                 dc->DrawImage(g.shadow.Get());
+                                 g.shadow->SetInput(0, nullptr);
+                             });
+    return drawn ? pad : -1;
+}
+
 void DrawTrackPanel(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT width, UINT height, float scale,
                     const std::vector<TrackColumn>& columns) {
     if (width == 0 || height == 0 || !Init() || !SetScale(scale)) {
