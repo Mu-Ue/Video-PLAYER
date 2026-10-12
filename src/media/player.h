@@ -48,7 +48,8 @@ IUnknown* VideoSwapChain();
 
 // Shows one picture for each 10 seconds of the video, like Netflix: on entering a new span, a thread of its own
 // decodes the key frame nearest its middle, alone and shrunk, into the preview's swap chain. If it is still busy,
-// only the latest span is shown next.
+// only the latest is decoded next, about 10 a second in step with the display. Once the mouse rests in a span, its
+// picture is decoded at once and no older one shows.
 void SeekPreview(double seconds);
 // The preview's swap chain, as content for a DirectComposition visual, and its size; null and 0 x 0 until the
 // video has loaded.

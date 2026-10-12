@@ -5,6 +5,7 @@
 #include <audiosessiontypes.h>
 #include <avrt.h>
 #include <d3d11.h>
+#include <dwmapi.h>
 #include <dxgi1_2.h>
 #include <mfapi.h>
 #include <mfidl.h>
@@ -113,14 +114,16 @@ struct {
     ComPtr<IMFMediaEngineEx> engine;
     ComPtr<IMFTimedText> timedText;  // null if unsupported
     std::vector<DWORD> audioStreams;  // the engine's stream index of each audio track
-    // The seek bar preview: a thread that decodes just the key frame the window last asked for. The window hands
-    // it a file to open or a key frame to show under previewLock, then sets previewWake.
+    // The seek bar preview: a thread that decodes just the key frame the window wants. The window hands it a file
+    // to open or a key frame to show under previewLock, then sets previewWake.
     std::thread previewer;
     HANDLE previewWake = nullptr;
     SRWLOCK previewLock = SRWLOCK_INIT;
     std::wstring previewPath;
-    double previewTarget = NAN;  // seconds
-    double previewBucket = -1;   // the last span of kPreviewSpan seconds the window asked for
+    LONGLONG previewWanted = -1;  // the key frame to show, in 100 ns units, or -1
+    LONGLONG previewWantedAt = 0;  // the QPC time it was set, when the mouse entered its span
+    double previewBucket = -1;    // the window's last span of kPreviewSpan seconds
+    LONGLONG previewAsked = -1;   // and its key frame, as last put in previewWanted
     // A second parser of the open file, which knows where its key frames are; null if the format doesn't say.
     ComPtr<IMFMediaSource> keySource;
     ComPtr<IMFSeekInfo> keyFrames;
@@ -330,12 +333,12 @@ std::wstring StreamString(DWORD stream, REFGUID key) {
 }
 
 // The key frame nearest to a time, in seconds, or the time itself if unknown.
-double NearestKeyFrame(double seconds) {
-    if (!g.keyFrames) return seconds;
+double NearestKeyFrame(IMFSeekInfo* keyFrames, double seconds) {
+    if (!keyFrames) return seconds;
     PROPVARIANT start{}, before{}, after{};  // 100 ns units, which need no clearing
     start.vt = VT_I8;
     start.hVal.QuadPart = LONGLONG(seconds * 1e7);
-    if (SUCCEEDED(g.keyFrames->GetNearestKeyFrames(&GUID_NULL, &start, &before, &after)) && before.vt == VT_I8 &&
+    if (SUCCEEDED(keyFrames->GetNearestKeyFrames(&GUID_NULL, &start, &before, &after)) && before.vt == VT_I8 &&
         after.vt == VT_I8) {
         const double a = before.hVal.QuadPart / 1e7, b = after.hVal.QuadPart / 1e7;
         seconds = seconds - a <= b - seconds ? a : b;
@@ -345,6 +348,8 @@ double NearestKeyFrame(double seconds) {
 
 constexpr DWORD kVideoStream = DWORD(MF_SOURCE_READER_FIRST_VIDEO_STREAM);
 constexpr double kPreviewSpan = 10;  // seconds of video each preview picture stands for
+constexpr DWORD kPreviewRestMs = 100;  // between preview decode starts, so at most 10 a second
+constexpr DWORD kPreviewDwellMs = 50;  // once the mouse is in a span this long, it rests there: decode it at once
 
 // A reader of the file's video alone, which decodes on the GPU and hands out each frame shrunk there to w x h, its
 // display size fitted to 320 px, about the largest the preview shows; null if it can't.
@@ -384,28 +389,32 @@ ComPtr<IMFSourceReader> OpenPreviewReader(const std::wstring& path, UINT& w, UIN
     return SUCCEEDED(hr) ? reader : nullptr;
 }
 
-// Seeks the reader to the key frame at or before a time and presents it in the preview's swap chain, unless it is
-// the one shown already. Only that frame is decoded.
-void ShowKeyFrame(IMFSourceReader* reader, double seconds, LONGLONG& shown) {
+// Seeks the reader to the key frame at or before a time, in 100 ns units, and decodes just that frame; null if it
+// can't.
+ComPtr<IMFSample> ReadKeyFrame(IMFSourceReader* reader, LONGLONG time) {
     PROPVARIANT position{};  // needs no clearing
     position.vt = VT_I8;
-    position.hVal.QuadPart = std::llround(seconds * 1e7);
-    if (FAILED(reader->SetCurrentPosition(GUID_NULL, position))) return;
+    position.hVal.QuadPart = time;
+    if (FAILED(reader->SetCurrentPosition(GUID_NULL, position))) return nullptr;
     ComPtr<IMFSample> sample;
     DWORD flags = 0;
-    LONGLONG time = 0;
+    LONGLONG at = 0;
     for (int i = 0; i < 8 && !sample; ++i) {  // a gap in the stream comes as no sample
-        if (FAILED(reader->ReadSample(kVideoStream, 0, nullptr, &flags, &time, &sample)) ||
+        if (FAILED(reader->ReadSample(kVideoStream, 0, nullptr, &flags, &at, &sample)) ||
             (flags & (MF_SOURCE_READERF_ERROR | MF_SOURCE_READERF_ENDOFSTREAM))) {
-            return;
+            return nullptr;
         }
     }
-    if (!sample || time == shown) return;
+    return sample;
+}
+
+// Presents a decoded frame in the preview's swap chain.
+void PresentKeyFrame(IMFSample* sample) {
     ComPtr<IMFMediaBuffer> buffer;
     ComPtr<IMFDXGIBuffer> dxgi;
     ComPtr<ID3D11Texture2D> texture;
     UINT index = 0;
-    if (FAILED(sample->GetBufferByIndex(0, &buffer)) || FAILED(buffer.As(&dxgi)) ||
+    if (!sample || FAILED(sample->GetBufferByIndex(0, &buffer)) || FAILED(buffer.As(&dxgi)) ||
         FAILED(dxgi->GetResource(IID_PPV_ARGS(&texture))) || FAILED(dxgi->GetSubresourceIndex(&index))) {
         return;
     }
@@ -420,22 +429,60 @@ void ShowKeyFrame(IMFSourceReader* reader, double seconds, LONGLONG& shown) {
         const D3D11_BOX box{0, 0, 0, std::min(desc.Width, g.previewWidth), std::min(desc.Height, g.previewHeight), 1};
         context->CopySubresourceRegion(target.Get(), 0, 0, 0, 0, texture.Get(), index, &box);
         target.Reset();
-        if (SUCCEEDED(g.previewChain->Present(0, 0))) shown = time;
+        g.previewChain->Present(0, 0);
     }
     ReleaseSRWLockExclusive(&g.lock);
 }
 
-// Opens the files and shows the key frames the window asks for, one at a time. Asks made while it decodes replace
-// each other, so only the latest is shown next and nothing queues up behind the mouse.
+LONGLONG Qpc() {
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return t.QuadPart;
+}
+
+// The QPC time the next preview decode may start, a beat after one that started at `start`: the vertical blank a
+// whole number of refreshes near kPreviewRestMs on, so pictures land evenly on screen. Just kPreviewRestMs on if the
+// refresh timing is unknown.
+LONGLONG NextBeat(LONGLONG start, LONGLONG frequency) {
+    const LONGLONG rest = frequency * kPreviewRestMs / 1000;
+    DWM_TIMING_INFO info{};
+    info.cbSize = sizeof(info);
+    if (FAILED(DwmGetCompositionTimingInfo(nullptr, &info)) || info.qpcRefreshPeriod <= 0) return start + rest;
+    const LONGLONG period = LONGLONG(info.qpcRefreshPeriod), blank = LONGLONG(info.qpcVBlank);
+    const LONGLONG d = start + std::max(1LL, (rest + period / 2) / period) * period - blank;
+    return blank + (d >= 0 ? (d + period / 2) / period : -((period / 2 - d) / period)) * period;  // the nearest
+}
+
+// Waits for the player to stop, the window to ask for something new, or the QPC time `until` (-1 for none). Returns
+// WAIT_OBJECT_0 plus 0, 1 or 2 for each.
+DWORD WaitPreview(HANDLE timer, LONGLONG until, LONGLONG frequency) {
+    const HANDLE events[] = {g.stop, g.previewWake, timer};
+    if (until < 0) return WaitForMultipleObjects(2, events, FALSE, INFINITE);
+    LARGE_INTEGER due;
+    due.QuadPart = -std::max(1LL, (until - Qpc()) * 10'000'000 / frequency);  // relative, in 100 ns units
+    if (!SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) return WAIT_OBJECT_0 + 2;
+    return WaitForMultipleObjects(3, events, FALSE, INFINITE);
+}
+
+// Opens the files and shows the key frames the window wants, one at a time, always the latest. Nothing queues: each
+// wake reads what is wanted now. Decodes start on a beat of about kPreviewRestMs, so a sweep skips key frames instead
+// of decoding every one, or as soon as the mouse has rested kPreviewDwellMs in a span. A picture the mouse moved on
+// from while it decoded is dropped, never shown, and where the mouse is now is decoded at once.
 void PreviewLoop() {
     const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!timer) timer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);  // before Windows 10 1803
+    LARGE_INTEGER frequency;
+    QueryPerformanceFrequency(&frequency);
+    const LONGLONG f = frequency.QuadPart, dwell = f * kPreviewDwellMs / 1000;
     ComPtr<IMFSourceReader> reader;
-    LONGLONG shown = -1;
-    const HANDLE events[] = {g.stop, g.previewWake};
-    while (WaitForMultipleObjects(2, events, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
+    LONGLONG shown = -1;  // the key frame on screen, in 100 ns units
+    LONGLONG beat = 0;    // the QPC time the next decode may start
+    bool stopping = !timer;
+    while (!stopping) {
         AcquireSRWLockExclusive(&g.previewLock);
         const std::wstring path = std::exchange(g.previewPath, {});
-        const double target = std::exchange(g.previewTarget, NAN);
+        const LONGLONG time = g.previewWanted, at = g.previewWantedAt;
         ReleaseSRWLockExclusive(&g.previewLock);
         if (!path.empty()) {
             UINT w = 0, h = 0;
@@ -451,9 +498,29 @@ void PreviewLoop() {
             }
             ReleaseSRWLockExclusive(&g.lock);
         }
-        if (reader && !std::isnan(target)) ShowKeyFrame(reader.Get(), target, shown);
+        if (!reader || time < 0 || time == shown) {
+            stopping = WaitPreview(timer, -1, f) == WAIT_OBJECT_0;
+            continue;
+        }
+        if (const LONGLONG due = std::min(beat, at + dwell); due > Qpc()) {
+            stopping = WaitPreview(timer, due, f) == WAIT_OBJECT_0;
+            continue;  // and take what is wanted by then
+        }
+        const LONGLONG start = Qpc();
+        beat = NextBeat(start, f);
+        const ComPtr<IMFSample> sample = ReadKeyFrame(reader.Get(), time);
+        AcquireSRWLockShared(&g.previewLock);
+        const bool outdated = g.previewWanted != time || !g.previewPath.empty();
+        ReleaseSRWLockShared(&g.previewLock);
+        if (outdated) {  // the mouse moved on while it decoded: decode where it is now, at once
+            beat = 0;
+        } else if (sample) {
+            shown = time;
+            PresentKeyFrame(sample.Get());
+        }
     }
     reader.Reset();
+    if (timer) CloseHandle(timer);
     if (com) CoUninitialize();
 }
 
@@ -505,9 +572,10 @@ HRESULT OpenVideo(const std::wstring& path) {
     // The previewer reads the file on its own; if it can't, there are just no previews.
     AcquireSRWLockExclusive(&g.previewLock);
     g.previewPath = path;
-    g.previewTarget = NAN;
+    g.previewWanted = -1;
     ReleaseSRWLockExclusive(&g.previewLock);
     g.previewBucket = -1;
+    g.previewAsked = -1;
     SetEvent(g.previewWake);
     return hr;
 }
@@ -517,9 +585,13 @@ void SeekPreview(double seconds) {
     const double bucket = std::floor(seconds / kPreviewSpan);
     if (bucket == g.previewBucket) return;
     g.previewBucket = bucket;
-    // The key frame nearest the middle, which needs no decoding up to it.
+    // The key frame nearest the span's middle, which needs no decoding up to it. Spans can share one.
+    const LONGLONG time = std::llround(NearestKeyFrame(g.keyFrames.Get(), (bucket + 0.5) * kPreviewSpan) * 1e7);
+    if (time == g.previewAsked) return;
+    g.previewAsked = time;
     AcquireSRWLockExclusive(&g.previewLock);
-    g.previewTarget = NearestKeyFrame((bucket + 0.5) * kPreviewSpan);
+    g.previewWanted = time;
+    g.previewWantedAt = Qpc();
     ReleaseSRWLockExclusive(&g.previewLock);
     SetEvent(g.previewWake);
 }
@@ -627,7 +699,8 @@ void SeekTo(double seconds, bool fast) {
     // The engine's approximate seek still decodes from a key frame up to near the target, a frame at a time,
     // so a fast seek goes exactly to a key frame instead (just past it, so rounding can't land a frame early).
     if (fast && g.keyFrames) {
-        g.engine->SetCurrentTimeEx(NearestKeyFrame(seconds) + 0.0005, MF_MEDIA_ENGINE_SEEK_MODE_NORMAL);
+        g.engine->SetCurrentTimeEx(NearestKeyFrame(g.keyFrames.Get(), seconds) + 0.0005,
+                                   MF_MEDIA_ENGINE_SEEK_MODE_NORMAL);
         return;
     }
     g.engine->SetCurrentTimeEx(seconds,
