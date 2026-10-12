@@ -25,7 +25,7 @@ target_compile_options(Video-PLAYER PRIVATE /W4 /permissive- /utf-8 /sdl /guard:
 # last, so it only supplies the COM functions, which then bind straight to combase.dll.
 set(CMAKE_CXX_STANDARD_LIBRARIES "")
 target_link_libraries(Video-PLAYER PRIVATE delayimp kernel32 user32 gdi32 imm32 dwmapi shell32 comdlg32 oleaut32 uuid
-                      mfplat mfuuid avrt d3d11 dxgi dcomp d2d1 dwrite dxguid onecore_apiset)
+                      mfplat mfreadwrite mfuuid avrt d3d11 dxgi dcomp d2d1 dwrite dxguid onecore_apiset)
 # The file picker and dropped files load their DLLs on first use, and text drawing once the window lays out.
 target_link_options(Video-PLAYER PRIVATE /DELAYLOAD:comdlg32.dll /DELAYLOAD:shell32.dll /DELAYLOAD:d2d1.dll
                     /DELAYLOAD:dwrite.dll)

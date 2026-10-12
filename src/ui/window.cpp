@@ -1326,9 +1326,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_APP_SUBTITLE_CUE:
             OnSubtitleCue(wp, lp);
             return 0;
-        case WM_APP_PREVIEW:
-            OnPreviewEvent(wp);
-            return 0;
         case WM_PAINT:  // everything is drawn by DirectComposition
             ValidateRect(hwnd, nullptr);
             return 0;

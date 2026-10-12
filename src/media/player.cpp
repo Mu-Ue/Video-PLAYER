@@ -9,6 +9,7 @@
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfmediaengine.h>
+#include <mfreadwrite.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -16,6 +17,7 @@
 #include <cmath>
 #include <memory>
 #include <thread>
+#include <utility>
 
 #include "config.h"
 #include "media/subtitles.h"
@@ -29,7 +31,6 @@ namespace {
 class Notify final : public IMFMediaEngineNotify {
   public:
     HWND hwnd = nullptr;
-    UINT msg = WM_APP_MEDIA;
 
     STDMETHODIMP QueryInterface(REFIID riid, void** object) override {
         if (riid == __uuidof(IUnknown) || riid == __uuidof(IMFMediaEngineNotify)) {
@@ -42,7 +43,7 @@ class Notify final : public IMFMediaEngineNotify {
     STDMETHODIMP_(ULONG) AddRef() override { return 2; }
     STDMETHODIMP_(ULONG) Release() override { return 1; }
     STDMETHODIMP EventNotify(DWORD event, DWORD_PTR param1, DWORD) override {
-        PostMessageW(hwnd, msg, event, LPARAM(param1));
+        PostMessageW(hwnd, WM_APP_MEDIA, event, LPARAM(param1));
         return S_OK;
     }
 };
@@ -102,7 +103,7 @@ class TextNotify final : public IMFTimedTextNotify {
 };
 
 struct {
-    Notify notify, previewNotify;
+    Notify notify;
     TextNotify textNotify;
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D10Multithread> multithread;
@@ -110,20 +111,25 @@ struct {
     ComPtr<IMFMediaEngineEx> engine;
     ComPtr<IMFTimedText> timedText;  // null if unsupported
     std::vector<DWORD> audioStreams;  // the engine's stream index of each audio track
-    // A second engine on the same file, paused, muted and without audio, which seeks to show seek bar previews.
-    ComPtr<IMFMediaEngineEx> preview;
-    bool previewBusy = false, previewQueued = false;  // one seek in flight, the latest one waiting
-    double previewTarget = 0;
+    // The seek bar preview: a thread that decodes just the key frame the window last asked for. The window hands
+    // it a file to open or a key frame to show under previewLock, then sets previewWake.
+    std::thread previewer;
+    HANDLE previewWake = nullptr;
+    SRWLOCK previewLock = SRWLOCK_INIT;
+    std::wstring previewPath;
+    double previewTarget = NAN;  // seconds
+    double previewBucket = -1;   // the last span of kPreviewSpan seconds the window asked for
     // A second parser of the open file, which knows where its key frames are; null if the format doesn't say.
     ComPtr<IMFMediaSource> keySource;
     ComPtr<IMFSeekInfo> keyFrames;
     bool started = false;  // MFStartup succeeded
-    // The video's swap chain, guarded by lock: the render thread presents into it, the window thread sizes it.
+    // The swap chains, guarded by lock: the render thread presents into the video's and the window thread sizes it;
+    // the previewer sizes and presents into the preview's.
     SRWLOCK lock = SRWLOCK_INIT;
     ComPtr<IDXGISwapChain1> chain, previewChain;
     UINT width = 0, height = 0, previewWidth = 0, previewHeight = 0;
-    std::atomic<bool> redraw = false, previewRedraw = false;  // present the current frame even if it isn't new
-    HANDLE stop = nullptr;              // tells the render thread to exit
+    std::atomic<bool> redraw = false;  // present the current frame even if it isn't new
+    HANDLE stop = nullptr;             // tells the render thread and the previewer to exit
     std::thread renderer;
 } g;
 
@@ -167,8 +173,6 @@ HRESULT CreateEngines() {
     HRESULT hr = MFCreateDXGIDeviceManager(&token, &g.manager);
     if (SUCCEEDED(hr)) hr = g.manager->ResetDevice(g.device.Get(), token);
     if (SUCCEEDED(hr)) hr = CreateEngine(&g.notify, g.engine);
-    if (SUCCEEDED(hr)) hr = CreateEngine(&g.previewNotify, g.preview);
-    if (SUCCEEDED(hr)) hr = g.preview->SetMuted(TRUE);
     ComPtr<IMFGetService> service;
     if (SUCCEEDED(hr) && SUCCEEDED(g.engine.As(&service)) &&
         SUCCEEDED(service->GetService(MF_MEDIA_ENGINE_TIMEDTEXT, IID_PPV_ARGS(&g.timedText))) &&
@@ -255,12 +259,6 @@ void RenderLoop() {
             g.redraw = !g.chain || !PresentFrame(g.engine.Get(), g.chain.Get(), g.width, g.height);
             ReleaseSRWLockExclusive(&g.lock);
         }
-        if (g.preview->OnVideoStreamTick(&pts) == S_OK || g.previewRedraw) {
-            AcquireSRWLockExclusive(&g.lock);
-            g.previewRedraw = !g.previewChain ||
-                              !PresentFrame(g.preview.Get(), g.previewChain.Get(), g.previewWidth, g.previewHeight);
-            ReleaseSRWLockExclusive(&g.lock);
-        }
     }
     if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
 }
@@ -325,33 +323,145 @@ double NearestKeyFrame(double seconds) {
     return seconds;
 }
 
+constexpr DWORD kVideoStream = DWORD(MF_SOURCE_READER_FIRST_VIDEO_STREAM);
+constexpr double kPreviewSpan = 10;  // seconds of video each preview picture stands for
+
+// A reader of the file's video alone, which decodes on the GPU and hands out each frame shrunk there to w x h, its
+// display size fitted to 320 px, about the largest the preview shows; null if it can't.
+ComPtr<IMFSourceReader> OpenPreviewReader(const std::wstring& path, UINT& w, UINT& h) {
+    ComPtr<IMFByteStream> stream;
+    ComPtr<IMFAttributes> attributes;
+    ComPtr<IMFSourceReader> reader;
+    ComPtr<IMFMediaType> native, type;
+    HRESULT hr = MFCreateFile(MF_ACCESSMODE_READ, MF_OPENMODE_FAIL_IF_NOT_EXIST, MF_FILEFLAGS_NONE, path.c_str(),
+                              &stream);
+    if (SUCCEEDED(hr)) hr = MFCreateAttributes(&attributes, 4);
+    if (SUCCEEDED(hr)) hr = attributes->SetUnknown(MF_SOURCE_READER_D3D_MANAGER, g.manager.Get());
+    if (SUCCEEDED(hr)) hr = attributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
+    if (SUCCEEDED(hr)) hr = attributes->SetUINT32(MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, TRUE);
+    // The decoder hands out a key frame as soon as it has it, rather than holding it to reorder later frames.
+    if (SUCCEEDED(hr)) hr = attributes->SetUINT32(MF_LOW_LATENCY, TRUE);
+    if (SUCCEEDED(hr)) hr = MFCreateSourceReaderFromByteStream(stream.Get(), attributes.Get(), &reader);
+    if (SUCCEEDED(hr)) hr = reader->SetStreamSelection(DWORD(MF_SOURCE_READER_ALL_STREAMS), FALSE);
+    if (SUCCEEDED(hr)) hr = reader->SetStreamSelection(kVideoStream, TRUE);
+    if (SUCCEEDED(hr)) hr = reader->GetNativeMediaType(kVideoStream, 0, &native);
+    UINT32 fw = 0, fh = 0;
+    if (SUCCEEDED(hr)) hr = MFGetAttributeSize(native.Get(), MF_MT_FRAME_SIZE, &fw, &fh);
+    if (FAILED(hr) || !fw || !fh) return nullptr;
+    // Non-square pixels (anamorphic video) stretch the width.
+    UINT32 ax = 1, ay = 1;
+    if (FAILED(MFGetAttributeRatio(native.Get(), MF_MT_PIXEL_ASPECT_RATIO, &ax, &ay)) || !ax || !ay) ax = ay = 1;
+    const double dw = double(fw) * ax / ay, scale = 320.0 / std::max(dw, double(fh));
+    w = UINT(std::max(2L, std::lround(dw * scale / 2) * 2));  // even, as video processing likes
+    h = UINT(std::max(2L, std::lround(fh * scale / 2) * 2));
+    hr = MFCreateMediaType(&type);
+    if (SUCCEEDED(hr)) hr = type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+    if (SUCCEEDED(hr)) hr = type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_ARGB32);  // the swap chain's format
+    if (SUCCEEDED(hr)) hr = type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    if (SUCCEEDED(hr)) hr = MFSetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, w, h);
+    if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(type.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+    if (SUCCEEDED(hr)) hr = reader->SetCurrentMediaType(kVideoStream, nullptr, type.Get());
+    return SUCCEEDED(hr) ? reader : nullptr;
+}
+
+// Seeks the reader to the key frame at or before a time and presents it in the preview's swap chain, unless it is
+// the one shown already. Only that frame is decoded.
+void ShowKeyFrame(IMFSourceReader* reader, double seconds, LONGLONG& shown) {
+    PROPVARIANT position{};  // needs no clearing
+    position.vt = VT_I8;
+    position.hVal.QuadPart = std::llround(seconds * 1e7);
+    if (FAILED(reader->SetCurrentPosition(GUID_NULL, position))) return;
+    ComPtr<IMFSample> sample;
+    DWORD flags = 0;
+    LONGLONG time = 0;
+    for (int i = 0; i < 8 && !sample; ++i) {  // a gap in the stream comes as no sample
+        if (FAILED(reader->ReadSample(kVideoStream, 0, nullptr, &flags, &time, &sample)) ||
+            (flags & (MF_SOURCE_READERF_ERROR | MF_SOURCE_READERF_ENDOFSTREAM))) {
+            return;
+        }
+    }
+    if (!sample || time == shown) return;
+    ComPtr<IMFMediaBuffer> buffer;
+    ComPtr<IMFDXGIBuffer> dxgi;
+    ComPtr<ID3D11Texture2D> texture;
+    UINT index = 0;
+    if (FAILED(sample->GetBufferByIndex(0, &buffer)) || FAILED(buffer.As(&dxgi)) ||
+        FAILED(dxgi->GetResource(IID_PPV_ARGS(&texture))) || FAILED(dxgi->GetSubresourceIndex(&index))) {
+        return;
+    }
+    D3D11_TEXTURE2D_DESC desc;
+    texture->GetDesc(&desc);
+    if (desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) return;
+    ComPtr<ID3D11DeviceContext> context;
+    g.device->GetImmediateContext(&context);
+    AcquireSRWLockExclusive(&g.lock);
+    ComPtr<ID3D11Texture2D> target;
+    if (g.previewChain && SUCCEEDED(g.previewChain->GetBuffer(0, IID_PPV_ARGS(&target)))) {
+        const D3D11_BOX box{0, 0, 0, std::min(desc.Width, g.previewWidth), std::min(desc.Height, g.previewHeight), 1};
+        context->CopySubresourceRegion(target.Get(), 0, 0, 0, 0, texture.Get(), index, &box);
+        target.Reset();
+        if (SUCCEEDED(g.previewChain->Present(0, 0))) shown = time;
+    }
+    ReleaseSRWLockExclusive(&g.lock);
+}
+
+// Opens the files and shows the key frames the window asks for, one at a time. Asks made while it decodes replace
+// each other, so only the latest is shown next and nothing queues up behind the mouse.
+void PreviewLoop() {
+    const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+    ComPtr<IMFSourceReader> reader;
+    LONGLONG shown = -1;
+    const HANDLE events[] = {g.stop, g.previewWake};
+    while (WaitForMultipleObjects(2, events, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
+        AcquireSRWLockExclusive(&g.previewLock);
+        const std::wstring path = std::exchange(g.previewPath, {});
+        const double target = std::exchange(g.previewTarget, NAN);
+        ReleaseSRWLockExclusive(&g.previewLock);
+        if (!path.empty()) {
+            UINT w = 0, h = 0;
+            reader = OpenPreviewReader(path, w, h);
+            shown = -1;
+            AcquireSRWLockExclusive(&g.lock);
+            g.previewWidth = g.previewHeight = 0;
+            if (reader && SUCCEEDED(SizeChain(g.previewChain, w, h))) {
+                g.previewWidth = w;
+                g.previewHeight = h;
+            } else {  // audio only, or a format it can't shrink: no previews
+                reader.Reset();
+            }
+            ReleaseSRWLockExclusive(&g.lock);
+        }
+        if (reader && !std::isnan(target)) ShowKeyFrame(reader.Get(), target, shown);
+    }
+    reader.Reset();
+    if (com) CoUninitialize();
+}
+
 }  // namespace
 
 bool InitPlayer(HWND hwnd) {
-    g.notify.hwnd = g.previewNotify.hwnd = g.textNotify.hwnd = hwnd;
-    g.previewNotify.msg = WM_APP_PREVIEW;
+    g.notify.hwnd = g.textNotify.hwnd = hwnd;
     if (FAILED(CreateDevice())) return false;
     g.started = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
     if (!g.started || FAILED(CreateEngines())) return false;
     g.stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!g.stop) return false;
+    g.previewWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g.stop || !g.previewWake) return false;
     g.renderer = std::thread(RenderLoop);
+    g.previewer = std::thread(PreviewLoop);
     return true;
 }
 
 void ShutdownPlayer() {
-    if (g.renderer.joinable()) {
-        SetEvent(g.stop);
-        g.renderer.join();
-    }
+    if (g.stop) SetEvent(g.stop);
+    if (g.renderer.joinable()) g.renderer.join();
+    if (g.previewer.joinable()) g.previewer.join();
     g.chain.Reset();
     g.previewChain.Reset();
     CloseKeyFrames();
     g.timedText.Reset();
     if (g.engine) g.engine->Shutdown();
     g.engine.Reset();
-    if (g.preview) g.preview->Shutdown();
-    g.preview.Reset();
     g.manager.Reset();
     if (g.started) MFShutdown();
     g.started = false;
@@ -371,75 +481,41 @@ HRESULT OpenVideo(const std::wstring& path) {
     if (SUCCEEDED(hr)) hr = g.engine->Play();
     if (FAILED(hr)) return hr;
     OpenKeyFrames(path);
-    // The preview engine reads the file on its own; if it can't, there are just no previews.
-    g.previewBusy = g.previewQueued = false;
-    ComPtr<IMFByteStream> previewStream;
-    name = SysAllocString(path.c_str());
-    if (name && SUCCEEDED(MFCreateFile(MF_ACCESSMODE_READ, MF_OPENMODE_FAIL_IF_NOT_EXIST, MF_FILEFLAGS_NONE,
-                                       path.c_str(), &previewStream))) {
-        g.preview->SetSourceFromByteStream(previewStream.Get(), name);
-    }
-    SysFreeString(name);
+    // The previewer reads the file on its own; if it can't, there are just no previews.
+    AcquireSRWLockExclusive(&g.previewLock);
+    g.previewPath = path;
+    g.previewTarget = NAN;
+    ReleaseSRWLockExclusive(&g.previewLock);
+    g.previewBucket = -1;
+    SetEvent(g.previewWake);
     return hr;
 }
 
-void OnPreviewEvent(WPARAM event) {
-    if (event == MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA) {
-        // Video only, so seeks decode no audio.
-        DWORD count = 0;
-        if (SUCCEEDED(g.preview->GetNumberOfStreams(&count))) {
-            for (DWORD i = 0; i < count; ++i) {
-                PROPVARIANT type;
-                PropVariantInit(&type);
-                const bool audio = SUCCEEDED(g.preview->GetStreamAttribute(i, MF_MT_MAJOR_TYPE, &type)) &&
-                                   type.vt == VT_CLSID && type.puuid && *type.puuid == MFMediaType_Audio;
-                PropVariantClear(&type);
-                if (audio) g.preview->SetStreamSelection(i, FALSE);
-            }
-            g.preview->ApplyStreamSelections();
-        }
-        // Fitted to 512 x 512, about the largest it shows.
-        const SIZE v = DisplaySize(g.preview.Get());
-        AcquireSRWLockExclusive(&g.lock);
-        g.previewWidth = g.previewHeight = 0;
-        if (v.cx > 0 && v.cy > 0) {
-            const double scale = 512.0 / std::max(v.cx, v.cy);
-            const UINT w = UINT(std::max(1L, std::lround(v.cx * scale)));
-            const UINT h = UINT(std::max(1L, std::lround(v.cy * scale)));
-            if (SUCCEEDED(SizeChain(g.previewChain, w, h))) {
-                g.previewWidth = w;
-                g.previewHeight = h;
-                g.previewRedraw = true;
-            }
-        }
-        ReleaseSRWLockExclusive(&g.lock);
-    } else if (event == MF_MEDIA_ENGINE_EVENT_SEEKED) {
-        g.previewBusy = false;
-        if (g.previewQueued) {
-            g.previewQueued = false;
-            SeekPreview(g.previewTarget);
-        }
-    }
-}
-
 void SeekPreview(double seconds) {
-    g.previewTarget = seconds;
-    if (g.previewBusy) {
-        g.previewQueued = true;
-        return;
-    }
-    g.previewBusy = true;
-    // Straight to a key frame, which needs no decoding up to the time.
-    if (g.keyFrames) {
-        g.preview->SetCurrentTimeEx(NearestKeyFrame(seconds) + 0.0005, MF_MEDIA_ENGINE_SEEK_MODE_NORMAL);
-    } else {
-        g.preview->SetCurrentTimeEx(seconds, MF_MEDIA_ENGINE_SEEK_MODE_APPROXIMATE);
-    }
+    // One picture for each 10 seconds, like Netflix: moves within them decode nothing new.
+    const double bucket = std::floor(seconds / kPreviewSpan);
+    if (bucket == g.previewBucket) return;
+    g.previewBucket = bucket;
+    // The key frame nearest the middle, which needs no decoding up to it.
+    AcquireSRWLockExclusive(&g.previewLock);
+    g.previewTarget = NearestKeyFrame((bucket + 0.5) * kPreviewSpan);
+    ReleaseSRWLockExclusive(&g.previewLock);
+    SetEvent(g.previewWake);
 }
 
-IUnknown* PreviewSwapChain() { return g.previewChain.Get(); }
+IUnknown* PreviewSwapChain() {
+    AcquireSRWLockShared(&g.lock);
+    IUnknown* chain = g.previewChain.Get();
+    ReleaseSRWLockShared(&g.lock);
+    return chain;
+}
 
-SIZE PreviewSize() { return {LONG(g.previewWidth), LONG(g.previewHeight)}; }
+SIZE PreviewSize() {
+    AcquireSRWLockShared(&g.lock);
+    const SIZE size{LONG(g.previewWidth), LONG(g.previewHeight)};
+    ReleaseSRWLockShared(&g.lock);
+    return size;
+}
 
 bool HasVideo() { return g.engine && g.engine->HasVideo(); }
 
