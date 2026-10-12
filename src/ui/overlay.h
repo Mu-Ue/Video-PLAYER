@@ -19,7 +19,7 @@ void SetOverlayDevice(ID3D11Device* device);
 SIZE DrawOutlinedText(IDCompositionDevice* dcomp, IDCompositionVisual* visual, std::wstring_view text,
                       const std::vector<StyleSpan>& spans, float fontSize, float maxWidth, bool center);
 
-// A button: text on the menu bar, an icon glyph on the controls.
+// A button: text on the menu bar, an icon glyph on the controls, or a row of the track panel.
 struct BarItem {
     RECT rect;  // in pixels from the surface's top left
     std::wstring text;
@@ -27,6 +27,7 @@ struct BarItem {
     bool hot = false;  // under the mouse
     bool dim = false;  // disabled
     bool mirror = false;  // flipped left to right
+    bool checked = false;  // a check mark left of the text
     bool operator==(const BarItem&) const = default;
 };
 
@@ -52,3 +53,20 @@ struct Controls {
 // and sets it as the visual's content.
 void DrawControls(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT width, UINT height, float scale,
                   const Controls& controls);
+
+// A column of the track panel: a header over rows, which are clipped to the rows rect. In pixels from the panel's
+// top left.
+struct TrackColumn {
+    RECT header;
+    std::wstring title;
+    RECT rows;
+    std::vector<BarItem> items;
+};
+
+// Draws the audio and subtitle track panel, a rounded dark box with the columns side by side, into the visual's
+// surface and sets it as the visual's content.
+void DrawTrackPanel(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT width, UINT height, float scale,
+                    const std::vector<TrackColumn>& columns);
+
+// The width in pixels of a track panel row's text, or of a header's.
+float TrackTextWidth(std::wstring_view text, float scale, bool header);

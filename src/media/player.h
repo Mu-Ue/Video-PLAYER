@@ -4,13 +4,15 @@
 #include <unknwn.h>
 
 #include <string>
+#include <vector>
 
 // Posted to the window for each media engine event: wParam is the MF_MEDIA_ENGINE_EVENT, lParam its first
 // parameter (the MF_MEDIA_ENGINE_ERR code for an error).
 constexpr UINT WM_APP_MEDIA = WM_APP + 1;
 // Posted when the video turns out to have a subtitle track of its own.
 constexpr UINT WM_APP_SUBTITLE_TRACK = WM_APP + 2;
-// Posted as each cue of the selected subtitle track starts showing: lParam is a Cue* for the window to delete.
+// Posted as each cue of the selected subtitle track starts showing: wParam is the track's id, lParam a Cue* for
+// the window to delete.
 constexpr UINT WM_APP_SUBTITLE_CUE = WM_APP + 3;
 
 // Creates a GPU device of its own, Media Foundation's media engine, which decodes on the GPU, and a thread that
@@ -22,9 +24,22 @@ void ShutdownPlayer();
 // Starts loading and playing a local file; the outcome arrives as events. Fails if the file can't be opened.
 HRESULT OpenVideo(const std::wstring& path);
 bool HasVideo();
-// Selects the video's first text subtitle track (SRT, SSA / ASS or WebVTT in MKV), whose cues are then posted as
-// they show. Returns false if there is none.
-bool SelectSubtitleTrack();
+
+// An audio or subtitle track of the video.
+struct Track {
+    std::wstring language;  // a language tag such as "en", "en-US" or "eng"; may be empty
+    std::wstring name;      // may be empty
+    DWORD id;               // of a subtitle track
+    bool selected;          // the audio track playing
+};
+// The video's audio tracks, once its metadata has loaded.
+std::vector<Track> AudioTracks();
+// Plays the audio track at index in AudioTracks() instead of the others.
+void SelectAudioTrack(size_t index);
+// The video's text subtitle tracks (SRT, SSA / ASS or WebVTT in MKV).
+std::vector<Track> SubtitleTracks();
+// Selects the subtitle track with the id instead of the others; its cues are then posted as they show.
+bool SelectSubtitleTrack(DWORD id);
 SIZE VideoSize();  // display size in pixels, or 0 x 0
 // Sizes the video's swap chain; the first call creates it.
 void SetVideoSize(int width, int height);

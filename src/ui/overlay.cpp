@@ -39,8 +39,8 @@ struct {
     std::vector<Target> targets;
     // The text formats of the bars and controls, for one DPI scale.
     float scale = 0;
-    ComPtr<IDWriteTextFormat> menu, time, title, icons, number;
-    ComPtr<IDWriteInlineObject> ellipsis;
+    ComPtr<IDWriteTextFormat> menu, time, title, icons, number, header, row, check;
+    ComPtr<IDWriteInlineObject> ellipsis, rowEllipsis;
     // The outlined text's format, for one size.
     float textSize = 0;
     ComPtr<IDWriteTextFormat> text;
@@ -197,13 +197,19 @@ bool SetScale(float scale) {
     g.title = CreateFormat(L"Segoe UI", 15 * scale, true, DWRITE_TEXT_ALIGNMENT_CENTER);
     g.icons = CreateFormat(IconFont(), 24 * scale, false, DWRITE_TEXT_ALIGNMENT_CENTER);
     g.number = CreateFormat(L"Segoe UI", 9 * scale, true, DWRITE_TEXT_ALIGNMENT_CENTER);
+    g.header = CreateFormat(L"Segoe UI", 14 * scale, true, DWRITE_TEXT_ALIGNMENT_LEADING);
+    g.row = CreateFormat(L"Segoe UI", 13 * scale, false, DWRITE_TEXT_ALIGNMENT_LEADING);
+    g.check = CreateFormat(IconFont(), 12 * scale, false, DWRITE_TEXT_ALIGNMENT_CENTER);
     g.ellipsis.Reset();
-    if (!g.menu || !g.time || !g.title || !g.icons || !g.number ||
-        FAILED(g.dwrite->CreateEllipsisTrimmingSign(g.title.Get(), &g.ellipsis))) {
+    g.rowEllipsis.Reset();
+    if (!g.menu || !g.time || !g.title || !g.icons || !g.number || !g.header || !g.row || !g.check ||
+        FAILED(g.dwrite->CreateEllipsisTrimmingSign(g.title.Get(), &g.ellipsis)) ||
+        FAILED(g.dwrite->CreateEllipsisTrimmingSign(g.row.Get(), &g.rowEllipsis))) {
         return false;
     }
     const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
     g.title->SetTrimming(&trimming, g.ellipsis.Get());
+    g.row->SetTrimming(&trimming, g.rowEllipsis.Get());
     g.scale = scale;
     return true;
 }
@@ -430,4 +436,64 @@ void DrawControls(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT 
                          r, g.brush.Get());
         }
     });
+}
+
+void DrawTrackPanel(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT width, UINT height, float scale,
+                    const std::vector<TrackColumn>& columns) {
+    if (width == 0 || height == 0 || !Init() || !SetScale(scale)) {
+        visual->SetContent(nullptr);
+        return;
+    }
+    const float check = 26 * scale, radius = 4 * scale;
+    Paint(dcomp, visual, width, height, [&](ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F&) {
+        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+        dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        g.brush->SetColor(D2D1::ColorF(0x262626, 0.95f));
+        dc->FillRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(0, 0, float(width), float(height)), 2 * radius, 2 * radius), g.brush.Get());
+        for (size_t k = 0; k < columns.size(); ++k) {
+            const TrackColumn& c = columns[k];
+            const D2D1_RECT_F rows = RectF(c.rows);
+            if (k > 0) {  // a divider halfway from the previous column
+                const float x = std::round((float(columns[k - 1].rows.right) + rows.left) / 2);
+                g.brush->SetColor(D2D1::ColorF(0x404040));
+                dc->FillRectangle(D2D1::RectF(x, rows.top, x + std::max(1.0f, std::round(scale)), rows.bottom),
+                                  g.brush.Get());
+            }
+            D2D1_RECT_F header = RectF(c.header);
+            header.left += check;
+            g.brush->SetColor(D2D1::ColorF(0xffffff));
+            dc->DrawText(c.title.data(), UINT32(c.title.size()), g.header.Get(), header, g.brush.Get(),
+                         D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            dc->PushAxisAlignedClip(rows, D2D1_ANTIALIAS_MODE_ALIASED);
+            for (const BarItem& item : c.items) {
+                const D2D1_RECT_F r = RectF(item.rect);
+                if (item.hot) {
+                    g.brush->SetColor(D2D1::ColorF(0x3a3a3a));
+                    dc->FillRoundedRectangle(D2D1::RoundedRect(r, radius, radius), g.brush.Get());
+                }
+                g.brush->SetColor(D2D1::ColorF(item.checked || item.hot ? 0xffffff : 0xb3b3b3));
+                if (item.checked) {
+                    dc->DrawText(L"\xE73E", 1, g.check.Get(), D2D1::RectF(r.left, r.top, r.left + check, r.bottom),
+                                 g.brush.Get());
+                }
+                dc->DrawText(item.text.data(), UINT32(item.text.size()), g.row.Get(),
+                             D2D1::RectF(r.left + check, r.top, r.right - 8 * scale, r.bottom), g.brush.Get(),
+                             D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            }
+            dc->PopAxisAlignedClip();
+        }
+    });
+}
+
+float TrackTextWidth(std::wstring_view text, float scale, bool header) {
+    ComPtr<IDWriteTextLayout> layout;
+    DWRITE_TEXT_METRICS m;
+    if (!Init() || !SetScale(scale) ||
+        FAILED(g.dwrite->CreateTextLayout(text.data(), UINT32(text.size()), (header ? g.header : g.row).Get(), 1e6f,
+                                          0, &layout)) ||
+        FAILED(layout->GetMetrics(&m))) {
+        return 0;
+    }
+    return m.widthIncludingTrailingWhitespace;
 }

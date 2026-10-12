@@ -96,7 +96,7 @@ class TextNotify final : public IMFTimedTextNotify {
             }
         }
         if (out->text.empty() || !(out->end > out->start)) return;
-        if (PostMessageW(hwnd, WM_APP_SUBTITLE_CUE, 0, LPARAM(out.get()))) out.release();
+        if (PostMessageW(hwnd, WM_APP_SUBTITLE_CUE, cue->GetTrackId(), LPARAM(out.get()))) out.release();
     }
 };
 
@@ -108,6 +108,7 @@ struct {
     ComPtr<IMFDXGIDeviceManager> manager;
     ComPtr<IMFMediaEngineEx> engine;
     ComPtr<IMFTimedText> timedText;  // null if unsupported
+    std::vector<DWORD> audioStreams;  // the engine's stream index of each audio track
     // A second parser of the open file, which knows where its key frames are; null if the format doesn't say.
     ComPtr<IMFMediaSource> keySource;
     ComPtr<IMFSeekInfo> keyFrames;
@@ -239,6 +240,24 @@ void OpenKeyFrames(const std::wstring& path) {
     }
 }
 
+// Takes a string the callee allocated.
+std::wstring Take(LPWSTR text) {
+    std::wstring s = text ? text : L"";
+    CoTaskMemFree(text);
+    return s;
+}
+
+std::wstring StreamString(DWORD stream, REFGUID key) {
+    PROPVARIANT value;
+    PropVariantInit(&value);
+    std::wstring s;
+    if (SUCCEEDED(g.engine->GetStreamAttribute(stream, key, &value)) && value.vt == VT_LPWSTR && value.pwszVal) {
+        s = value.pwszVal;
+    }
+    PropVariantClear(&value);
+    return s;
+}
+
 // The key frame nearest to a time, in seconds, or the time itself if unknown.
 double NearestKeyFrame(double seconds) {
     if (!g.keyFrames) return seconds;
@@ -299,11 +318,57 @@ HRESULT OpenVideo(const std::wstring& path) {
 
 bool HasVideo() { return g.engine && g.engine->HasVideo(); }
 
-bool SelectSubtitleTrack() {
-    ComPtr<IMFTimedTextTrackList> tracks;
-    ComPtr<IMFTimedTextTrack> track;
-    return g.timedText && SUCCEEDED(g.timedText->GetTextTracks(&tracks)) && tracks->GetLength() > 0 &&
-           SUCCEEDED(tracks->GetTrack(0, &track)) && SUCCEEDED(g.timedText->SelectTrack(track->GetId(), TRUE));
+std::vector<Track> AudioTracks() {
+    std::vector<Track> tracks;
+    g.audioStreams.clear();
+    DWORD count = 0;
+    if (!g.engine || FAILED(g.engine->GetNumberOfStreams(&count))) return tracks;
+    for (DWORD i = 0; i < count; ++i) {
+        PROPVARIANT type;
+        PropVariantInit(&type);
+        const bool audio = SUCCEEDED(g.engine->GetStreamAttribute(i, MF_MT_MAJOR_TYPE, &type)) &&
+                           type.vt == VT_CLSID && type.puuid && *type.puuid == MFMediaType_Audio;
+        PropVariantClear(&type);
+        if (!audio) continue;
+        BOOL selected = FALSE;
+        g.engine->GetStreamSelection(i, &selected);
+        tracks.push_back({StreamString(i, MF_SD_LANGUAGE), StreamString(i, MF_SD_STREAM_NAME), 0, selected != FALSE});
+        g.audioStreams.push_back(i);
+    }
+    return tracks;
+}
+
+void SelectAudioTrack(size_t index) {
+    if (index >= g.audioStreams.size()) return;
+    for (size_t k = 0; k < g.audioStreams.size(); ++k) g.engine->SetStreamSelection(g.audioStreams[k], k == index);
+    g.engine->ApplyStreamSelections();
+}
+
+std::vector<Track> SubtitleTracks() {
+    std::vector<Track> tracks;
+    ComPtr<IMFTimedTextTrackList> list;
+    if (!g.timedText || FAILED(g.timedText->GetTextTracks(&list))) return tracks;
+    for (DWORD i = 0; i < list->GetLength(); ++i) {
+        ComPtr<IMFTimedTextTrack> track;
+        LPWSTR language = nullptr, label = nullptr;
+        if (FAILED(list->GetTrack(i, &track))) continue;
+        track->GetLanguage(&language);
+        track->GetLabel(&label);
+        tracks.push_back({Take(language), Take(label), track->GetId(), false});
+    }
+    return tracks;
+}
+
+bool SelectSubtitleTrack(DWORD id) {
+    ComPtr<IMFTimedTextTrackList> list;
+    if (!g.timedText || FAILED(g.timedText->GetTextTracks(&list))) return false;
+    for (DWORD i = 0; i < list->GetLength(); ++i) {
+        ComPtr<IMFTimedTextTrack> track;
+        if (SUCCEEDED(list->GetTrack(i, &track)) && track->GetId() != id) {
+            g.timedText->SelectTrack(track->GetId(), FALSE);
+        }
+    }
+    return SUCCEEDED(g.timedText->SelectTrack(id, TRUE));
 }
 
 SIZE VideoSize() {

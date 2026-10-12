@@ -34,15 +34,39 @@ enum Control {
 constexpr UINT kShowFallbackMs = 1000;  // show the window even if the video's size isn't known by then
 constexpr float kFadeSeconds = 0.2f;    // of the controls
 
+// A subtitle track: one of the video's own, whose cues are added as they show, or an SRT file.
+struct SubtitleTrack {
+    std::wstring label;
+    std::wstring path;  // of the file; empty for the video's own
+    DWORD id = 0;       // of the video's own
+    Subtitles subs;
+};
+
+// A column of the track panel.
+struct PanelColumn {
+    std::vector<std::wstring> rows;
+    int width = 0;   // in pixels
+    int scroll = 0;  // rows scrolled off the top
+};
+
+// Where the track panel is, in client pixels.
+struct PanelGeometry {
+    RECT panel;
+    RECT rows[2];  // of the audio and subtitle columns; empty if not shown
+    int rowH, headerH;
+};
+
 struct Window {
     HWND hwnd = nullptr;
     int showCmd = SW_SHOWNORMAL;
     // Bottom to top: black background, video, subtitles at the bottom and top, seek / volume feedback, the
-    // controls over the bottom of the video, and the menu bar, which the video doesn't overlap.
+    // controls over the bottom of the video, the track panel above them, and the menu bar, which the video
+    // doesn't overlap.
     ComPtr<ID3D11Device> device;  // for composition and the overlay
     ComPtr<IDCompositionDevice> dcomp;
     ComPtr<IDCompositionTarget> target;
-    ComPtr<IDCompositionVisual> root, background, video, subtitleBottom, subtitleTop, osd, controls, menuBar;
+    ComPtr<IDCompositionVisual> root, background, video, subtitleBottom, subtitleTop, osd, controls, panel,
+        menuBar;
     ComPtr<IDCompositionEffectGroup> controlsFade;
     ComPtr<IDXGISwapChain1> black;  // 8 x 8, stretched over the window
     bool attached = false;          // the engine's swap chain is the content of `video`
@@ -50,9 +74,17 @@ struct Window {
     RECT videoRect{};               // where the video is, in client pixels
 
     bool sized = false;  // the window has been sized to a video
-    Subtitles subs;
-    bool embeddedSubs = false;  // subs are the video's own, which grow as its cues show
-    bool subsOn = true;
+    std::vector<SubtitleTrack> tracks;  // the video's own first, then files
+    int subtitle = -1;                  // the track shown, or -1 for off
+    int lastSubtitle = -1;              // the last one shown, which S brings back
+    bool ownTrackSelected = false;      // one of the video's own is selected in the engine, collecting cues
+    std::vector<std::wstring> audio;    // labels of the video's audio tracks
+    int audioTrack = -1;                // the one playing
+    // The track panel: an audio column (with 2+ tracks) and a subtitle column, and the row under the mouse.
+    bool panelOpen = false;
+    PanelColumn columns[2];
+    int hotColumn = -1, hotRow = -1;
+    int wheel = 0;  // mouse wheel turns short of a row
     std::vector<size_t> shown;  // indices of the cues on screen
     float subtitleHeight = 0;   // of the bottom ones
     std::wstring osdText;
@@ -89,10 +121,79 @@ std::wstring FileName(const std::wstring& path) { return path.substr(path.find_l
 
 bool IsMenuButton(Control c) { return c == kFile || c == kSubs; }
 
-bool HasSubtitles() { return g.embeddedSubs || !g.subs.cues.empty(); }
+bool HasSubtitles() { return !g.tracks.empty(); }
+
+// Whether the track panel has anything to choose from.
+bool HasTrackChoice() { return HasSubtitles() || g.audio.size() >= 2; }
+
+// The cues of the subtitles shown, or null if off.
+const Subtitles* ShownSubtitles() { return g.subtitle >= 0 ? &g.tracks[size_t(g.subtitle)].subs : nullptr; }
 
 bool IsSubtitleFile(const std::wstring& path) {
     return path.size() >= 4 && CompareStringOrdinal(path.c_str() + path.size() - 4, 4, L".srt", 4, TRUE) == CSTR_EQUAL;
+}
+
+// The language's name, such as "English" or "English (United States)", from a tag such as "en", "en-US" or the
+// ISO 639-2 "eng"; empty if it isn't one.
+std::wstring LanguageName(std::wstring code) {
+    if (code.size() < 2 || code.size() > 16) return {};
+    wchar_t name[128];
+    if (code.size() != 3) {
+        const LCID lcid = LocaleNameToLCID(code.c_str(), LOCALE_ALLOW_NEUTRAL_NAMES);
+        return lcid && lcid != LOCALE_CUSTOM_UNSPECIFIED &&
+                       GetLocaleInfoEx(code.c_str(), LOCALE_SLOCALIZEDDISPLAYNAME, name, int(std::size(name)))
+                   ? name
+                   : L"";
+    }
+    // Windows knows the terminology codes, so map the bibliographic ones that differ.
+    static const wchar_t* const kBibliographic[][2] = {
+        {L"alb", L"sqi"}, {L"arm", L"hye"}, {L"baq", L"eus"}, {L"bur", L"mya"}, {L"chi", L"zho"},
+        {L"cze", L"ces"}, {L"dut", L"nld"}, {L"fre", L"fra"}, {L"geo", L"kat"}, {L"ger", L"deu"},
+        {L"gre", L"ell"}, {L"ice", L"isl"}, {L"mac", L"mkd"}, {L"mao", L"mri"}, {L"may", L"msa"},
+        {L"per", L"fas"}, {L"rum", L"ron"}, {L"slo", L"slk"}, {L"tib", L"bod"}, {L"wel", L"cym"}};
+    for (const auto& b : kBibliographic) {
+        if (CompareStringOrdinal(code.c_str(), 3, b[0], 3, TRUE) == CSTR_EQUAL) code = b[1];
+    }
+    struct Find {
+        const wchar_t* code;
+        wchar_t locale[LOCALE_NAME_MAX_LENGTH];
+    } find{code.c_str(), L""};
+    EnumSystemLocalesEx(
+        [](LPWSTR locale, DWORD, LPARAM param) -> BOOL {
+            auto& f = *reinterpret_cast<Find*>(param);
+            wchar_t iso[9];
+            if (GetLocaleInfoEx(locale, LOCALE_SISO639LANGNAME2, iso, int(std::size(iso))) &&
+                CompareStringOrdinal(iso, -1, f.code, -1, TRUE) == CSTR_EQUAL) {
+                wcscpy_s(f.locale, locale);
+                return FALSE;
+            }
+            return TRUE;
+        },
+        LOCALE_NEUTRALDATA, LPARAM(&find), nullptr);
+    return find.locale[0] && GetLocaleInfoEx(find.locale, LOCALE_SLOCALIZEDDISPLAYNAME, name, int(std::size(name)))
+               ? name
+               : L"";
+}
+
+// "English", "English – Commentary", "Commentary" or "Track 2".
+std::wstring TrackLabel(const Track& track, size_t index) {
+    std::wstring label = LanguageName(track.language);
+    const std::wstring& name = track.name;
+    if (!name.empty() && CompareStringOrdinal(name.c_str(), int(name.size()), label.c_str(), int(label.size()),
+                                              TRUE) != CSTR_EQUAL) {
+        label = label.empty() ? name : label + L" \x2013 " + name;
+    }
+    return label.empty() ? L"Track " + std::to_wstring(index + 1) : label;
+}
+
+// The language of "Movie.en.srt", else the file name without its extension.
+std::wstring SubtitleFileLabel(const std::wstring& path) {
+    std::wstring stem = FileName(path);
+    stem.resize(stem.size() - 4);
+    if (const size_t dot = stem.find_last_of(L'.'); dot != std::wstring::npos) {
+        if (std::wstring language = LanguageName(stem.substr(dot + 1)); !language.empty()) return language;
+    }
+    return stem;
 }
 
 // "1:05:09" or "5:09".
@@ -231,7 +332,7 @@ bool DrawControls() {
         g.title,
         {button(kPlay, g.playing ? L"\xE769" : L"\xF5B0", off), button(kBack, step, off, -1),
          button(kForward, step, off, 1), button(kVolume, VolumeGlyph(), false),
-         button(kSubtitles, L"\xE7F0", off || !HasSubtitles()),
+         button(kSubtitles, L"\xE7F0", off || !HasTrackChoice()),
          button(kFullscreen, g.fullscreen ? L"\xE73F" : L"\xE740", false)}};
     g.controls->SetOffsetY(float(top));
     const SIZE size{client.right, h};
@@ -248,6 +349,128 @@ bool DrawControls() {
 // Redraws the controls if they show and changed, for a new time, play state or volume.
 void UpdateControls() {
     if (g.controlsShown && DrawControls()) g.dcomp->Commit();
+}
+
+// The panel sits right above the seek bar at the right, as tall as its longest column or the room above allows.
+// Clamps the columns' scroll positions to it.
+PanelGeometry PanelLayout() {
+    RECT client;
+    GetClientRect(g.hwnd, &client);
+    const int pad = Px(16), gap = Px(24), headerH = Px(32), rowH = Px(30);
+    const int bottom = int(ControlRect(kSeek).top) - Px(4), right = int(client.right) - Px(12);
+    const int maxRows = std::max(1, (bottom - MenuBarHeight() - Px(8) - 2 * pad - headerH) / rowH);
+    int rows = 0, width = 2 * pad - gap;
+    for (const PanelColumn& c : g.columns) {
+        if (c.rows.empty()) continue;
+        rows = std::max(rows, std::min(maxRows, int(c.rows.size())));
+        width += c.width + gap;
+    }
+    PanelGeometry p{{right - width, bottom - 2 * pad - headerH - rows * rowH, right, bottom}, {}, rowH, headerH};
+    int x = p.panel.left + pad;
+    for (int k = 0; k < 2; ++k) {
+        PanelColumn& c = g.columns[k];
+        if (c.rows.empty()) continue;
+        const int top = p.panel.top + pad + headerH;
+        p.rows[k] = {x, top, x + c.width, top + rows * rowH};
+        x += c.width + gap;
+        c.scroll = std::clamp(c.scroll, 0, std::max(0, int(c.rows.size()) - rows));
+    }
+    return p;
+}
+
+// The panel column under pt, or -1, and the row under it, or -1 past its last row.
+int PanelColumnAt(const PanelGeometry& p, POINT pt, int& row) {
+    row = -1;
+    for (int k = 0; k < 2; ++k) {
+        if (!PtInRect(&p.rows[k], pt)) continue;
+        row = (pt.y - p.rows[k].top) / p.rowH + g.columns[k].scroll;
+        if (row >= int(g.columns[k].rows.size())) row = -1;
+        return k;
+    }
+    return -1;
+}
+
+constexpr const wchar_t* kPanelTitles[] = {L"Audio", L"Subtitles"};
+
+// Fills the columns' rows and fits their widths to them.
+void FillPanel() {
+    std::vector<std::wstring>& audio = g.columns[0].rows;
+    std::vector<std::wstring>& subtitles = g.columns[1].rows;
+    audio.clear();
+    if (g.audio.size() >= 2) audio = g.audio;
+    subtitles = {L"Off"};
+    for (const SubtitleTrack& t : g.tracks) subtitles.push_back(t.label);
+    const float scale = GetDpiForWindow(g.hwnd) / 96.0f;
+    for (int k = 0; k < 2; ++k) {
+        PanelColumn& c = g.columns[k];
+        float w = TrackTextWidth(kPanelTitles[k], scale, true);
+        for (const std::wstring& row : c.rows) w = std::max(w, TrackTextWidth(row, scale, false));
+        c.width = std::clamp(int(std::ceil(w)) + Px(26 + 12), Px(140), Px(320));
+    }
+}
+
+void DrawPanel() {
+    if (!g.panelOpen) {
+        g.panel->SetContent(nullptr);
+        return;
+    }
+    const PanelGeometry p = PanelLayout();
+    const int checked[2] = {g.audioTrack, g.subtitle + 1};
+    const auto local = [&](RECT r) {
+        OffsetRect(&r, -p.panel.left, -p.panel.top);
+        return r;
+    };
+    std::vector<TrackColumn> columns;
+    for (int k = 0; k < 2; ++k) {
+        const PanelColumn& c = g.columns[k];
+        const RECT rows = p.rows[k];
+        if (c.rows.empty()) continue;
+        TrackColumn column{local({rows.left, rows.top - p.headerH, rows.right, rows.top}), kPanelTitles[k],
+                           local(rows), {}};
+        const int shown = (rows.bottom - rows.top) / p.rowH;
+        for (int i = c.scroll; i < std::min(int(c.rows.size()), c.scroll + shown); ++i) {
+            const int y = rows.top + (i - c.scroll) * p.rowH;
+            BarItem item{local({rows.left, y, rows.right, y + p.rowH}), c.rows[size_t(i)]};
+            item.hot = k == g.hotColumn && i == g.hotRow;
+            item.checked = i == checked[k];
+            column.items.push_back(std::move(item));
+        }
+        columns.push_back(std::move(column));
+    }
+    DrawTrackPanel(g.dcomp.Get(), g.panel.Get(), UINT(p.panel.right - p.panel.left),
+                   UINT(p.panel.bottom - p.panel.top), GetDpiForWindow(g.hwnd) / 96.0f, columns);
+    g.panel->SetOffsetX(float(p.panel.left));
+    g.panel->SetOffsetY(float(p.panel.top));
+}
+
+// Redraws the panel, if open, for changed tracks.
+void RefreshPanel() {
+    if (!g.panelOpen) return;
+    FillPanel();
+    DrawPanel();
+    g.dcomp->Commit();
+}
+
+void SetPanelOpen(bool open) {
+    if (open == g.panelOpen) return;
+    g.panelOpen = open;
+    g.hotColumn = g.hotRow = -1;
+    g.columns[0].scroll = g.columns[1].scroll = 0;
+    if (open) FillPanel();
+    DrawPanel();
+    g.dcomp->Commit();
+}
+
+// Highlights the panel row under pt.
+void SetPanelHot(POINT pt) {
+    int row = -1;
+    int column = g.panelOpen ? PanelColumnAt(PanelLayout(), pt, row) : -1;
+    if (column < 0 || row < 0) column = row = -1;
+    if (column == g.hotColumn && row == g.hotRow) return;
+    g.hotColumn = column;
+    g.hotRow = row;
+    DrawPanel();
+    g.dcomp->Commit();
 }
 
 void SetHot(Control c) {
@@ -310,7 +533,7 @@ void OnIdle() {
     POINT pt;
     GetCursorPos(&pt);
     ScreenToClient(g.hwnd, &pt);
-    if (!g.playing || g.drag || IsOnBar(pt)) return;
+    if (!g.playing || g.drag || g.panelOpen || IsOnBar(pt)) return;
     SetControlsShown(false);
     SetCursorHidden(true);
 }
@@ -318,8 +541,9 @@ void OnIdle() {
 void DrawSubtitles() {
     std::wstring text[2];  // bottom, top
     std::vector<StyleSpan> spans[2];
+    const Subtitles* subs = ShownSubtitles();  // not null while cues are shown
     for (const size_t i : g.shown) {
-        const Cue& cue = g.subs.cues[i];
+        const Cue& cue = subs->cues[i];
         std::wstring& t = text[cue.top];
         if (!t.empty()) t += L'\n';
         const UINT32 at = UINT32(t.size());
@@ -352,7 +576,7 @@ void UpdateSubtitles(bool redraw) {
     std::vector<size_t> active;
     double next = INFINITY;
     const double now = PlaybackTime();
-    if (g.subsOn && HasVideo()) next = ActiveCues(g.subs, now, active);
+    if (const Subtitles* subs = ShownSubtitles(); subs && HasVideo()) next = ActiveCues(*subs, now, active);
     if (redraw || active != g.shown) {
         g.shown = std::move(active);
         DrawSubtitles();
@@ -429,6 +653,10 @@ void Layout() {
     } else {
         g.videoRect = {0, top, cw, top + ah};
     }
+    if (g.panelOpen) {
+        FillPanel();  // for a new DPI
+        DrawPanel();
+    }
     UpdateSubtitles(true);
     if (!g.osdText.empty()) DrawOsd();
     g.dcomp->Commit();
@@ -482,16 +710,42 @@ void ShowVideoError(LPARAM code) {
     ShowError(message);
 }
 
+// Shows the subtitle track at index, or none (-1). Picking one of the video's own makes the engine send its cues.
+void SelectSubtitle(int index) {
+    if (index >= 0) {
+        SubtitleTrack& track = g.tracks[size_t(index)];
+        if (track.path.empty()) SelectSubtitleTrack(track.id);
+        g.lastSubtitle = index;
+    }
+    g.subtitle = index;
+    DrawPanel();
+    UpdateSubtitles(true);
+}
+
+// Adds an SRT file as a subtitle track, unless it is already one, and returns its index, or -1 if it can't be read.
+int AddSubtitleFile(const std::wstring& path) {
+    for (size_t i = 0; i < g.tracks.size(); ++i) {
+        const std::wstring& p = g.tracks[i].path;
+        if (CompareStringOrdinal(p.c_str(), int(p.size()), path.c_str(), int(path.size()), TRUE) == CSTR_EQUAL) {
+            return int(i);
+        }
+    }
+    SubtitleTrack track{SubtitleFileLabel(path), path};
+    if (!LoadSubtitles(path, track.subs)) return -1;
+    g.tracks.push_back(std::move(track));
+    UpdateControls();
+    RefreshPanel();
+    return int(g.tracks.size() - 1);
+}
+
 void LoadSubtitleFile(const std::wstring& path) {
-    if (!LoadSubtitles(path, g.subs)) {
+    const int index = AddSubtitleFile(path);
+    if (index < 0) {
         ShowError(L"Can't open the subtitles \"" + FileName(path) + L"\".\n\nIt isn't a readable SRT file.");
         return;
     }
-    g.embeddedSubs = false;  // the file replaces them
-    g.subsOn = true;
-    UpdateSubtitles(true);
-    UpdateControls();
-    if (IsWindowVisible(g.hwnd)) ShowOsd(L"Subtitles: " + FileName(path));
+    SelectSubtitle(index);
+    if (IsWindowVisible(g.hwnd)) ShowOsd(L"Subtitles: " + g.tracks[size_t(index)].label);
 }
 
 bool OpenVideoFile(const std::wstring& path) {
@@ -502,11 +756,14 @@ bool OpenVideoFile(const std::wstring& path) {
         ShowError(L"Can't open \"" + FileName(path) + L"\"." + (missing ? L"\n\nThe file doesn't exist." : L""));
         return false;
     }
-    // Seeks and subtitles belong to the video they were for.
+    // Seeks and tracks belong to the video they were for.
     g.duration = NAN;
     g.seekBusy = g.seekQueued = g.seekCheck = false;
-    g.subs = {};
-    g.embeddedSubs = false;
+    SetPanelOpen(false);
+    g.tracks.clear();
+    g.subtitle = g.lastSubtitle = g.audioTrack = -1;
+    g.ownTrackSelected = false;
+    g.audio.clear();
     // Drop any cues of the previous video still queued.
     for (MSG msg; PeekMessageW(&msg, g.hwnd, WM_APP_SUBTITLE_CUE, WM_APP_SUBTITLE_CUE, PM_REMOVE);) {
         delete reinterpret_cast<Cue*>(msg.lParam);
@@ -539,19 +796,50 @@ void AddSubtitles() {
     if (!path.empty()) LoadSubtitleFile(path);
 }
 
-// The video has subtitles of its own, unless a file was added. They start off, as they are often in another
-// language or for the hard of hearing.
+// The video has subtitle tracks of its own, listed before the files. They start off, as they are often in another
+// language or for the hard of hearing, but the first one is selected in the engine so S can show its cues.
 void OnSubtitleTrack() {
-    if (HasSubtitles() || !SelectSubtitleTrack()) return;
-    g.embeddedSubs = true;
-    g.subsOn = false;
+    size_t own = size_t(std::count_if(g.tracks.begin(), g.tracks.end(),
+                                      [](const SubtitleTrack& t) { return t.path.empty(); }));
+    const size_t before = own;
+    for (const Track& t : SubtitleTracks()) {
+        if (std::any_of(g.tracks.begin(), g.tracks.begin() + ptrdiff_t(own),
+                        [&](const SubtitleTrack& s) { return s.id == t.id; })) {
+            continue;
+        }
+        g.tracks.insert(g.tracks.begin() + ptrdiff_t(own), SubtitleTrack{TrackLabel(t, own), L"", t.id});
+        if (g.subtitle >= int(own)) ++g.subtitle;
+        if (g.lastSubtitle >= int(own)) ++g.lastSubtitle;
+        ++own;
+    }
+    if (own == before) return;
+    if (!g.ownTrackSelected) {
+        g.ownTrackSelected = SelectSubtitleTrack(g.tracks[0].id);
+        if (g.subtitle < 0) ShowOsd(L"Subtitles available (S)");
+    }
     UpdateControls();
-    ShowOsd(L"Subtitles available (S)");
+    RefreshPanel();
 }
 
-void OnSubtitleCue(LPARAM cue) {
+void OnSubtitleCue(WPARAM track, LPARAM cue) {
     const std::unique_ptr<Cue> owned(reinterpret_cast<Cue*>(cue));
-    if (g.embeddedSubs && AddCue(g.subs, std::move(*owned))) UpdateSubtitles(true);
+    const auto it = std::find_if(g.tracks.begin(), g.tracks.end(),
+                                 [&](const SubtitleTrack& t) { return t.path.empty() && t.id == DWORD(track); });
+    if (it != g.tracks.end() && AddCue(it->subs, std::move(*owned)) && it - g.tracks.begin() == g.subtitle) {
+        UpdateSubtitles(true);
+    }
+}
+
+// Plays the audio track or shows the subtitle track (0 for off) in the panel's column and row.
+void PickTrack(int column, int row) {
+    if (column == 0 && row != g.audioTrack) {
+        SelectAudioTrack(size_t(row));
+        g.audioTrack = row;
+        DrawPanel();
+        g.dcomp->Commit();
+    } else if (column == 1 && row - 1 != g.subtitle) {
+        SelectSubtitle(row - 1);
+    }
 }
 
 // Shows the menu of a menu bar button, kFile or kSubs.
@@ -639,9 +927,8 @@ void ToggleMuted() {
 
 void ToggleSubtitles() {
     if (!HasSubtitles()) return;
-    g.subsOn = !g.subsOn;
-    UpdateSubtitles(false);
-    ShowOsd(g.subsOn ? L"Subtitles on" : L"Subtitles off");
+    SelectSubtitle(g.subtitle >= 0 ? -1 : std::max(g.lastSubtitle, 0));
+    ShowOsd(g.subtitle >= 0 ? L"Subtitles: " + g.tracks[size_t(g.subtitle)].label : L"Subtitles off");
 }
 
 // Seeks to the time under x on the seek bar.
@@ -696,7 +983,7 @@ void Press(Control c) {
         if (c == kPlay) {
             TogglePlay();
         } else if (c == kSubtitles) {
-            ToggleSubtitles();
+            if (HasTrackChoice()) SetPanelOpen(!g.panelOpen);
         } else {
             Seek(c == kBack ? -kSeekStep : kSeekStep);
         }
@@ -708,6 +995,12 @@ void OnMediaEvent(WPARAM event, LPARAM param) {
         case MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA:
             g.attached = false;  // a new source may bring a new swap chain
             g.duration = Duration();
+            g.audio.clear();
+            g.audioTrack = -1;
+            for (const Track& t : AudioTracks()) {
+                if (t.selected && g.audioTrack < 0) g.audioTrack = int(g.audio.size());
+                g.audio.push_back(TrackLabel(t, g.audio.size()));
+            }
             if (!g.sized && HasVideo()) {
                 PlaceWindow();
                 g.sized = true;
@@ -798,7 +1091,9 @@ void OnKey(WPARAM key, bool repeat) {
             break;
         case VK_ESCAPE:
             if (repeat) break;
-            if (g.fullscreen) {
+            if (g.panelOpen) {
+                SetPanelOpen(false);
+            } else if (g.fullscreen) {
                 ToggleFullscreen();
             } else {
                 DestroyWindow(g.hwnd);
@@ -830,7 +1125,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             OnSubtitleTrack();
             return 0;
         case WM_APP_SUBTITLE_CUE:
-            OnSubtitleCue(lp);
+            OnSubtitleCue(wp, lp);
             return 0;
         case WM_PAINT:  // everything is drawn by DirectComposition
             ValidateRect(hwnd, nullptr);
@@ -876,6 +1171,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_LBUTTONDBLCLK: {
             const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             const Control c = HitTest(pt);
+            if (g.panelOpen) {  // a click off the panel closes it, and does nothing else on the video
+                const PanelGeometry p = PanelLayout();
+                int row;
+                if (const int column = PanelColumnAt(p, pt, row); column >= 0 && row >= 0) PickTrack(column, row);
+                if (PtInRect(&p.panel, pt)) return 0;
+                if (c != kSubtitles) {
+                    SetPanelOpen(false);
+                    if (!IsOnBar(pt)) return 0;
+                }
+            }
             if (c == kSeek && HasVideo()) {
                 g.drag = kSeek;
                 SetCapture(hwnd);
@@ -921,13 +1226,29 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SetVolumeToX(GET_X_LPARAM(lp));
             } else {
                 SetHot(HitTest({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}));
+                SetPanelHot({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
             }
             return 0;
         case WM_MOUSELEAVE:
             g.tracking = false;
             SetHot(kNone);
-            if (g.playing && !g.drag) SetControlsShown(false);
+            SetPanelHot({-1, -1});
+            if (g.playing && !g.drag && !g.panelOpen) SetControlsShown(false);
             return 0;
+        case WM_MOUSEWHEEL: {  // scrolls the panel column under the mouse
+            POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            ScreenToClient(hwnd, &pt);
+            int row;
+            const int column = g.panelOpen ? PanelColumnAt(PanelLayout(), pt, row) : -1;
+            if (column < 0) return 0;
+            g.wheel += GET_WHEEL_DELTA_WPARAM(wp);
+            const int steps = g.wheel / WHEEL_DELTA;
+            g.wheel -= steps * WHEEL_DELTA;
+            g.columns[column].scroll -= steps;
+            g.hotColumn = -1;  // makes SetPanelHot redraw at the new scroll position
+            SetPanelHot(pt);
+            return 0;
+        }
         case WM_SETCURSOR:
             if (g.cursorHidden && LOWORD(lp) == HTCLIENT) {
                 SetCursor(nullptr);
@@ -968,7 +1289,8 @@ bool InitComposition() {
     if (SUCCEEDED(hr)) hr = g.dcomp->CreateVisual(&g.root);
     for (IDCompositionVisual** v : {g.background.GetAddressOf(), g.video.GetAddressOf(),
                                     g.subtitleBottom.GetAddressOf(), g.subtitleTop.GetAddressOf(),
-                                    g.osd.GetAddressOf(), g.controls.GetAddressOf(), g.menuBar.GetAddressOf()}) {
+                                    g.osd.GetAddressOf(), g.controls.GetAddressOf(), g.panel.GetAddressOf(),
+                                    g.menuBar.GetAddressOf()}) {
         if (SUCCEEDED(hr)) hr = g.dcomp->CreateVisual(v);
         if (SUCCEEDED(hr)) hr = g.root->AddVisual(*v, FALSE, nullptr);  // in front of the previous ones
     }
