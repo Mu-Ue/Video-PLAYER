@@ -33,6 +33,8 @@ enum Control {
 };
 constexpr UINT kShowFallbackMs = 1000;  // show the window even if the video's size isn't known by then
 constexpr float kFadeSeconds = 0.2f;    // of the controls
+// The icon popped up in the middle: in by kFlashIn, out from kFlashOut to kFlashEnd, in seconds.
+constexpr float kFlashIn = 0.15f, kFlashOut = 0.55f, kFlashEnd = 0.8f;
 
 // A subtitle track: one of the video's own, whose cues are added as they show, or an SRT file.
 struct SubtitleTrack {
@@ -59,15 +61,17 @@ struct PanelGeometry {
 struct Window {
     HWND hwnd = nullptr;
     int showCmd = SW_SHOWNORMAL;
-    // Bottom to top: black background, video, subtitles at the bottom and top, seek / volume feedback, the
-    // controls over the bottom of the video, the track panel above them, and the menu bar, which the video
-    // doesn't overlap.
+    // Bottom to top: black background, video, subtitles at the bottom and top, seek / volume feedback, the icon
+    // popped up in the middle, the controls over the bottom of the video, the track panel above them, and the menu
+    // bar, which the video doesn't overlap.
     ComPtr<ID3D11Device> device;  // for composition and the overlay
     ComPtr<IDCompositionDevice> dcomp;
     ComPtr<IDCompositionTarget> target;
-    ComPtr<IDCompositionVisual> root, background, video, subtitleBottom, subtitleTop, osd, controls, panel,
+    ComPtr<IDCompositionVisual> root, background, video, subtitleBottom, subtitleTop, osd, flash, controls, panel,
         menuBar;
-    ComPtr<IDCompositionEffectGroup> controlsFade;
+    ComPtr<IDCompositionEffectGroup> controlsFade, flashFade, osdFade;
+    ComPtr<IDCompositionScaleTransform> flashScale;  // about the icon's center, then
+    ComPtr<IDCompositionTranslateTransform> flashMove;  // to the middle of the video
     ComPtr<IDXGISwapChain1> black;  // 8 x 8, stretched over the window
     bool attached = false;          // the engine's swap chain is the content of `video`
     SIZE videoSize{};               // swap chain size: the video fitted to the monitor
@@ -87,6 +91,7 @@ struct Window {
     std::vector<size_t> shown;  // indices of the cues on screen
     float subtitleHeight = 0;   // of the bottom ones
     std::wstring osdText;
+    bool osdCentered = false;  // at the top center rather than the top left
     Control hot = kNone;    // under the mouse
     Control menuOpen = kNone;  // kFile or kSubs while its menu is showing
     std::wstring title;     // the video's file name
@@ -101,6 +106,7 @@ struct Window {
     double duration = NAN;
     double volume = 1;
     bool muted = false;
+    double restoreVolume = 1;  // what unmuting from 0% goes back to: the volume before it was turned down
     // One seek at a time is in flight; the latest one asked for meanwhile waits for it to finish.
     bool seekBusy = false, seekQueued = false, seekFast = false;
     double seekTarget = 0;  // of the latest seek
@@ -290,8 +296,8 @@ void DrawMenuBar() {
 
 const wchar_t* VolumeGlyph() {
     const double volume = g.volume;
-    if (g.muted) return L"\xE74F";
-    return volume == 0 ? L"\xE992" : volume < 1.0 / 3 ? L"\xE993" : volume < 2.0 / 3 ? L"\xE994" : L"\xE995";
+    if (g.muted || volume == 0) return L"\xE74F";
+    return volume < 1.0 / 3 ? L"\xE993" : volume < 2.0 / 3 ? L"\xE994" : L"\xE995";
 }
 
 // Where the video is, or will be once the seeks in flight are done.
@@ -602,14 +608,18 @@ void DrawOsd() {
     const float fontSize =
         std::max(12.0f, (HasVideo() ? TextScale() : float(g.videoRect.bottom - g.videoRect.top)) * 0.035f);
     const float margin = std::round(fontSize * 0.8f);
-    DrawOutlinedText(g.dcomp.Get(), g.osd.Get(), g.osdText, {}, fontSize, float(g.videoRect.right), false);
-    g.osd->SetOffsetX(margin);
+    const RECT& v = g.videoRect;
+    const SIZE s =
+        DrawOutlinedText(g.dcomp.Get(), g.osd.Get(), g.osdText, {}, fontSize, float(g.videoRect.right), false);
+    g.osd->SetOffsetX(g.osdCentered ? std::round((v.left + v.right - s.cx) / 2.0f) : margin);
     g.osd->SetOffsetY(float(MenuBarHeight()) + margin);
 }
 
 // Shows text in the top left for a moment.
 void ShowOsd(std::wstring text) {
     g.osdText = std::move(text);
+    g.osdCentered = false;
+    g.osdFade->SetOpacity(1.0f);
     DrawOsd();
     g.dcomp->Commit();
     SetTimer(g.hwnd, kOsdTimer, kOsdMs, nullptr);
@@ -620,6 +630,51 @@ void HideOsd() {
     if (g.osdText.empty()) return;
     g.osdText.clear();
     g.osd->SetContent(nullptr);
+    g.dcomp->Commit();
+}
+
+// Pops an icon up in the middle of the video for a moment, like YouTube's and Netflix's: it grows as it fades in,
+// then shrinks a little as it fades out. held (a key held down) shows it at once, so repeats don't pulse it. A
+// caption shows at the top center, fading with the icon.
+void ShowFlash(const wchar_t* glyph, bool slash = false, bool held = false, std::wstring caption = {}) {
+    const RECT& v = g.videoRect;
+    const float in = held ? 0 : kFlashIn, out = kFlashOut - kFlashIn + in, end = kFlashEnd - kFlashIn + in;
+    if (!caption.empty()) {
+        g.osdText = std::move(caption);
+        g.osdCentered = true;
+        DrawOsd();
+        SetTimer(g.hwnd, kOsdTimer, UINT(end * 1000), nullptr);  // clears it once faded out
+    } else if (g.osdCentered) {
+        HideOsd();  // another one's caption
+    }
+    const float size = std::round(std::max(float(Px(56)), TextScale() * 0.1f));
+    DrawFlash(g.dcomp.Get(), g.flash.Get(), UINT(size), glyph, slash);
+    g.flashScale->SetCenterX(size / 2);
+    g.flashScale->SetCenterY(size / 2);
+    g.flashMove->SetOffsetX(std::round((v.left + v.right - size) / 2));
+    g.flashMove->SetOffsetY(std::round((v.top + v.bottom - size) / 2));
+    ComPtr<IDCompositionAnimation> fade, zoom;
+    if (SUCCEEDED(g.dcomp->CreateAnimation(&fade)) && SUCCEEDED(g.dcomp->CreateAnimation(&zoom))) {
+        constexpr float from = 0.7f, to = 0.85f;
+        if (!held) {
+            fade->AddCubic(0, 0, 1 / in, 0, 0);
+            // Easing out as it grows.
+            zoom->AddCubic(0, from, 2 * (1 - from) / in, -(1 - from) / (in * in), 0);
+        }
+        fade->AddCubic(in, 1, 0, 0, 0);
+        fade->AddCubic(out, 1, -1 / (end - out), 0, 0);
+        fade->End(end, 0);
+        zoom->AddCubic(in, 1, 0, 0, 0);
+        zoom->AddCubic(out, 1, -(1 - to) / (end - out), 0, 0);
+        zoom->End(end, to);
+        g.flashFade->SetOpacity(fade.Get());
+        if (g.osdCentered) g.osdFade->SetOpacity(fade.Get());
+        g.flashScale->SetScaleX(zoom.Get());
+        g.flashScale->SetScaleY(zoom.Get());
+    } else {
+        g.flashFade->SetOpacity(0.0f);
+        g.osdFade->SetOpacity(1.0f);
+    }
     g.dcomp->Commit();
 }
 
@@ -949,17 +1004,26 @@ void TogglePlay() {
     SetPlaying(g.playing);
     UpdateSubtitles(false);
     UpdateControls();
+    ShowFlash(g.playing ? L"\xF5B0" : L"\xE769");
 }
 
-void ToggleMuted() {
-    g.muted = ToggleMute();
-    ShowOsd(g.muted ? L"Muted" : L"Unmuted");
+// Mutes or unmutes, popping up the new volume icon if flash. At 0% it already counts as muted, so it unmutes to
+// the volume before that, at least a little.
+void ToggleMuted(bool flash) {
+    if (g.volume == 0) {
+        g.volume = SetVolume(std::max(g.restoreVolume, kVolumeStep));
+        g.muted = false;
+    } else {
+        g.muted = ToggleMute();
+    }
+    UpdateControls();
+    if (flash) ShowFlash(VolumeGlyph());
 }
 
 void ToggleSubtitles() {
     if (!HasSubtitles()) return;
     SelectSubtitle(g.subtitle >= 0 ? -1 : std::max(g.lastSubtitle, 0));
-    ShowOsd(g.subtitle >= 0 ? L"Subtitles: " + g.tracks[size_t(g.subtitle)].label : L"Subtitles off");
+    ShowFlash(L"\xE7F0", g.subtitle < 0);
 }
 
 // Seeks to the time under x on the seek bar.
@@ -1007,7 +1071,7 @@ void Press(Control c) {
     if (IsMenuButton(c)) {
         ShowMenu(c);
     } else if (c == kVolume) {
-        ToggleMuted();
+        ToggleMuted(false);  // the button and slider already show it
     } else if (c == kFullscreen) {
         ToggleFullscreen();
     } else if (c != kNone && c != kSeek && HasVideo()) {
@@ -1107,12 +1171,15 @@ void OnKey(WPARAM key, bool repeat) {
             break;
         case VK_UP:
         case VK_DOWN: {
-            const double volume = g.volume = ChangeVolume(key == VK_UP ? kVolumeStep : -kVolumeStep);
-            ShowOsd(L"Volume " + std::to_wstring(std::lround(volume * 100)) + L"%");
+            if (g.volume > 0) g.restoreVolume = g.volume;
+            g.volume = ChangeVolume(key == VK_UP ? kVolumeStep : -kVolumeStep);
+            g.muted = IsMuted();  // turning it up unmutes
+            UpdateControls();
+            ShowFlash(VolumeGlyph(), false, repeat, std::to_wstring(std::lround(g.volume * 100)) + L"%");
             break;
         }
         case 'M':
-            if (!repeat) ToggleMuted();
+            if (!repeat) ToggleMuted(true);
             break;
         case 'S':
             if (!repeat) ToggleSubtitles();
@@ -1219,12 +1286,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (c == kVolumeBar) {
                 g.drag = kVolumeBar;
                 SetCapture(hwnd);
+                if (g.volume > 0) g.restoreVolume = g.volume;
                 SetVolumeToX(pt.x);
             } else if (IsOnBar(pt)) {  // a double click there is just a second click
                 Press(c);
             } else if (msg == WM_LBUTTONDBLCLK &&
                        static_cast<DWORD>(GetMessageTime() - g.lastClick) <= kDoubleClickMs) {
                 if (HasVideo()) TogglePlay();  // the first click toggled playback; undo that
+                g.flashFade->SetOpacity(0.0f);  // and don't show it
                 ToggleFullscreen();
             } else {  // also a double click slower than ours but within the system's
                 g.lastClick = GetMessageTime();
@@ -1320,14 +1389,27 @@ bool InitComposition() {
     if (SUCCEEDED(hr)) hr = g.dcomp->CreateVisual(&g.root);
     for (IDCompositionVisual** v : {g.background.GetAddressOf(), g.video.GetAddressOf(),
                                     g.subtitleBottom.GetAddressOf(), g.subtitleTop.GetAddressOf(),
-                                    g.osd.GetAddressOf(), g.controls.GetAddressOf(), g.panel.GetAddressOf(),
-                                    g.menuBar.GetAddressOf()}) {
+                                    g.osd.GetAddressOf(), g.flash.GetAddressOf(), g.controls.GetAddressOf(),
+                                    g.panel.GetAddressOf(), g.menuBar.GetAddressOf()}) {
         if (SUCCEEDED(hr)) hr = g.dcomp->CreateVisual(v);
         if (SUCCEEDED(hr)) hr = g.root->AddVisual(*v, FALSE, nullptr);  // in front of the previous ones
     }
-    if (SUCCEEDED(hr)) hr = g.dcomp->CreateEffectGroup(&g.controlsFade);
-    if (SUCCEEDED(hr)) hr = g.controlsFade->SetOpacity(0.0f);
+    for (IDCompositionEffectGroup** e : {g.controlsFade.GetAddressOf(), g.flashFade.GetAddressOf()}) {
+        if (SUCCEEDED(hr)) hr = g.dcomp->CreateEffectGroup(e);
+        if (SUCCEEDED(hr)) hr = (*e)->SetOpacity(0.0f);
+    }
     if (SUCCEEDED(hr)) hr = g.controls->SetEffect(g.controlsFade.Get());
+    if (SUCCEEDED(hr)) hr = g.flash->SetEffect(g.flashFade.Get());
+    if (SUCCEEDED(hr)) hr = g.dcomp->CreateEffectGroup(&g.osdFade);
+    if (SUCCEEDED(hr)) hr = g.osd->SetEffect(g.osdFade.Get());
+    if (SUCCEEDED(hr)) hr = g.dcomp->CreateScaleTransform(&g.flashScale);
+    if (SUCCEEDED(hr)) hr = g.dcomp->CreateTranslateTransform(&g.flashMove);
+    if (SUCCEEDED(hr)) {
+        ComPtr<IDCompositionTransform> transform;
+        IDCompositionTransform* steps[] = {g.flashScale.Get(), g.flashMove.Get()};
+        hr = g.dcomp->CreateTransformGroup(steps, UINT(std::size(steps)), &transform);
+        if (SUCCEEDED(hr)) hr = g.flash->SetTransform(transform.Get());
+    }
     if (SUCCEEDED(hr)) hr = g.target->SetRoot(g.root.Get());
 
     if (SUCCEEDED(hr)) hr = dxgi->GetAdapter(&adapter);

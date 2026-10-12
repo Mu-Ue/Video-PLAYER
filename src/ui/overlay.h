@@ -54,6 +54,10 @@ struct Controls {
 void DrawControls(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT width, UINT height, float scale,
                   const Controls& controls);
 
+// Draws an icon glyph in white on a translucent black circle filling the visual's size x size surface, with a
+// slash through it if asked, and sets it as the visual's content.
+void DrawFlash(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT size, std::wstring_view glyph, bool slash);
+
 // A column of the track panel: a header over rows, which are clipped to the rows rect. In pixels from the panel's
 // top left.
 struct TrackColumn {

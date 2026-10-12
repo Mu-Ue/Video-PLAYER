@@ -450,6 +450,30 @@ void DrawControls(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT 
     });
 }
 
+void DrawFlash(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT size, std::wstring_view glyph,
+               bool slash) {
+    const float s = float(size);
+    const ComPtr<IDWriteTextFormat> icon =
+        size && Init() ? CreateFormat(IconFont(), s * 0.42f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER)
+                       : nullptr;
+    if (!icon) {
+        visual->SetContent(nullptr);
+        return;
+    }
+    Paint(dcomp, visual, size, size, [&](ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F&) {
+        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+        dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        g.brush->SetColor(D2D1::ColorF(0, 0, 0, 0.5f));
+        dc->FillEllipse(D2D1::Ellipse({s / 2, s / 2}, s / 2, s / 2), g.brush.Get());
+        g.brush->SetColor(D2D1::ColorF(0xffffff));
+        dc->DrawText(glyph.data(), UINT32(glyph.size()), icon.Get(), D2D1::RectF(0, 0, s, s), g.brush.Get());
+        if (slash) {
+            const float a = s * 0.3f, b = s - a;
+            dc->DrawLine({a, a}, {b, b}, g.brush.Get(), s * 0.035f, g.round.Get());
+        }
+    });
+}
+
 void DrawTrackPanel(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT width, UINT height, float scale,
                     const std::vector<TrackColumn>& columns) {
     if (width == 0 || height == 0 || !Init() || !SetScale(scale)) {
