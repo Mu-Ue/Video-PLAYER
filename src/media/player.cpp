@@ -5,7 +5,6 @@
 #include <audiosessiontypes.h>
 #include <avrt.h>
 #include <d3d11.h>
-#include <dwmapi.h>
 #include <dxgi1_2.h>
 #include <mfapi.h>
 #include <mfidl.h>
@@ -121,7 +120,6 @@ struct {
     SRWLOCK previewLock = SRWLOCK_INIT;
     std::wstring previewPath;
     LONGLONG previewWanted = -1;  // the key frame to show, in 100 ns units, or -1
-    LONGLONG previewWantedAt = 0;  // the QPC time it was set, when the mouse entered its span
     double previewBucket = -1;    // the window's last span of kPreviewSpan seconds
     LONGLONG previewAsked = -1;   // and its key frame, as last put in previewWanted
     // A second parser of the open file, which knows where its key frames are; null if the format doesn't say.
@@ -359,8 +357,6 @@ double NearestKeyFrame(IMFSeekInfo* keyFrames, double seconds) {
 
 constexpr DWORD kVideoStream = DWORD(MF_SOURCE_READER_FIRST_VIDEO_STREAM);
 constexpr double kPreviewSpan = 10;  // seconds of video each preview picture stands for
-constexpr DWORD kPreviewRestMs = 100;  // between preview decode starts, so at most 10 a second
-constexpr DWORD kPreviewDwellMs = 50;  // once the mouse is in a span this long, it rests there: decode it at once
 
 // A reader of the file's video alone, which decodes on the GPU and hands out each frame shrunk there to w x h, its
 // display size fitted to 320 px, about the largest the preview shows; null if it can't.
@@ -445,55 +441,19 @@ void PresentKeyFrame(IMFSample* sample) {
     ReleaseSRWLockExclusive(&g.lock);
 }
 
-LONGLONG Qpc() {
-    LARGE_INTEGER t;
-    QueryPerformanceCounter(&t);
-    return t.QuadPart;
-}
-
-// The QPC time the next preview decode may start, a beat after one that started at `start`: the vertical blank a
-// whole number of refreshes near kPreviewRestMs on, so pictures land evenly on screen. Just kPreviewRestMs on if the
-// refresh timing is unknown.
-LONGLONG NextBeat(LONGLONG start, LONGLONG frequency) {
-    const LONGLONG rest = frequency * kPreviewRestMs / 1000;
-    DWM_TIMING_INFO info{};
-    info.cbSize = sizeof(info);
-    if (FAILED(DwmGetCompositionTimingInfo(nullptr, &info)) || info.qpcRefreshPeriod <= 0) return start + rest;
-    const LONGLONG period = LONGLONG(info.qpcRefreshPeriod), blank = LONGLONG(info.qpcVBlank);
-    const LONGLONG d = start + std::max(1LL, (rest + period / 2) / period) * period - blank;
-    return blank + (d >= 0 ? (d + period / 2) / period : -((period / 2 - d) / period)) * period;  // the nearest
-}
-
-// Waits for the player to stop, the window to ask for something new, or the QPC time `until` (-1 for none). Returns
-// WAIT_OBJECT_0 plus 0, 1 or 2 for each.
-DWORD WaitPreview(HANDLE timer, LONGLONG until, LONGLONG frequency) {
-    const HANDLE events[] = {g.stop, g.previewWake, timer};
-    if (until < 0) return WaitForMultipleObjects(2, events, FALSE, INFINITE);
-    LARGE_INTEGER due;
-    due.QuadPart = -std::max(1LL, (until - Qpc()) * 10'000'000 / frequency);  // relative, in 100 ns units
-    if (!SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) return WAIT_OBJECT_0 + 2;
-    return WaitForMultipleObjects(3, events, FALSE, INFINITE);
-}
-
 // Opens the files and shows the key frames the window wants, one at a time, always the latest. Nothing queues: each
-// wake reads what is wanted now. Decodes start on a beat of about kPreviewRestMs, so a sweep skips key frames instead
-// of decoding every one, or as soon as the mouse has rested kPreviewDwellMs in a span. A picture the mouse moved on
-// from while it decoded is still shown, as the nearest there is, so a fast sweep updates as often as a slow one.
+// wake reads what is wanted now, and it decodes back to back while that changes. The window asks at most once per
+// frame shown. A picture the mouse moved on from while it decoded is still shown, as the nearest there is, so a fast
+// sweep updates as often as a slow one.
 void PreviewLoop() {
     const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
-    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    if (!timer) timer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);  // before Windows 10 1803
-    LARGE_INTEGER frequency;
-    QueryPerformanceFrequency(&frequency);
-    const LONGLONG f = frequency.QuadPart, dwell = f * kPreviewDwellMs / 1000;
     ComPtr<IMFSourceReader> reader;
     LONGLONG shown = -1;  // the key frame on screen, in 100 ns units
-    LONGLONG beat = 0;    // the QPC time the next decode may start
-    bool stopping = !timer;
-    while (!stopping) {
+    const HANDLE events[] = {g.stop, g.previewWake};
+    for (;;) {
         AcquireSRWLockExclusive(&g.previewLock);
         const std::wstring path = std::exchange(g.previewPath, {});
-        const LONGLONG time = g.previewWanted, at = g.previewWantedAt;
+        const LONGLONG time = g.previewWanted;
         ReleaseSRWLockExclusive(&g.previewLock);
         if (!path.empty()) {
             UINT w = 0, h = 0;
@@ -510,15 +470,9 @@ void PreviewLoop() {
             ReleaseSRWLockExclusive(&g.lock);
         }
         if (!reader || time < 0 || time == shown) {
-            stopping = WaitPreview(timer, -1, f) == WAIT_OBJECT_0;
+            if (WaitForMultipleObjects(2, events, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) break;
             continue;
         }
-        if (const LONGLONG due = std::min(beat, at + dwell); due > Qpc()) {
-            stopping = WaitPreview(timer, due, f) == WAIT_OBJECT_0;
-            continue;  // and take what is wanted by then
-        }
-        const LONGLONG start = Qpc();
-        beat = NextBeat(start, f);
         const ComPtr<IMFSample> sample = ReadKeyFrame(reader.Get(), time);
         AcquireSRWLockShared(&g.previewLock);
         const bool reopened = !g.previewPath.empty();
@@ -529,7 +483,6 @@ void PreviewLoop() {
         }
     }
     reader.Reset();
-    if (timer) CloseHandle(timer);
     if (com) CoUninitialize();
 }
 
@@ -600,7 +553,6 @@ void SeekPreview(double seconds) {
     g.previewAsked = time;
     AcquireSRWLockExclusive(&g.previewLock);
     g.previewWanted = time;
-    g.previewWantedAt = Qpc();
     ReleaseSRWLockExclusive(&g.previewLock);
     SetEvent(g.previewWake);
 }
