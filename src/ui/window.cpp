@@ -175,15 +175,15 @@ std::wstring LanguageName(std::wstring code) {
                : L"";
 }
 
-// "English", "English – Commentary", "Commentary" or "Track 2".
-std::wstring TrackLabel(const Track& track, size_t index) {
+// "English", "English – Commentary", "Commentary" or "Unknown".
+std::wstring TrackLabel(const Track& track) {
     std::wstring label = LanguageName(track.language);
     const std::wstring& name = track.name;
     if (!name.empty() && CompareStringOrdinal(name.c_str(), int(name.size()), label.c_str(), int(label.size()),
                                               TRUE) != CSTR_EQUAL) {
         label = label.empty() ? name : label + L" \x2013 " + name;
     }
-    return label.empty() ? L"Track " + std::to_wstring(index + 1) : label;
+    return label.empty() ? L"Unknown" : label;
 }
 
 // The language of "Movie.en.srt", else the file name without its extension.
@@ -828,7 +828,7 @@ void OnSubtitleTrack() {
                         [&](const SubtitleTrack& s) { return s.id == t.id; })) {
             continue;
         }
-        g.tracks.insert(g.tracks.begin() + ptrdiff_t(own), SubtitleTrack{TrackLabel(t, own), L"", t.id});
+        g.tracks.insert(g.tracks.begin() + ptrdiff_t(own), SubtitleTrack{TrackLabel(t), L"", t.id});
         if (g.subtitle >= int(own)) ++g.subtitle;
         if (g.lastSubtitle >= int(own)) ++g.lastSubtitle;
         ++own;
@@ -1020,7 +1020,7 @@ void OnMediaEvent(WPARAM event, LPARAM param) {
             g.audioTrack = -1;
             for (const Track& t : AudioTracks()) {
                 if (t.selected && g.audioTrack < 0) g.audioTrack = int(g.audio.size());
-                g.audio.push_back(TrackLabel(t, g.audio.size()));
+                g.audio.push_back(TrackLabel(t));
             }
             if (!g.sized && HasVideo()) {
                 PlaceWindow();
