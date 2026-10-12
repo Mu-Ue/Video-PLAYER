@@ -735,7 +735,7 @@ bool UpdatePreview(POINT pt) {
     if (x != g.previewX) {
         g.previewX = x;
         const double seconds = double(x - left) / std::max(1, right - left) * g.duration;
-        SeekPreview(seconds);
+        SeekPreview(seconds, g.duration);
         if (std::wstring text = FormatTime(seconds); text != g.previewText) {
             g.previewText = std::move(text);
             g.previewTextSize =

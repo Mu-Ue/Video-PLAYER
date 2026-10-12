@@ -356,7 +356,8 @@ double NearestKeyFrame(IMFSeekInfo* keyFrames, double seconds) {
 }
 
 constexpr DWORD kVideoStream = DWORD(MF_SOURCE_READER_FIRST_VIDEO_STREAM);
-constexpr double kPreviewSpan = 10;  // seconds of video each preview picture stands for
+constexpr double kPreviewCount = 200;   // preview pictures across the whole seek bar
+constexpr double kMinPreviewSpan = 1;  // seconds of video each preview picture stands for, at least
 
 // A reader of the file's video alone, which decodes on the GPU and hands out each frame shrunk there to w x h, its
 // display size fitted to 320 px, about the largest the preview shows; null if it can't.
@@ -542,13 +543,15 @@ HRESULT OpenVideo(const std::wstring& path) {
     return hr;
 }
 
-void SeekPreview(double seconds) {
-    // One picture for each 10 seconds, like Netflix: moves within them decode nothing new.
-    const double bucket = std::floor(seconds / kPreviewSpan);
+void SeekPreview(double seconds, double duration) {
+    // A span grows with the video, so a sweep of the bar shows as many pictures however long it is; moves within
+    // one decode nothing new.
+    const double span = std::max(kMinPreviewSpan, duration / kPreviewCount);
+    const double bucket = std::floor(seconds / span);
     if (bucket == g.previewBucket) return;
     g.previewBucket = bucket;
     // The key frame nearest the span's middle, which needs no decoding up to it. Spans can share one.
-    const LONGLONG time = std::llround(NearestKeyFrame(g.keyFrames.Get(), (bucket + 0.5) * kPreviewSpan) * 1e7);
+    const LONGLONG time = std::llround(NearestKeyFrame(g.keyFrames.Get(), (bucket + 0.5) * span) * 1e7);
     if (time == g.previewAsked) return;
     g.previewAsked = time;
     AcquireSRWLockExclusive(&g.previewLock);

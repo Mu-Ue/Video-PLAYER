@@ -50,10 +50,10 @@ void SetVideoSize(int width, int height);
 // The swap chain, as content for a DirectComposition visual, or null before SetVideoSize.
 IUnknown* VideoSwapChain();
 
-// Shows one picture for each 10 seconds of the video, like Netflix: on entering a new span, a thread of its own
+// Shows one picture for each 1/200 of the video (1 second at least): on entering a new span, a thread of its own
 // decodes the key frame nearest its middle, alone and shrunk, into the preview's swap chain. If it is still busy,
 // only the latest is decoded next. The window asks at most once per frame shown.
-void SeekPreview(double seconds);
+void SeekPreview(double seconds, double duration);
 // The preview's swap chain, as content for a DirectComposition visual, and its size; null and 0 x 0 until the
 // video has loaded.
 IUnknown* PreviewSwapChain();
