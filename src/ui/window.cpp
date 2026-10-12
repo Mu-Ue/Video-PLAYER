@@ -117,6 +117,8 @@ struct Window {
     double volume = 1;
     bool muted = false;
     double restoreVolume = 1;  // what unmuting from 0% goes back to: the volume before it was turned down
+    int wheel = 0;             // wheel delta short of a volume step, from touchpads and free-spinning wheels
+    LONG lastWheelStep = 0;    // message time of the last volume step by the wheel
     // One seek at a time is in flight; the latest one asked for meanwhile waits for it to finish.
     bool seekBusy = false, seekQueued = false, seekFast = false;
     double seekTarget = 0;  // of the latest seek
@@ -1256,6 +1258,15 @@ void OnMediaEvent(WPARAM event, LPARAM param) {
     }
 }
 
+// Turns the volume up or down a step, showing the new level; held keeps the icon up rather than popping it again.
+void StepVolume(bool up, bool held) {
+    if (g.volume > 0) g.restoreVolume = g.volume;
+    g.volume = ChangeVolume(up ? kVolumeStep : -kVolumeStep);
+    g.muted = IsMuted();  // turning it up unmutes
+    UpdateControls();
+    ShowFlash(VolumeGlyph(), false, held, std::to_wstring(std::lround(g.volume * 100)) + L"%");
+}
+
 void OnKey(WPARAM key, bool repeat) {
     if (GetKeyState(VK_CONTROL) < 0) {
         if (key == 'O' && !repeat) Open();
@@ -1271,14 +1282,9 @@ void OnKey(WPARAM key, bool repeat) {
             if (video) Seek(key == VK_LEFT ? -kSeekStep : kSeekStep);
             break;
         case VK_UP:
-        case VK_DOWN: {
-            if (g.volume > 0) g.restoreVolume = g.volume;
-            g.volume = ChangeVolume(key == VK_UP ? kVolumeStep : -kVolumeStep);
-            g.muted = IsMuted();  // turning it up unmutes
-            UpdateControls();
-            ShowFlash(VolumeGlyph(), false, repeat, std::to_wstring(std::lround(g.volume * 100)) + L"%");
+        case VK_DOWN:
+            StepVolume(key == VK_UP, repeat);
             break;
-        }
         case 'M':
             if (!repeat) ToggleMuted(true);
             break;
@@ -1439,11 +1445,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             UpdatePreview({});
             if (g.playing && !g.drag && !g.panelOpen) SetControlsShown(false);
             return 0;
-        case WM_MOUSEWHEEL: {  // scrolls the panel column under the mouse
+        case WM_MOUSEWHEEL: {  // scrolls the panel column under the mouse, or else changes the volume
             POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             ScreenToClient(hwnd, &pt);
             int row;
-            if (!g.panelOpen) return 0;
+            if (!g.panelOpen) {
+                if (g.menuOpen || g.drag) return 0;
+                // A step a notch, the finer steps of touchpads adding up to one.
+                const int delta = GET_WHEEL_DELTA_WPARAM(wp);
+                if ((delta > 0) != (g.wheel > 0)) g.wheel = 0;  // turning back starts over
+                g.wheel += delta;
+                while (std::abs(g.wheel) >= WHEEL_DELTA) {
+                    const bool up = g.wheel > 0;
+                    g.wheel -= up ? WHEEL_DELTA : -WHEEL_DELTA;
+                    // Steps in quick succession keep the icon up, like a held key.
+                    StepVolume(up, static_cast<DWORD>(GetMessageTime() - g.lastWheelStep) < kOsdMs);
+                    g.lastWheelStep = GetMessageTime();
+                }
+                return 0;
+            }
             const PanelGeometry p = PanelLayout();
             const int column = PanelColumnAt(p, pt, row);
             if (column < 0) return 0;

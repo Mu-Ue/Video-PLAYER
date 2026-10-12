@@ -27,7 +27,7 @@ Plays the formats Windows supports (MP4, MOV, MKV, AVI, WMV, …). Drop a video 
 | ---------------------- | ----------------------- |
 | `Space` / click        | Play / pause            |
 | `←` / `→`              | Back / forward 5 s      |
-| `↑` / `↓`              | Volume up / down        |
+| `↑` / `↓` / scroll     | Volume up / down        |
 | `M`                    | Mute                    |
 | `S`                    | Subtitles on / off      |
 | `F11` / double-click   | Fullscreen              |
