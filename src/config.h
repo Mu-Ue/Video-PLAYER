@@ -2,8 +2,8 @@
 
 #include <windows.h>
 
-constexpr wchar_t kAppId[] = L"Video-PLAYER";
-constexpr wchar_t kAppName[] = L"Video-PLAYER";
+constexpr wchar_t kAppId[] = L"VideoPLAYER";
+constexpr wchar_t kAppName[] = L"VideoPLAYER";
 constexpr wchar_t kFileFilter[] =
     L"Videos and subtitles\0*.mp4;*.m4v;*.mov;*.mkv;*.avi;*.wmv;*.webm;*.3gp;*.ts;*.m2ts;*.srt\0"
     L"Videos\0*.mp4;*.m4v;*.mov;*.mkv;*.avi;*.wmv;*.webm;*.3gp;*.ts;*.m2ts\0"

@@ -1,6 +1,6 @@
 1
 00:00:00,500 --> 00:00:03,000
-Welcome to Video-PLAYER.
+Welcome to VideoPLAYER.
 
 2
 00:00:03,500 --> 00:00:07,000
