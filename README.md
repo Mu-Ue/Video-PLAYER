@@ -2,18 +2,18 @@
 
 # VideoPLAYER
 
-A lightweight, highly optimized video player for Windows, built natively on Win32, Media Foundation and DirectComposition. Minimal by design, it focuses on doing the essentials well: hardware-accelerated playback and subtitles (`.srt` files or built into the video), without the clutter.
+A highly optimized and minimalistic video player for Windows, built with native tools.
 
 ## Build
 
-Requires Visual Studio (or Build Tools) with the C++ workload. Run `build.bat`, or from a Developer Command Prompt:
+Requires Visual Studio or Build Tools with the C++ workload. Run `build.bat`, or from a Developer Command Prompt:
 
 ```
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-Output: `build\VideoPLAYER.exe` (single file, no dependencies).
+Output: `build\VideoPLAYER.exe`, a single file with no dependencies.
 
 ## Use
 
@@ -21,9 +21,15 @@ Output: `build\VideoPLAYER.exe` (single file, no dependencies).
 "VideoPLAYER.exe" [video.mp4] [subtitles.srt]
 ```
 
-Run `VideoPLAYER.exe --register` once to list the player under Settings → Default apps (run again after moving the exe; `--unregister` removes it).
+Run `VideoPLAYER.exe --register` once to add the player to Settings → Default apps. Run it again after moving the exe. `--unregister` removes it.
 
-Plays the formats Windows supports (MP4, MOV, MKV, AVI, WMV, …). Drop a video or an `.srt` file on the window, use File → Open, or add subtitles to the playing video with Subtitles → Add subtitle file. Text subtitles built into an MKV, and `.srt` files next to the video named like it (`Movie.en.srt`), are detected and start off; press `S` to show them, or pick an audio or subtitle track with the subtitles button. Moving the mouse shows the controls over the bottom of the video: a seek bar that previews the frame under the mouse, play / pause, seek back / forward, volume, subtitles and fullscreen.
+Plays every format Windows supports, such as MP4, MOV, MKV, AVI and WMV.
+
+Open a video by dropping it on the window or with File → Open. Add subtitles the same way, or with Subtitles → Add subtitle file.
+
+Subtitles built into an MKV and `.srt` files named like the video (`Movie.en.srt`) are found automatically but start hidden. Press `S` to show them, or pick an audio or subtitle track with the subtitles button.
+
+Move the mouse to show the controls. Hover over the seek bar to preview any frame.
 
 | Input                  | Action                  |
 | ---------------------- | ----------------------- |
