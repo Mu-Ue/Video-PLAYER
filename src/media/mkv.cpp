@@ -21,13 +21,14 @@ enum : UINT32 {
     kLanguage = 0x22B59C, kLanguageBcp47 = 0x22B59D, kName = 0x536E, kDefaultDuration = 0x23E383,
     kContentEncodings = 0x6D80, kContentEncoding = 0x6240, kContentEncodingType = 0x5033,
     kContentCompression = 0x5034, kContentCompAlgo = 0x4254, kContentCompSettings = 0x4255,
-    kCues = 0x1C53BB6B, kCuePoint = 0xBB, kCueTime = 0xB3, kCueTrackPositions = 0xB7, kCueTrack = 0xF7, kCueClusterPosition = 0xF1,
-    kCueRelativePosition = 0xF0, kCluster = 0x1F43B675, kTimestamp = 0xE7, kBlockGroup = 0xA0, kBlock = 0xA1,
-    kSimpleBlock = 0xA3, kBlockDuration = 0x9B,
+    kCues = 0x1C53BB6B, kCuePoint = 0xBB, kCueTime = 0xB3, kCueTrackPositions = 0xB7, kCueTrack = 0xF7,
+    kCueClusterPosition = 0xF1, kCueRelativePosition = 0xF0, kCluster = 0x1F43B675,
+    kTimestamp = 0xE7, kBlockGroup = 0xA0, kBlock = 0xA1, kSimpleBlock = 0xA3, kBlockDuration = 0x9B,
 };
 constexpr UINT64 kUnknown = ~UINT64(0);  // an element size that isn't given, or a position that isn't
 constexpr UINT64 kMaxHeaderBytes = 1 << 22;  // of the elements read whole: the file header, Info and Tracks
 constexpr UINT64 kMaxBlockBytes = 1 << 16;   // of a subtitle block (group)
+constexpr size_t kPageBytes = 4096;          // the least the disk cache reads, so the least a read costs
 
 // Reads an EBML variable-length integer at p, moving p past it: an id keeps its length marker, a size loses it
 // (all ones: kUnknown).
@@ -121,7 +122,12 @@ struct Reader {
     UINT64 timeCluster = kUnknown, timeData = 0, time = 0;  // the last cluster ClusterTime found
     const TextTrack* lastTrack = nullptr;  // of the last cue AddBlock read, and its end
     double lastEnd = 0;
-    std::vector<BYTE> scan;  // Resync's buffer
+    size_t clusterHead = 0;  // the length of the last cluster header read, the same throughout most files
+    // The bytes read last: chunk of them from a page boundary, so headers, timestamps and blocks near each other
+    // come from one read. A page for the blocks the index points to, more when walking clusters.
+    std::vector<BYTE> buffer;
+    UINT64 bufferAt = 0;
+    size_t chunk = kPageBytes;
 
     ~Reader() {
         if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
@@ -136,13 +142,29 @@ struct Reader {
         return ReadFile(file, out, DWORD(size), &read, &o) && read == size;
     }
 
+    // The n bytes at `at`, fewer at the end of the file, from the buffer, which is read anew unless it holds them.
+    // Valid until the next call.
+    const BYTE* Bytes(UINT64 at, size_t& n) {
+        if (at >= fileSize) return nullptr;
+        n = size_t(std::min<UINT64>(n, fileSize - at));
+        if (at < bufferAt || at + n > bufferAt + buffer.size()) {
+            const UINT64 from = at & ~UINT64(kPageBytes - 1);
+            const size_t size = size_t(std::min<UINT64>(std::max<UINT64>(chunk, at + n - from), fileSize - from));
+            buffer.resize(size);
+            if (!Read(from, buffer.data(), size)) {
+                buffer.clear();
+                return nullptr;
+            }
+            bufferAt = from;
+        }
+        return buffer.data() + (at - bufferAt);
+    }
+
     bool Header(UINT64 at, Element& e) {
-        BYTE head[12];
-        if (at >= fileSize) return false;
-        const size_t n = size_t(std::min<UINT64>(sizeof head, fileSize - at));
-        if (!Read(at, head, n)) return false;
+        size_t n = 12;
+        const BYTE* head = Bytes(at, n);
         const BYTE* p = head;
-        if (!ParseHeader(p, head + n, e.id, e.size)) return false;
+        if (!head || !ParseHeader(p, head + n, e.id, e.size)) return false;
         e.at = at;
         e.data = at + UINT64(p - head);
         return true;
@@ -150,8 +172,24 @@ struct Reader {
 
     bool Data(const Element& e, std::vector<BYTE>& out, UINT64 max) {
         if (e.size > max) return false;
-        out.resize(size_t(e.size));
-        return Read(e.data, out.data(), out.size());
+        size_t n = size_t(e.size);
+        if (n > chunk) {  // read whole, past the buffer
+            out.resize(n);
+            return Read(e.data, out.data(), n);
+        }
+        const BYTE* p = Bytes(e.data, n);
+        if (!p || n != e.size) return false;
+        out.assign(p, p + n);
+        return true;
+    }
+
+    // An unsigned integer element's value.
+    bool Value(const Element& e, UINT64& value) {
+        size_t n = size_t(e.size);
+        const BYTE* p = e.size <= 8 ? Bytes(e.data, n) : nullptr;
+        if (!p || n != e.size) return false;
+        value = UInt(p, n);
+        return true;
     }
 
     // The element with this id at `at`, read whole.
@@ -173,13 +211,14 @@ struct Reader {
         if (!PostMessageW(hwnd, WM_APP_SUBTITLE_CUES, WPARAM(t.number), LPARAM(batch))) delete batch;
     }
 
-    // Turns a block of a text track, with the duration of its group, into a cue.
-    void AddBlock(const BYTE* p, const BYTE* end, UINT64 clusterTime, UINT64 duration) {
+    // Turns a block of a text track, with the duration of its group, into a cue. It is `at` the cluster's time, or
+    // its own if `own`.
+    void AddBlock(const BYTE* p, const BYTE* end, UINT64 at, bool own, UINT64 duration) {
         UINT64 number;
         if (!Vint(p, end, number, false) || end - p < 3 || (p[2] & 0x06)) return;  // laced: not text
         TextTrack* t = Find(number);
         if (!t || t->count >= kMaxCues) return;
-        const double start = (double(clusterTime) + INT16(p[0] << 8 | p[1])) * scale;
+        const double start = (double(at) + (own ? 0 : INT16(p[0] << 8 | p[1]))) * scale;
         const double length = duration != kUnknown ? double(duration) * scale : t->defaultDuration;
         p += 3;
         std::string bytes = t->prefix;
@@ -205,22 +244,29 @@ struct Reader {
         }
     }
 
-    // Reads a SimpleBlock or BlockGroup if it is of a text track.
-    void Block(const Element& e, UINT64 clusterTime) {
-        // A text track's number, which leads a SimpleBlock and a group's Block, normally its first child, rules out
-        // the video and audio without reading them.
-        BYTE head[16];
-        const size_t n = size_t(std::min<UINT64>(sizeof head, e.size));
-        if (!Read(e.data, head, n)) return;
+    // Whether the element is a SimpleBlock or BlockGroup that may be of a text track. A text track's number, which
+    // leads a SimpleBlock and a group's Block, normally its first child, rules out the video and audio without
+    // reading them.
+    bool IsText(const Element& e) {
+        if (e.id != kSimpleBlock && e.id != kBlockGroup) return false;
+        size_t n = size_t(std::min<UINT64>(16, e.size));
+        const BYTE* head = Bytes(e.data, n);
+        if (!head) return false;
         const BYTE* p = head;
         UINT32 id = kBlock;
         UINT64 size, number;
-        if (e.id == kBlockGroup && !ParseHeader(p, head + n, id, size)) return;
-        if (id == kBlock && (!Vint(p, head + n, number, false) || !Find(number))) return;
+        if (e.id == kBlockGroup && !ParseHeader(p, head + n, id, size)) return false;
+        return id != kBlock || (Vint(p, head + n, number, false) && Find(number));
+    }
+
+    // Reads a SimpleBlock or BlockGroup if it is of a text track, with the time AddBlock takes.
+    void Block(const Element& e, UINT64 at, bool own) {
         std::vector<BYTE> data;
-        if (e.size > kMaxBlockBytes || !seen.insert(e.at).second || !Data(e, data, kMaxBlockBytes)) return;
+        if (e.size > kMaxBlockBytes || !IsText(e) || !seen.insert(e.at).second || !Data(e, data, kMaxBlockBytes)) {
+            return;
+        }
         if (e.id == kSimpleBlock) {
-            AddBlock(data.data(), data.data() + data.size(), clusterTime, kUnknown);
+            AddBlock(data.data(), data.data() + data.size(), at, own, kUnknown);
             return;
         }
         const BYTE* block = nullptr;
@@ -230,7 +276,7 @@ struct Reader {
             if (child == kBlock) block = d, blockSize = s;
             if (child == kBlockDuration) duration = UInt(d, s);
         });
-        if (block) AddBlock(block, block + blockSize, clusterTime, duration);
+        if (block) AddBlock(block, block + blockSize, at, own, duration);
     }
 
     // Reads the text blocks of the cluster at `at`, or skips the other element there. Returns where the next one
@@ -246,12 +292,10 @@ struct Reader {
             if (!Header(p, e) || e.data > end) break;
             if (e.id == kCluster) return p;  // one whose size isn't given ends at the next
             if (e.size == kUnknown || e.size > end - e.data) break;
-            if (e.id == kTimestamp && e.size <= 8) {
-                BYTE v[8];
-                if (!Read(e.data, v, size_t(e.size))) break;
-                clusterTime = UInt(v, size_t(e.size));
+            if (e.id == kTimestamp) {
+                if (!Value(e, clusterTime)) break;
             } else if ((e.id == kBlockGroup || e.id == kSimpleBlock) && clusterTime != kUnknown) {
-                Block(e, clusterTime);
+                Block(e, clusterTime, false);
             }
         }
         return sized ? end : kUnknown;
@@ -266,11 +310,9 @@ struct Reader {
         UINT64 child = cluster.data;
         for (int i = 0; i < 2 && Header(child, e) && e.size != kUnknown; ++i, child = e.data + e.size) {
             if (e.id != kTimestamp) continue;
-            BYTE v[8];
-            if (e.size > 8 || !Read(e.data, v, size_t(e.size))) return false;
+            if (!Value(e, time)) return false;
             timeCluster = at;
             timeData = cluster.data;
-            time = UInt(v, size_t(e.size));
             return true;
         }
         return false;
@@ -280,17 +322,20 @@ struct Reader {
     // so a hit counts only if a cluster's header and Timestamp follow.
     UINT64 Resync(UINT64 from, UINT64 to, const std::atomic<bool>& stop) {
         static constexpr BYTE kId[] = {0x1F, 0x43, 0xB6, 0x75};
-        scan.resize(1 << 16);
-        while (from < to && from < fileSize && !stop.load(std::memory_order_relaxed)) {
-            const size_t n = size_t(std::min<UINT64>(scan.size(), fileSize - from));
-            if (n < sizeof kId || !Read(from, scan.data(), n)) return kUnknown;
-            const BYTE* end = scan.data() + n;
-            for (const BYTE* p = scan.data(); (p = std::search(p, end, kId, std::end(kId))) != end; ++p) {
-                const UINT64 at = from + UINT64(p - scan.data());
-                if (at >= to) return kUnknown;
-                if (ClusterTime(at)) return at;
+        while (from < to && !stop.load(std::memory_order_relaxed)) {
+            size_t n = sizeof kId;
+            const BYTE* p = Bytes(from, n);
+            if (!p || n < sizeof kId) return kUnknown;
+            const BYTE* end = buffer.data() + buffer.size();
+            const BYTE* hit = std::search(p, end, kId, std::end(kId));
+            if (hit == end) {
+                from = bufferAt + buffer.size() - (sizeof kId - 1);  // an id cut off at the end is read whole next
+                continue;
             }
-            from += n - (sizeof kId - 1);  // an id cut off at the end is read whole next time
+            const UINT64 at = from + UINT64(hit - p);
+            if (at >= to) return kUnknown;
+            if (ClusterTime(at)) return at;
+            from = at + 1;
         }
         return kUnknown;
     }
@@ -310,15 +355,20 @@ struct Reader {
         return lo;
     }
 
+    // Posts the cues read but not yet posted.
+    void PostAll() {
+        for (TextTrack& track : tracks) {
+            if (!track.batch.empty()) Post(track);
+        }
+    }
+
     // The seek the window asked for, in seconds, or a negative number. Posts what was read before it, and starts the
     // batches small again so the cues there arrive at once.
     double TakeSeek() {
         const double t = seekTarget.exchange(-1);
         if (t < 0) return t;
-        for (TextTrack& track : tracks) {
-            if (!track.batch.empty()) Post(track);
-            track.batchSize = 1;
-        }
+        PostAll();
+        for (TextTrack& track : tracks) track.batchSize = 1;
         return t;
     }
 
@@ -335,12 +385,18 @@ struct Reader {
             --left;
             lastTrack = nullptr;
             const Entry& entry = blocks[i];
-            Element e;
-            if (entry.relative != kUnknown && ClusterTime(entry.cluster) && Header(timeData + entry.relative, e) &&
-                (e.id == kBlockGroup || e.id == kSimpleBlock)) {
-                Block(e, time);
+            Element e, cluster;
+            // The block is at its relative position in the cluster's data. That starts after the cluster's header,
+            // tried at the last one's length first, which saves reading it. The time is the block's own.
+            if (entry.relative != kUnknown &&
+                ((clusterHead && Header(entry.cluster + clusterHead + entry.relative, e) && IsText(e)) ||
+                 (Header(entry.cluster, cluster) && cluster.id == kCluster &&
+                  (clusterHead = size_t(cluster.data - entry.cluster), Header(cluster.data + entry.relative, e))))) {
+                Block(e, entry.time, true);
             } else if (seen.insert(entry.cluster).second) {
+                chunk = kScanBytes;
                 Step(entry.cluster, stop);
+                chunk = kPageBytes;
             }
             last[i] = {lastTrack, lastEnd};
         };
@@ -448,11 +504,10 @@ struct Reader {
             clusters.erase(std::unique(clusters.begin(), clusters.end(),
                                        [](const Entry& a, const Entry& b) { return a.cluster == b.cluster; }),
                            clusters.end());
+            chunk = kScanBytes;
             ReadClusters(clusters, stop);
         }
-        for (TextTrack& t : tracks) {
-            if (!t.batch.empty() && !stop.load(std::memory_order_relaxed)) Post(t);
-        }
+        if (!stop.load(std::memory_order_relaxed)) PostAll();
     }
 };
 

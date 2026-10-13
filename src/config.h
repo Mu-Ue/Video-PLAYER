@@ -20,5 +20,7 @@ constexpr UINT kDoubleClickMs = 300;  // max gap between the clicks of a fullscr
 constexpr UINT kIdleMs = 2500;        // idle time before the controls and cursor hide while playing
 constexpr LONGLONG kMaxSubtitleBytes = 16 << 20;
 constexpr size_t kMaxCueChars = 2048;
+// Of a read while walking an MKV's clusters for subtitles: where hard disks reach full speed.
+constexpr size_t kScanBytes = 1 << 20;
 constexpr size_t kMaxCues = 100000;  // per subtitle file; a film has a few thousand
 constexpr int kMaxSidecarSubtitles = 32;  // .srt files picked up next to a video
