@@ -202,8 +202,8 @@ HRESULT CreateEngines() {
         FAILED(g.timedText->RegisterNotifications(&g.textNotify))) {
         g.timedText.Reset();
     }
-    // Deliver cues ahead of time so each is ready before its first frame; cues keep their own start times.
-    if (g.timedText) g.timedText->SetCueTimeOffset(0.1);
+    // Deliver cues ahead of time so each is ready before its first frame.
+    if (g.timedText) g.timedText->SetCueTimeOffset(kCueLeadSeconds);
     return hr;
 }
 
