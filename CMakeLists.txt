@@ -21,7 +21,7 @@ add_executable(VideoPLAYER WIN32
 set_source_files_properties(res/app.rc PROPERTIES OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/res/app.ico)
 target_include_directories(VideoPLAYER PRIVATE src)
 target_compile_definitions(VideoPLAYER PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_compile_options(VideoPLAYER PRIVATE /W4 /permissive- /utf-8 /sdl /guard:cf)
+target_compile_options(VideoPLAYER PRIVATE /W4 /permissive- /utf-8 /sdl /guard:cf /guard:ehcont)
 # List the libraries explicitly instead of CMake's defaults (which import ole32.dll). onecore_apiset comes
 # last, so it only supplies the COM functions, which then bind straight to combase.dll.
 set(CMAKE_CXX_STANDARD_LIBRARIES "")
@@ -31,5 +31,6 @@ target_link_libraries(VideoPLAYER PRIVATE delayimp kernel32 user32 gdi32 imm32 d
 # The registry is only touched by --register / --unregister.
 target_link_options(VideoPLAYER PRIVATE /DELAYLOAD:comdlg32.dll /DELAYLOAD:shell32.dll /DELAYLOAD:d2d1.dll
                     /DELAYLOAD:dwrite.dll /DELAYLOAD:advapi32.dll)
-# Control-flow guard, shadow stack, and DLL imports from System32 only (no planted DLLs next to the exe).
-target_link_options(VideoPLAYER PRIVATE /GUARD:CF /CETCOMPAT /DEPENDENTLOADFLAG:0x800)
+# Control-flow guard, shadow stack with checked exception continuations, and DLL imports from System32 only
+# (no planted DLLs next to the exe).
+target_link_options(VideoPLAYER PRIVATE /GUARD:CF /GUARD:EHCONT /CETCOMPAT /DEPENDENTLOADFLAG:0x800)
