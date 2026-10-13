@@ -992,16 +992,8 @@ void AddSidecarSubtitles(const std::wstring& video) {
 }
 
 bool OpenVideoFile(const std::wstring& path) {
-    // Stop reading the previous video's subtitles and drop any of its cues still queued. The new one's are read from
-    // what playback reads, so the reading is readied before it starts.
-    StopMkvSubtitles();
-    for (MSG msg; PeekMessageW(&msg, g.hwnd, WM_APP_SUBTITLE_CUES, WM_APP_SUBTITLE_CUES, PM_REMOVE);) {
-        delete reinterpret_cast<std::vector<Cue>*>(msg.lParam);
-    }
-    const std::vector<Track> own = StartMkvSubtitles(path, g.hwnd);
     const HRESULT hr = OpenVideo(path);
     if (FAILED(hr)) {
-        StopMkvSubtitles();
         const bool missing = hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) ||
                              hr == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
         ShowError(L"Can't open \"" + FileName(path) + L"\"." + (missing ? L"\n\nThe file doesn't exist." : L""));
@@ -1015,10 +1007,15 @@ bool OpenVideoFile(const std::wstring& path) {
     g.subtitle = g.lastSubtitle = g.audioTrack = -1;
     g.ownTrackSelected = false;
     g.audio.clear();
+    // Stop reading the previous video's subtitles and drop any of its cues still queued.
+    StopMkvSubtitles();
     for (MSG msg; PeekMessageW(&msg, g.hwnd, WM_APP_SUBTITLE_CUE, WM_APP_SUBTITLE_CUE, PM_REMOVE);) {
         delete reinterpret_cast<Cue*>(msg.lParam);
     }
-    for (const Track& t : own) g.tracks.push_back({TrackLabel(t), L"", t.id, {}, true});
+    for (MSG msg; PeekMessageW(&msg, g.hwnd, WM_APP_SUBTITLE_CUES, WM_APP_SUBTITLE_CUES, PM_REMOVE);) {
+        delete reinterpret_cast<std::vector<Cue>*>(msg.lParam);
+    }
+    for (const Track& t : StartMkvSubtitles(path, g.hwnd)) g.tracks.push_back({TrackLabel(t), L"", t.id, {}, true});
     AddSidecarSubtitles(path);
     ShowSubtitles();
     HideOsd();
@@ -1095,10 +1092,7 @@ void OnSubtitleCues(WPARAM track, LPARAM cues) {
                                  [&](const SubtitleTrack& t) { return t.read && t.id == DWORD(track); });
     if (it == g.tracks.end()) return;
     bool added = false;
-    for (Cue& cue : *owned) {
-        if (it->subs.cues.size() >= kMaxCues) break;
-        added |= AddCue(it->subs, std::move(cue));
-    }
+    for (Cue& cue : *owned) added |= AddCue(it->subs, std::move(cue));
     if (added && it - g.tracks.begin() == g.subtitle) ShowSubtitles();
 }
 
@@ -1147,6 +1141,7 @@ void ShowMenu(Control which) {
 double RequestSeek(double seconds, bool fast) {
     g.seekTarget = std::max(0.0, std::isfinite(g.duration) ? std::min(seconds, g.duration) : seconds);
     g.seekFast = fast;
+    SeekMkvSubtitles(g.seekTarget);
     if (g.seekBusy) {
         g.seekQueued = true;
     } else {

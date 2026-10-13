@@ -1,16 +1,15 @@
 #include "media/mkv.h"
 
-#include <mfapi.h>
-#include <wrl/implements.h>
-
 #include <algorithm>
+#include <atomic>
+#include <map>
 #include <memory>
 #include <string_view>
+#include <thread>
+#include <unordered_set>
 
 #include "config.h"
 #include "media/subtitles.h"
-
-using Microsoft::WRL::ComPtr;
 
 namespace {
 
@@ -22,17 +21,13 @@ enum : UINT32 {
     kLanguage = 0x22B59C, kLanguageBcp47 = 0x22B59D, kName = 0x536E, kDefaultDuration = 0x23E383,
     kContentEncodings = 0x6D80, kContentEncoding = 0x6240, kContentEncodingType = 0x5033,
     kContentCompression = 0x5034, kContentCompAlgo = 0x4254, kContentCompSettings = 0x4255,
-    kCluster = 0x1F43B675, kTimestamp = 0xE7, kBlockGroup = 0xA0, kBlock = 0xA1, kSimpleBlock = 0xA3,
-    kBlockDuration = 0x9B,
+    kCues = 0x1C53BB6B, kCuePoint = 0xBB, kCueTime = 0xB3, kCueTrackPositions = 0xB7, kCueTrack = 0xF7, kCueClusterPosition = 0xF1,
+    kCueRelativePosition = 0xF0, kCluster = 0x1F43B675, kTimestamp = 0xE7, kBlockGroup = 0xA0, kBlock = 0xA1,
+    kSimpleBlock = 0xA3, kBlockDuration = 0x9B,
 };
 constexpr UINT64 kUnknown = ~UINT64(0);  // an element size that isn't given, or a position that isn't
 constexpr UINT64 kMaxHeaderBytes = 1 << 22;  // of the elements read whole: the file header, Info and Tracks
 constexpr UINT64 kMaxBlockBytes = 1 << 16;   // of a subtitle block (group)
-constexpr size_t kMaxElementHeader = 12;     // an id of up to 4 bytes and a size of up to 8
-constexpr size_t kTrackBytes = 16;           // enough to hold a block's track number, also in a group
-constexpr size_t kMaxCursors = 8;
-constexpr size_t kMaxHeads = 16;
-constexpr size_t kMaxHeadBytes = 1 << 20;
 
 // Reads an EBML variable-length integer at p, moving p past it: an id keeps its length marker, a size loses it
 // (all ones: kUnknown).
@@ -95,37 +90,75 @@ struct TextTrack {
     bool ass;                    // S_TEXT/ASS or S_TEXT/SSA: the text follows eight other fields
     std::string prefix;          // bytes stripped from the front of each block
     double defaultDuration = 0;  // of a block without its own, in seconds
+    bool listed = false;         // the index lists its blocks
+    size_t count = 0;            // cues posted
     std::vector<Cue> batch;      // read but not yet posted
+    size_t batchSize = 1;        // posted once it has this many, doubling each time
 };
 
-// Where parsing goes on in the file. Playback reads it in pieces, mostly in order, but also elsewhere ahead of
-// time and after a seek; each of those gets a cursor of its own.
-struct Cursor {
-    UINT64 next = kUnknown;  // where the next element starts
-    UINT64 last = 0;         // where the one before it started
-    bool inCluster = false;
-    UINT64 clusterEnd = kUnknown, clusterTime = kUnknown;
-    UINT64 carryAt = 0;      // an element cut off at the end of a piece, from there, until the next piece
-    std::vector<BYTE> carry;
-    UINT64 used = 0;         // the piece that last moved it on
+// An element in the file: its id, where it starts and its data's position and size.
+struct Element {
+    UINT32 id;
+    UINT64 at, data, size;
 };
 
-// Picks the text tracks' cues out of the bytes playback reads from the file, at their offsets. Video and audio
-// blocks are skipped by their size.
-struct Parser {
-    SRWLOCK lock = SRWLOCK_INIT;
-    HWND hwnd = nullptr;  // none once stopped
+// A position the index lists: its time, its cluster and the block's position in that, if given.
+struct Entry {
+    UINT64 time, cluster, relative;
+};
+
+std::atomic<double> seekTarget = -1;  // the seek the reader is yet to take, in seconds, if not negative
+
+struct Reader {
+    HANDLE file = INVALID_HANDLE_VALUE;
+    UINT64 fileSize = 0;
+    HWND hwnd = nullptr;
+    UINT64 segment = 0, segmentEnd = 0;  // the Segment's data
+    UINT64 cues = kUnknown, firstCluster = kUnknown;
     double scale = 1e-3;  // seconds per timestamp unit
     std::vector<TextTrack> tracks;
-    std::vector<Cursor> cursors;
-    UINT64 pieces = 0;
-    // A piece no cursor followed starts within a cluster, and a new cursor parses it from the next. Its part before
-    // that is kept for the cursor that gets there later.
-    struct Head {
-        UINT64 at;
-        std::vector<BYTE> bytes;
-    };
-    std::vector<Head> heads;
+    std::unordered_set<UINT64> seen;  // text blocks read and clusters walked
+    UINT64 timeCluster = kUnknown, timeData = 0, time = 0;  // the last cluster ClusterTime found
+    const TextTrack* lastTrack = nullptr;  // of the last cue AddBlock read, and its end
+    double lastEnd = 0;
+    std::vector<BYTE> scan;  // Resync's buffer
+
+    ~Reader() {
+        if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    }
+
+    bool Read(UINT64 at, void* out, size_t size) {
+        if (at > fileSize || size > fileSize - at) return false;
+        OVERLAPPED o{};
+        o.Offset = DWORD(at);
+        o.OffsetHigh = DWORD(at >> 32);
+        DWORD read = 0;
+        return ReadFile(file, out, DWORD(size), &read, &o) && read == size;
+    }
+
+    bool Header(UINT64 at, Element& e) {
+        BYTE head[12];
+        if (at >= fileSize) return false;
+        const size_t n = size_t(std::min<UINT64>(sizeof head, fileSize - at));
+        if (!Read(at, head, n)) return false;
+        const BYTE* p = head;
+        if (!ParseHeader(p, head + n, e.id, e.size)) return false;
+        e.at = at;
+        e.data = at + UINT64(p - head);
+        return true;
+    }
+
+    bool Data(const Element& e, std::vector<BYTE>& out, UINT64 max) {
+        if (e.size > max) return false;
+        out.resize(size_t(e.size));
+        return Read(e.data, out.data(), out.size());
+    }
+
+    // The element with this id at `at`, read whole.
+    bool ElementAt(UINT64 at, UINT32 id, std::vector<BYTE>& out, UINT64 max) {
+        Element e;
+        return Header(at, e) && e.id == id && Data(e, out, max);
+    }
 
     TextTrack* Find(UINT64 number) {
         for (TextTrack& t : tracks) {
@@ -134,12 +167,18 @@ struct Parser {
         return nullptr;
     }
 
-    // Turns a block of a text track, with its cluster's time and the duration of its group, into a cue.
+    void Post(TextTrack& t) {
+        auto* batch = new std::vector<Cue>(std::move(t.batch));
+        t.batch = {};
+        if (!PostMessageW(hwnd, WM_APP_SUBTITLE_CUES, WPARAM(t.number), LPARAM(batch))) delete batch;
+    }
+
+    // Turns a block of a text track, with the duration of its group, into a cue.
     void AddBlock(const BYTE* p, const BYTE* end, UINT64 clusterTime, UINT64 duration) {
         UINT64 number;
         if (!Vint(p, end, number, false) || end - p < 3 || (p[2] & 0x06)) return;  // laced: not text
         TextTrack* t = Find(number);
-        if (!t) return;
+        if (!t || t->count >= kMaxCues) return;
         const double start = (double(clusterTime) + INT16(p[0] << 8 | p[1])) * scale;
         const double length = duration != kUnknown ? double(duration) * scale : t->defaultDuration;
         p += 3;
@@ -155,283 +194,323 @@ struct Parser {
         std::erase(raw, L'\r');
         Cue cue{start, start + length};
         SetCueText(raw, cue);
-        if (!cue.text.empty() && cue.end > cue.start) t->batch.push_back(std::move(cue));
-    }
-
-    // Whether a block of which `have` bytes are here may be a text track's: 1 yes, 0 no, -1 if that can't be told
-    // yet. Its track number leads a SimpleBlock and a group's Block, normally its first child.
-    int Text(UINT32 id, const BYTE* p, size_t have) {
-        const BYTE* end = p + std::min(have, kTrackBytes);
-        UINT32 child = kBlock;
-        UINT64 size, number;
-        if (id == kBlockGroup && !ParseHeader(p, end, child, size)) return have < kTrackBytes ? -1 : 0;
-        if (child != kBlock) return 1;  // read whole to find out
-        if (!Vint(p, end, number, false)) return have < kTrackBytes ? -1 : 0;
-        return Find(number) ? 1 : 0;
-    }
-
-    // Parses the elements from c.next on that lie in the piece [base, base + n). An element cut off at its end is
-    // kept until the next piece.
-    void Walk(Cursor& c, UINT64 base, const BYTE* p, size_t n) {
-        while (c.next != kUnknown && c.next >= base && c.next - base < n) {
-            if (c.inCluster && c.clusterEnd != kUnknown && c.next >= c.clusterEnd) c.inCluster = false;
-            const BYTE* q = p + (c.next - base);
-            const BYTE* d = q;
-            const size_t left = n - size_t(c.next - base);
-            UINT32 id;
-            UINT64 size;
-            if (!ParseHeader(d, p + n, id, size)) {
-                if (left < kMaxElementHeader) {
-                    c.carryAt = c.next;
-                    c.carry.assign(q, p + n);
-                } else {
-                    c.next = kUnknown;  // damaged
-                }
-                return;
-            }
-            const UINT64 data = c.next + UINT64(d - q);
-            c.last = c.next;
-            if (id == kCluster) {
-                c.inCluster = true;
-                c.clusterEnd = size == kUnknown ? kUnknown : data + size;
-                c.clusterTime = kUnknown;
-                c.next = data;  // into it
-                continue;
-            }
-            if (size == kUnknown) {
-                c.next = kUnknown;
-                return;
-            }
-            const size_t have = left - size_t(d - q);
-            const bool block = (id == kSimpleBlock || id == kBlockGroup) && c.clusterTime != kUnknown &&
-                               size <= kMaxBlockBytes;
-            if (c.inCluster && ((id == kTimestamp && size <= 8) || block)) {
-                if (size > have) {
-                    if (id == kTimestamp || Text(id, d, have)) {
-                        c.carryAt = c.next;
-                        c.carry.assign(q, p + n);
-                        return;
-                    }
-                } else if (id == kTimestamp) {
-                    c.clusterTime = UInt(d, size_t(size));
-                } else if (id == kSimpleBlock) {
-                    AddBlock(d, d + size, c.clusterTime, kUnknown);
-                } else {
-                    const BYTE* found = nullptr;
-                    size_t foundSize = 0;
-                    UINT64 duration = kUnknown;
-                    Children(d, d + size, [&](UINT32 child, const BYTE* v, size_t s) {
-                        if (child == kBlock) found = v, foundSize = s;
-                        if (child == kBlockDuration) duration = UInt(v, s);
-                    });
-                    if (found) AddBlock(found, found + foundSize, c.clusterTime, duration);
-                }
-            }
-            c.next = data + size;
+        if (cue.text.empty() || !(cue.end > cue.start)) return;
+        ++t->count;
+        lastTrack = t;
+        lastEnd = cue.end;
+        t->batch.push_back(std::move(cue));
+        if (t->batch.size() >= t->batchSize) {
+            Post(*t);
+            t->batchSize *= 2;
         }
     }
 
-    // Finds the first cluster in the piece from p + from on, by its id, and parses from there; returns where it is,
-    // if anywhere. The id can also occur by chance in other data, so a hit counts only if a cluster's header and
-    // Timestamp follow in the piece.
-    size_t Resync(Cursor& c, UINT64 base, const BYTE* p, size_t n, size_t from) {
-        static constexpr BYTE kId[] = {0x1F, 0x43, 0xB6, 0x75};
-        const BYTE* end = p + n;
-        for (const BYTE* q = p + from; (q = std::search(q, end, std::begin(kId), std::end(kId))) != end; ++q) {
-            const BYTE* d = q;
-            UINT32 id;
-            UINT64 size;
-            if (!ParseHeader(d, end, id, size)) continue;
-            // The Timestamp comes first, after a CRC-32 at most.
-            bool timed = false;
-            for (int i = 0; i < 2 && !timed && ParseHeader(d, end, id, size) && size <= UINT64(end - d); ++i) {
-                timed = id == kTimestamp && size <= 8;
-                d += size;
-            }
-            if (!timed) continue;
-            c.next = base + UINT64(q - p);
-            c.inCluster = false;
-            Walk(c, base, p, n);
-            return size_t(q - p);
-        }
-        return n;
-    }
-
-    // Moves the cursor on through the piece [at, at + n), if it continues there. Returns whether it did.
-    bool Follow(Cursor& c, UINT64 at, const BYTE* p, size_t n) {
-        bool moved = false;
-        // An element cut off at the end of the last piece is joined with the start of this one.
-        if (!c.carry.empty() && c.next == c.carryAt && at == c.carryAt + c.carry.size()) {
-            std::vector<BYTE> joined = std::move(c.carry);
-            const size_t take = std::min(n, size_t(kMaxBlockBytes + kMaxElementHeader));
-            joined.insert(joined.end(), p, p + take);
-            c.carry.clear();
-            Walk(c, c.carryAt, joined.data(), joined.size());
-            if (take < n) c.carry.clear();  // cut off for good
-            moved = true;
-        }
-        if (c.next != kUnknown && c.next >= at && c.next - at < n) {
-            Walk(c, at, p, n);
-            if (c.next == kUnknown) Resync(c, at, p, n, size_t(std::max(c.last + 1, at) - at));
-            moved = true;
-        }
-        return moved;
-    }
-
-    // Takes a piece the player read, at its offset in the file, and posts the cues in it.
-    void Feed(UINT64 at, const BYTE* p, size_t n) {
-        AcquireSRWLockExclusive(&lock);
-        if (hwnd && n) {
-            ++pieces;
-            bool followed = false;  // by a cursor, or inside an element one skips
-            for (Cursor& c : cursors) {
-                if (Follow(c, at, p, n)) {
-                    c.used = pieces;
-                    followed = true;
-                    // On through the kept parts it gets to.
-                    for (size_t i = 0; i < heads.size();) {
-                        if (Follow(c, heads[i].at, heads[i].bytes.data(), heads[i].bytes.size())) {
-                            heads.erase(heads.begin() + ptrdiff_t(i));
-                            i = 0;
-                        } else {
-                            ++i;
-                        }
-                    }
-                } else if (at + n <= c.next && at + n > c.last) {
-                    followed = true;
-                }
-            }
-            if (!followed) {
-                Cursor c;
-                const size_t head = Resync(c, at, p, n, 0);
-                if (head) {
-                    if (heads.size() >= kMaxHeads) heads.erase(heads.begin());
-                    heads.push_back({at, std::vector<BYTE>(p, p + std::min(head, kMaxHeadBytes))});
-                }
-                if (c.next != kUnknown) {
-                    c.used = pieces;
-                    if (cursors.size() >= kMaxCursors) {
-                        cursors.erase(std::min_element(cursors.begin(), cursors.end(),
-                                                       [](const Cursor& a, const Cursor& b) { return a.used < b.used; }));
-                    }
-                    cursors.push_back(std::move(c));
-                }
-            }
-            // A cursor that lost its place, or met another, ends.
-            for (size_t i = 0; i < cursors.size();) {
-                const UINT64 next = cursors[i].next;
-                if (next == kUnknown || std::any_of(cursors.begin(), cursors.begin() + ptrdiff_t(i),
-                                                    [&](const Cursor& c) { return c.next == next; })) {
-                    cursors.erase(cursors.begin() + ptrdiff_t(i));
-                } else {
-                    ++i;
-                }
-            }
-            for (TextTrack& t : tracks) {
-                if (t.batch.empty()) continue;
-                auto* batch = new std::vector<Cue>(std::move(t.batch));
-                t.batch = {};
-                if (!PostMessageW(hwnd, WM_APP_SUBTITLE_CUES, WPARAM(t.number), LPARAM(batch))) delete batch;
-            }
-        }
-        ReleaseSRWLockExclusive(&lock);
-    }
-};
-
-// Reads the file at open: the header, Info and Tracks.
-struct File {
-    HANDLE file = INVALID_HANDLE_VALUE;
-    UINT64 size = 0;
-
-    ~File() {
-        if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
-    }
-
-    bool Read(UINT64 at, void* out, size_t n) {
-        if (at > size || n > size - at) return false;
-        OVERLAPPED o{};
-        o.Offset = DWORD(at);
-        o.OffsetHigh = DWORD(at >> 32);
-        DWORD read = 0;
-        return ReadFile(file, out, DWORD(n), &read, &o) && read == n;
-    }
-
-    // The header of the element at `at`: its id, the position of its data and its size.
-    bool Header(UINT64 at, UINT32& id, UINT64& data, UINT64& length) {
-        BYTE head[kMaxElementHeader];
-        if (at >= size) return false;
-        const size_t n = size_t(std::min<UINT64>(sizeof head, size - at));
-        if (!Read(at, head, n)) return false;
+    // Reads a SimpleBlock or BlockGroup if it is of a text track.
+    void Block(const Element& e, UINT64 clusterTime) {
+        // A text track's number, which leads a SimpleBlock and a group's Block, normally its first child, rules out
+        // the video and audio without reading them.
+        BYTE head[16];
+        const size_t n = size_t(std::min<UINT64>(sizeof head, e.size));
+        if (!Read(e.data, head, n)) return;
         const BYTE* p = head;
-        if (!ParseHeader(p, head + n, id, length)) return false;
-        data = at + UINT64(p - head);
-        return true;
+        UINT32 id = kBlock;
+        UINT64 size, number;
+        if (e.id == kBlockGroup && !ParseHeader(p, head + n, id, size)) return;
+        if (id == kBlock && (!Vint(p, head + n, number, false) || !Find(number))) return;
+        std::vector<BYTE> data;
+        if (e.size > kMaxBlockBytes || !seen.insert(e.at).second || !Data(e, data, kMaxBlockBytes)) return;
+        if (e.id == kSimpleBlock) {
+            AddBlock(data.data(), data.data() + data.size(), clusterTime, kUnknown);
+            return;
+        }
+        const BYTE* block = nullptr;
+        size_t blockSize = 0;
+        UINT64 duration = kUnknown;
+        Children(data.data(), data.data() + data.size(), [&](UINT32 child, const BYTE* d, size_t s) {
+            if (child == kBlock) block = d, blockSize = s;
+            if (child == kBlockDuration) duration = UInt(d, s);
+        });
+        if (block) AddBlock(block, block + blockSize, clusterTime, duration);
     }
 
-    // The element with this id at `at`, read whole.
-    bool ElementAt(UINT64 at, UINT32 id, std::vector<BYTE>& out) {
-        UINT32 found;
-        UINT64 data, length;
-        if (!Header(at, found, data, length) || found != id || length > kMaxHeaderBytes) return false;
-        out.resize(size_t(length));
-        return Read(data, out.data(), out.size());
+    // Reads the text blocks of the cluster at `at`, or skips the other element there. Returns where the next one
+    // starts, or kUnknown if that can't be told.
+    UINT64 Step(UINT64 at, const std::atomic<bool>& stop) {
+        Element e;
+        if (!Header(at, e) || e.data > segmentEnd) return kUnknown;
+        const bool sized = e.size != kUnknown;
+        const UINT64 end = sized ? std::min(segmentEnd, e.data + e.size) : segmentEnd;
+        if (e.id != kCluster) return sized ? end : kUnknown;
+        UINT64 clusterTime = kUnknown;
+        for (UINT64 p = e.data; p < end && !stop.load(std::memory_order_relaxed); p = e.data + e.size) {
+            if (!Header(p, e) || e.data > end) break;
+            if (e.id == kCluster) return p;  // one whose size isn't given ends at the next
+            if (e.size == kUnknown || e.size > end - e.data) break;
+            if (e.id == kTimestamp && e.size <= 8) {
+                BYTE v[8];
+                if (!Read(e.data, v, size_t(e.size))) break;
+                clusterTime = UInt(v, size_t(e.size));
+            } else if ((e.id == kBlockGroup || e.id == kSimpleBlock) && clusterTime != kUnknown) {
+                Block(e, clusterTime);
+            }
+        }
+        return sized ? end : kUnknown;
+    }
+
+    // Finds the data position and Timestamp of the cluster at `at`: timeData and time.
+    bool ClusterTime(UINT64 at) {
+        if (timeCluster == at) return true;
+        Element cluster, e;
+        if (!Header(at, cluster) || cluster.id != kCluster) return false;
+        // The Timestamp comes first, after a CRC-32 at most.
+        UINT64 child = cluster.data;
+        for (int i = 0; i < 2 && Header(child, e) && e.size != kUnknown; ++i, child = e.data + e.size) {
+            if (e.id != kTimestamp) continue;
+            BYTE v[8];
+            if (e.size > 8 || !Read(e.data, v, size_t(e.size))) return false;
+            timeCluster = at;
+            timeData = cluster.data;
+            time = UInt(v, size_t(e.size));
+            return true;
+        }
+        return false;
+    }
+
+    // The first cluster that starts in [from, to), found by its id. The id can also occur by chance in other data,
+    // so a hit counts only if a cluster's header and Timestamp follow.
+    UINT64 Resync(UINT64 from, UINT64 to, const std::atomic<bool>& stop) {
+        static constexpr BYTE kId[] = {0x1F, 0x43, 0xB6, 0x75};
+        scan.resize(1 << 16);
+        while (from < to && from < fileSize && !stop.load(std::memory_order_relaxed)) {
+            const size_t n = size_t(std::min<UINT64>(scan.size(), fileSize - from));
+            if (n < sizeof kId || !Read(from, scan.data(), n)) return kUnknown;
+            const BYTE* end = scan.data() + n;
+            for (const BYTE* p = scan.data(); (p = std::search(p, end, kId, std::end(kId))) != end; ++p) {
+                const UINT64 at = from + UINT64(p - scan.data());
+                if (at >= to) return kUnknown;
+                if (ClusterTime(at)) return at;
+            }
+            from += n - (sizeof kId - 1);  // an id cut off at the end is read whole next time
+        }
+        return kUnknown;
+    }
+
+    // The last cluster whose Timestamp is at most units, found without an index by halving the bytes it can be in.
+    UINT64 Bisect(UINT64 units, const std::atomic<bool>& stop) {
+        UINT64 lo = firstCluster, hi = segmentEnd;  // lo is a cluster at most at units, the ones from hi on are later
+        while (hi - lo > 1 && !stop.load(std::memory_order_relaxed)) {
+            const UINT64 mid = lo + (hi - lo) / 2;
+            const UINT64 at = Resync(mid, hi, stop);
+            if (at != kUnknown && time <= units) {
+                lo = at;
+            } else {
+                hi = mid;
+            }
+        }
+        return lo;
+    }
+
+    // The seek the window asked for, in seconds, or a negative number. Posts what was read before it, and starts the
+    // batches small again so the cues there arrive at once.
+    double TakeSeek() {
+        const double t = seekTarget.exchange(-1);
+        if (t < 0) return t;
+        for (TextTrack& track : tracks) {
+            if (!track.batch.empty()) Post(track);
+            track.batchSize = 1;
+        }
+        return t;
+    }
+
+    UINT64 Units(double seconds) const { return UINT64(std::min(seconds / scale, 1e18)); }
+
+    // Reads the blocks the index lists, from the seek position on, and the ones before it after the end.
+    void ReadBlocks(const std::vector<Entry>& blocks, const std::atomic<bool>& stop) {
+        std::vector<bool> done(blocks.size());
+        std::vector<std::pair<const TextTrack*, double>> last(blocks.size());  // the track and end of each's last cue
+        size_t left = blocks.size(), next = 0;
+        const auto read = [&](size_t i) {
+            if (done[i]) return;
+            done[i] = true;
+            --left;
+            lastTrack = nullptr;
+            const Entry& entry = blocks[i];
+            Element e;
+            if (entry.relative != kUnknown && ClusterTime(entry.cluster) && Header(timeData + entry.relative, e) &&
+                (e.id == kBlockGroup || e.id == kSimpleBlock)) {
+                Block(e, time);
+            } else if (seen.insert(entry.cluster).second) {
+                Step(entry.cluster, stop);
+            }
+            last[i] = {lastTrack, lastEnd};
+        };
+        while (left && !stop.load(std::memory_order_relaxed)) {
+            const double t = TakeSeek();
+            if (t >= 0) {
+                const UINT64 units = Units(t);
+                next = size_t(std::upper_bound(blocks.begin(), blocks.end(), units,
+                                               [](UINT64 u, const Entry& b) { return u < b.time; }) -
+                              blocks.begin());
+                // Back from there until each track has a cue that ended by then, for one that still shows.
+                std::vector<const TextTrack*> ended;
+                for (size_t i = next; i-- > 0 && ended.size() < tracks.size() && seekTarget < 0 &&
+                                      !stop.load(std::memory_order_relaxed);) {
+                    read(i);
+                    const auto [track, end] = last[i];
+                    if (track && end <= t && std::find(ended.begin(), ended.end(), track) == ended.end()) {
+                        ended.push_back(track);
+                    }
+                }
+            }
+            if (next >= blocks.size()) next = 0;
+            read(next++);
+        }
+    }
+
+    // Reads the clusters from the seek position on, and the ones not yet read after the end, without the subtitles'
+    // index. The clusters the index lists for other tracks, if any, give the position.
+    void ReadClusters(const std::vector<Entry>& clusters, const std::atomic<bool>& stop) {
+        std::map<UINT64, UINT64> walked;  // byte ranges read, merged: start to end
+        const auto unread = [&](UINT64 at) {
+            const auto it = walked.upper_bound(at);
+            return it != walked.begin() && std::prev(it)->second > at ? std::prev(it)->second : at;
+        };
+        UINT64 at = firstCluster;
+        while (!stop.load(std::memory_order_relaxed)) {
+            const double t = TakeSeek();
+            if (t >= 0) {
+                // One cluster before the one at t, for a cue that started there and still shows.
+                const UINT64 units = Units(t);
+                if (!clusters.empty()) {
+                    const size_t n = size_t(std::upper_bound(clusters.begin(), clusters.end(), units,
+                                                             [](UINT64 u, const Entry& c) { return u < c.time; }) -
+                                            clusters.begin());
+                    at = n >= 2 ? clusters[n - 2].cluster : firstCluster;
+                } else {
+                    at = Bisect(units, stop);
+                    if (at != firstCluster && ClusterTime(at) && time) at = Bisect(time - 1, stop);
+                }
+            }
+            at = unread(at);
+            if (at >= segmentEnd) at = unread(firstCluster);
+            if (at >= segmentEnd) return;
+            UINT64 next = Step(at, stop);
+            if (stop.load(std::memory_order_relaxed)) return;
+            if (next == kUnknown || next <= at) next = Resync(at + 1, segmentEnd, stop);
+            next = std::min(next, segmentEnd);
+            // Marks [at, next) read, merged with the ranges it touches.
+            UINT64 from = at, to = next;
+            auto it = walked.lower_bound(from);
+            if (it != walked.begin() && std::prev(it)->second >= from) from = (--it)->first;
+            for (; it != walked.end() && it->first <= to; it = walked.erase(it)) to = std::max(to, it->second);
+            walked[from] = to;
+            at = next;
+        }
+    }
+
+    void Run(const std::atomic<bool>& stop) {
+        std::vector<Entry> blocks, clusters;  // the index's text blocks and clusters of any track, by time
+        std::vector<BYTE> index;
+        if (cues != kUnknown && ElementAt(cues, kCues, index, kMaxSubtitleBytes)) {
+            Children(index.data(), index.data() + index.size(), [&](UINT32 id, const BYTE* d, size_t s) {
+                if (id != kCuePoint) return;
+                UINT64 cueTime = kUnknown;
+                const size_t firstBlock = blocks.size(), firstPoint = clusters.size();
+                Children(d, d + s, [&](UINT32 id2, const BYTE* d2, size_t s2) {
+                    if (id2 == kCueTime) cueTime = UInt(d2, s2);
+                    if (id2 != kCueTrackPositions) return;
+                    TextTrack* t = nullptr;
+                    UINT64 cluster = kUnknown, relative = kUnknown;
+                    Children(d2, d2 + s2, [&](UINT32 field, const BYTE* v, size_t n) {
+                        if (field == kCueTrack) t = Find(UInt(v, n));
+                        if (field == kCueClusterPosition) cluster = segment + UInt(v, n);
+                        if (field == kCueRelativePosition) relative = UInt(v, n);
+                    });
+                    if (cluster == kUnknown) return;
+                    clusters.push_back({0, cluster, kUnknown});
+                    if (!t) return;
+                    t->listed = true;
+                    blocks.push_back({0, cluster, relative});
+                });
+                for (size_t i = firstBlock; i < blocks.size(); ++i) blocks[i].time = cueTime;
+                for (size_t i = firstPoint; i < clusters.size(); ++i) clusters[i].time = cueTime;
+            });
+        }
+        index = {};
+        const auto byTime = [](const Entry& a, const Entry& b) { return a.time < b.time; };
+        if (std::all_of(tracks.begin(), tracks.end(), [](const TextTrack& t) { return t.listed; })) {
+            clusters = {};
+            std::stable_sort(blocks.begin(), blocks.end(), byTime);
+            ReadBlocks(blocks, stop);
+        } else if (firstCluster != kUnknown) {
+            blocks = {};
+            std::stable_sort(clusters.begin(), clusters.end(), byTime);
+            clusters.erase(std::unique(clusters.begin(), clusters.end(),
+                                       [](const Entry& a, const Entry& b) { return a.cluster == b.cluster; }),
+                           clusters.end());
+            ReadClusters(clusters, stop);
+        }
+        for (TextTrack& t : tracks) {
+            if (!t.batch.empty() && !stop.load(std::memory_order_relaxed)) Post(t);
+        }
     }
 };
 
-// Reads the file header, Info and Tracks, which come before the first cluster, and finds that.
-bool ReadHeaders(File& f, Parser& r, std::vector<Track>& out) {
+// Reads the file header, Info and Tracks, which come before the first cluster, and finds the index.
+bool ReadHeaders(Reader& r, std::vector<Track>& out) {
+    Element e;
     std::vector<BYTE> data;
-    UINT32 id;
-    UINT64 at, length;
-    if (!f.ElementAt(0, kEbml, data) || !f.Header(0, id, at, length)) return false;
+    if (!r.Header(0, e) || e.id != kEbml || !r.Data(e, data, kMaxHeaderBytes)) return false;
     bool matroska = false;
-    Children(data.data(), data.data() + data.size(), [&](UINT32 field, const BYTE* d, size_t s) {
-        if (field == kDocType) matroska = Equals(d, s, "matroska") || Equals(d, s, "webm");
+    Children(data.data(), data.data() + data.size(), [&](UINT32 id, const BYTE* d, size_t s) {
+        if (id == kDocType) matroska = Equals(d, s, "matroska") || Equals(d, s, "webm");
     });
-    if (!matroska || !f.Header(at + length, id, at, length) || id != kSegment) return false;
-    const UINT64 segment = at;
-    const UINT64 segmentEnd = length != kUnknown && length <= f.size - at ? at + length : f.size;
+    if (!matroska || !r.Header(e.data + e.size, e) || e.id != kSegment) return false;
+    r.segment = e.data;
+    r.segmentEnd = e.size != kUnknown && e.size <= r.fileSize - e.data ? e.data + e.size : r.fileSize;
 
     UINT64 info = kUnknown, tracks = kUnknown;
-    for (UINT64 p = segment; p < segmentEnd && f.Header(p, id, at, length); p = at + length) {
-        if (id == kCluster) {
-            r.cursors.push_back({p});
+    for (UINT64 at = r.segment; at < r.segmentEnd && r.Header(at, e); at = e.data + e.size) {
+        if (e.id == kCluster) {
+            r.firstCluster = at;
             break;
         }
-        if (length == kUnknown) break;
-        if (id == kInfo) info = p;
-        if (id == kTracks) tracks = p;
-        if (id == kSeekHead && f.ElementAt(p, kSeekHead, data)) {
-            Children(data.data(), data.data() + data.size(), [&](UINT32 field, const BYTE* d, size_t s) {
-                if (field != kSeek) return;
+        if (e.size == kUnknown) break;
+        if (e.id == kInfo) info = at;
+        if (e.id == kTracks) tracks = at;
+        if (e.id == kCues) r.cues = at;
+        if (e.id == kSeekHead && r.Data(e, data, kMaxHeaderBytes)) {
+            Children(data.data(), data.data() + data.size(), [&](UINT32 id, const BYTE* d, size_t s) {
+                if (id != kSeek) return;
                 UINT64 target = 0, position = kUnknown;
-                Children(d, d + s, [&](UINT32 field2, const BYTE* v, size_t n) {
-                    if (field2 == kSeekId) target = UInt(v, n);
-                    if (field2 == kSeekPosition) position = segment + UInt(v, n);
+                Children(d, d + s, [&](UINT32 field, const BYTE* v, size_t n) {
+                    if (field == kSeekId) target = UInt(v, n);
+                    if (field == kSeekPosition) position = r.segment + UInt(v, n);
                 });
                 if (position == kUnknown) return;
                 if (target == kInfo && info == kUnknown) info = position;
                 if (target == kTracks && tracks == kUnknown) tracks = position;
+                if (target == kCues && r.cues == kUnknown) r.cues = position;
             });
         }
     }
-    if (info != kUnknown && f.ElementAt(info, kInfo, data)) {
-        Children(data.data(), data.data() + data.size(), [&](UINT32 field, const BYTE* d, size_t s) {
-            if (field == kTimestampScale && UInt(d, s)) r.scale = double(UInt(d, s)) * 1e-9;
+    if (info != kUnknown && r.ElementAt(info, kInfo, data, kMaxHeaderBytes)) {
+        Children(data.data(), data.data() + data.size(), [&](UINT32 id, const BYTE* d, size_t s) {
+            if (id == kTimestampScale && UInt(d, s)) r.scale = double(UInt(d, s)) * 1e-9;
         });
     }
-    if (tracks == kUnknown || !f.ElementAt(tracks, kTracks, data)) return false;
+    if (tracks == kUnknown || !r.ElementAt(tracks, kTracks, data, kMaxHeaderBytes)) return false;
 
     bool readable = true;
-    Children(data.data(), data.data() + data.size(), [&](UINT32 field, const BYTE* d, size_t s) {
-        if (field != kTrackEntry) return;
+    Children(data.data(), data.data() + data.size(), [&](UINT32 id, const BYTE* d, size_t s) {
+        if (id != kTrackEntry) return;
         TextTrack t{};
         UINT64 type = 0;
         bool text = false, encoded = false;
         Track track{};
         std::wstring language, bcp47;
-        Children(d, d + s, [&](UINT32 entry, const BYTE* v, size_t n) {
-            switch (entry) {
+        Children(d, d + s, [&](UINT32 field, const BYTE* v, size_t n) {
+            switch (field) {
                 case kTrackNumber: t.number = UInt(v, n); break;
                 case kTrackType: type = UInt(v, n); break;
                 case kCodecId:
@@ -477,124 +556,38 @@ bool ReadHeaders(File& f, Parser& r, std::vector<Track>& out) {
     return readable && !r.tracks.empty();
 }
 
-// A read the player started, which hands the bytes to the parser when it completes and then completes the
-// player's own.
-class ReadOp final
-    : public Microsoft::WRL::RuntimeClass<Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
-                                          IMFAsyncCallback> {
-  public:
-    ReadOp(std::shared_ptr<Parser> parser, IMFByteStream* inner, BYTE* buffer, UINT64 at, IMFAsyncCallback* callback,
-           IUnknown* state)
-        : parser_(std::move(parser)), inner_(inner), buffer_(buffer), at_(at), callback_(callback), state_(state) {}
-
-    ULONG read = 0;
-
-    STDMETHODIMP GetParameters(DWORD*, DWORD*) override { return E_NOTIMPL; }
-    STDMETHODIMP Invoke(IMFAsyncResult* result) override {
-        const HRESULT hr = inner_->EndRead(result, &read);
-        if (SUCCEEDED(hr)) parser_->Feed(at_, buffer_, read);
-        ComPtr<IMFAsyncResult> done;
-        if (SUCCEEDED(MFCreateAsyncResult(static_cast<IMFAsyncCallback*>(this), callback_.Get(), state_.Get(),
-                                          &done))) {
-            done->SetStatus(hr);
-            MFInvokeCallback(done.Get());
-        }
-        return S_OK;
-    }
-
-  private:
-    std::shared_ptr<Parser> parser_;
-    ComPtr<IMFByteStream> inner_;
-    BYTE* buffer_;
-    UINT64 at_;
-    ComPtr<IMFAsyncCallback> callback_;
-    ComPtr<IUnknown> state_;
-};
-
-// The file as the player reads it, passing what it reads to the parser too.
-class Stream final
-    : public Microsoft::WRL::RuntimeClass<Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
-                                          IMFByteStream> {
-  public:
-    Stream(IMFByteStream* inner, std::shared_ptr<Parser> parser) : inner_(inner), parser_(std::move(parser)) {}
-
-    STDMETHODIMP GetCapabilities(DWORD* capabilities) override { return inner_->GetCapabilities(capabilities); }
-    STDMETHODIMP GetLength(QWORD* length) override { return inner_->GetLength(length); }
-    STDMETHODIMP SetLength(QWORD length) override { return inner_->SetLength(length); }
-    STDMETHODIMP GetCurrentPosition(QWORD* position) override { return inner_->GetCurrentPosition(position); }
-    STDMETHODIMP SetCurrentPosition(QWORD position) override { return inner_->SetCurrentPosition(position); }
-    STDMETHODIMP IsEndOfStream(BOOL* end) override { return inner_->IsEndOfStream(end); }
-    STDMETHODIMP Read(BYTE* buffer, ULONG size, ULONG* read) override {
-        QWORD at = 0;
-        const bool known = SUCCEEDED(inner_->GetCurrentPosition(&at));
-        const HRESULT hr = inner_->Read(buffer, size, read);
-        if (SUCCEEDED(hr) && known && read) parser_->Feed(at, buffer, *read);
-        return hr;
-    }
-    STDMETHODIMP BeginRead(BYTE* buffer, ULONG size, IMFAsyncCallback* callback, IUnknown* state) override {
-        QWORD at = 0;
-        HRESULT hr = inner_->GetCurrentPosition(&at);
-        if (FAILED(hr)) return hr;
-        const ComPtr<ReadOp> op = Microsoft::WRL::Make<ReadOp>(parser_, inner_.Get(), buffer, at, callback, state);
-        return op ? inner_->BeginRead(buffer, size, op.Get(), nullptr) : E_OUTOFMEMORY;
-    }
-    STDMETHODIMP EndRead(IMFAsyncResult* result, ULONG* read) override {
-        if (!result || !read) return E_INVALIDARG;
-        ComPtr<IUnknown> object;
-        const HRESULT hr = result->GetObject(&object);
-        if (FAILED(hr)) return hr;
-        *read = static_cast<ReadOp*>(static_cast<IMFAsyncCallback*>(object.Get()))->read;
-        return result->GetStatus();
-    }
-    STDMETHODIMP Write(const BYTE* buffer, ULONG size, ULONG* written) override {
-        return inner_->Write(buffer, size, written);
-    }
-    STDMETHODIMP BeginWrite(const BYTE* buffer, ULONG size, IMFAsyncCallback* callback, IUnknown* state) override {
-        return inner_->BeginWrite(buffer, size, callback, state);
-    }
-    STDMETHODIMP EndWrite(IMFAsyncResult* result, ULONG* written) override {
-        return inner_->EndWrite(result, written);
-    }
-    STDMETHODIMP Seek(MFBYTESTREAM_SEEK_ORIGIN origin, LONGLONG offset, DWORD flags, QWORD* position) override {
-        return inner_->Seek(origin, offset, flags, position);
-    }
-    STDMETHODIMP Flush() override { return inner_->Flush(); }
-    STDMETHODIMP Close() override { return inner_->Close(); }
-
-  private:
-    ComPtr<IMFByteStream> inner_;
-    std::shared_ptr<Parser> parser_;
-};
-
-std::shared_ptr<Parser> current;  // of the video being opened or played
+std::thread reader;
+std::atomic<bool> stopReader = false;
 
 }  // namespace
 
 std::vector<Track> StartMkvSubtitles(const std::wstring& path, HWND hwnd) {
     StopMkvSubtitles();
-    File f;
-    f.file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                         OPEN_EXISTING, 0, nullptr);
+    auto r = std::make_unique<Reader>();
+    r->file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                          OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, nullptr);
     LARGE_INTEGER size{};
-    auto r = std::make_shared<Parser>();
     std::vector<Track> tracks;
-    if (f.file == INVALID_HANDLE_VALUE || GetFileType(f.file) != FILE_TYPE_DISK || !GetFileSizeEx(f.file, &size) ||
-        (f.size = UINT64(size.QuadPart), !ReadHeaders(f, *r, tracks))) {
+    if (r->file == INVALID_HANDLE_VALUE || GetFileType(r->file) != FILE_TYPE_DISK || !GetFileSizeEx(r->file, &size) ||
+        (r->fileSize = UINT64(size.QuadPart), !ReadHeaders(*r, tracks))) {
         return {};
     }
     r->hwnd = hwnd;
-    current = std::move(r);
+    reader = std::thread([r = std::move(r)] {
+        SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);  // its reads yield to playback's
+        r->Run(stopReader);
+    });
     return tracks;
 }
 
-void WrapMkvStream(ComPtr<IMFByteStream>& stream) {
-    if (current) stream = Microsoft::WRL::Make<Stream>(stream.Get(), current);
+void SeekMkvSubtitles(double seconds) {
+    seekTarget = std::max(0.0, seconds);
 }
 
 void StopMkvSubtitles() {
-    if (!current) return;
-    AcquireSRWLockExclusive(&current->lock);
-    current->hwnd = nullptr;
-    ReleaseSRWLockExclusive(&current->lock);
-    current.reset();
+    seekTarget = -1;
+    if (!reader.joinable()) return;
+    stopReader = true;
+    reader.join();
+    stopReader = false;
 }
