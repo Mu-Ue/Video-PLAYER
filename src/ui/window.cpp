@@ -1726,9 +1726,11 @@ bool StartPlayer(HINSTANCE instance, const std::vector<std::wstring>& files, int
     g.showCmd = showCmd;
     g.hwnd = CreateMainWindow(instance);
     if (!g.hwnd) return false;
+    // On failure, destroying the window stops the player's threads, which must not outlive it.
     if (!InitPlayer(g.hwnd) || !InitComposition()) {
         MessageBoxW(nullptr, L"Can't start: Direct3D 11 or Media Foundation isn't available.", kAppName,
                     MB_OK | MB_ICONERROR);
+        DestroyWindow(g.hwnd);
         return false;
     }
     if (std::none_of(files.begin(), files.end(), [](const std::wstring& f) { return !IsSubtitleFile(f); })) {
@@ -1736,7 +1738,10 @@ bool StartPlayer(HINSTANCE instance, const std::vector<std::wstring>& files, int
         Layout();
         return true;
     }
-    if (!OpenFiles(files)) return false;
+    if (!OpenFiles(files)) {
+        DestroyWindow(g.hwnd);
+        return false;
+    }
     // The window shows when the video's size is known (LOADEDMETADATA) so it opens at the right size.
     SetTimer(g.hwnd, kShowTimer, kShowFallbackMs, nullptr);
     return true;
