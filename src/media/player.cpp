@@ -376,6 +376,30 @@ void OpenKeyFrames(const std::wstring& path) {
     }
 }
 
+// Whether a path names a device, such as a pipe, console or raw volume, rather than a file: "\\.\…", "\??\…",
+// "\\?\…" other than the "\\?\C:\…" and "\\?\UNC\…" forms of long file paths, or a "\\host\pipe\…" or mailslot
+// share. Either slash works.
+bool IsDevicePath(const std::wstring& path) {
+    const auto slash = [&](size_t i) { return i < path.size() && (path[i] == L'\\' || path[i] == L'/'); };
+    if (path.size() < 4 || !slash(0)) return false;
+    if (path[1] == L'?' && path[2] == L'?' && slash(3)) return true;
+    if (!slash(1)) return false;  // a rooted path, "\dir\…"
+    size_t host = 2;  // where the server name of a UNC path starts
+    if ((path[2] == L'.' || path[2] == L'?') && slash(3)) {
+        if (path[2] == L'.') return true;
+        if (path.size() > 6 && path[5] == L':' && slash(6)) return false;  // \\?\C:\…
+        if (_wcsnicmp(path.c_str() + 4, L"UNC", 3) != 0 || !slash(7)) return true;
+        host = 8;
+    }
+    const size_t share = path.find_first_of(L"\\/", host);
+    if (share == std::wstring::npos) return false;
+    const size_t end = std::min(path.find_first_of(L"\\/", share + 1), path.size());
+    const auto isShare = [&](const wchar_t* name) {
+        return CompareStringOrdinal(path.c_str() + share + 1, int(end - share - 1), name, -1, TRUE) == CSTR_EQUAL;
+    };
+    return isShare(L"pipe") || isShare(L"mailslot");
+}
+
 // Takes a string the callee allocated.
 std::wstring Take(LPWSTR text) {
     std::wstring s = text ? text : L"";
@@ -590,6 +614,7 @@ void ShutdownPlayer() {
 }
 
 HRESULT OpenVideo(const std::wstring& path) {
+    if (IsDevicePath(path)) return E_ACCESSDENIED;
     // A byte stream keeps the source a local file: the path is never parsed as a URL.
     ComPtr<IMFByteStream> stream;
     HRESULT hr = MFCreateFile(MF_ACCESSMODE_READ, MF_OPENMODE_FAIL_IF_NOT_EXIST, MF_FILEFLAGS_NONE, path.c_str(),
