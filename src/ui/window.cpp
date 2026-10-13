@@ -1141,6 +1141,7 @@ void ShowMenu(Control which) {
 double RequestSeek(double seconds, bool fast) {
     g.seekTarget = std::max(0.0, std::isfinite(g.duration) ? std::min(seconds, g.duration) : seconds);
     g.seekFast = fast;
+    SeekMkvSubtitles(g.seekTarget);
     if (g.seekBusy) {
         g.seekQueued = true;
     } else {
