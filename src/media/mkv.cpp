@@ -22,7 +22,7 @@ enum : UINT32 {
     kContentEncodings = 0x6D80, kContentEncoding = 0x6240, kContentEncodingType = 0x5033,
     kContentCompression = 0x5034, kContentCompAlgo = 0x4254, kContentCompSettings = 0x4255,
     kCues = 0x1C53BB6B, kCuePoint = 0xBB, kCueTime = 0xB3, kCueTrackPositions = 0xB7, kCueTrack = 0xF7,
-    kCueClusterPosition = 0xF1, kCueRelativePosition = 0xF0, kCluster = 0x1F43B675,
+    kCueClusterPosition = 0xF1, kCueRelativePosition = 0xF0, kCueDuration = 0xB2, kCluster = 0x1F43B675,
     kTimestamp = 0xE7, kBlockGroup = 0xA0, kBlock = 0xA1, kSimpleBlock = 0xA3, kBlockDuration = 0x9B,
 };
 constexpr UINT64 kUnknown = ~UINT64(0);  // an element size that isn't given, or a position that isn't
@@ -103,9 +103,9 @@ struct Element {
     UINT64 at, data, size;
 };
 
-// A position the index lists: its time, its cluster and the block's position in that, if given.
+// A position the index lists: its time, its cluster, and the block's position in that and its duration, if given.
 struct Entry {
-    UINT64 time, cluster, relative;
+    UINT64 time, cluster, relative, duration = kUnknown;
 };
 
 std::atomic<double> seekTarget = -1;  // the seek the reader is yet to take, in seconds, if not negative
@@ -379,6 +379,9 @@ struct Reader {
         std::vector<bool> done(blocks.size());
         std::vector<std::pair<const TextTrack*, double>> last(blocks.size());  // the track and end of each's last cue
         size_t left = blocks.size(), next = 0;
+        const bool timed = std::all_of(blocks.begin(), blocks.end(), [](const Entry& b) {
+            return b.duration != kUnknown && b.duration <= kUnknown - b.time;
+        });
         const auto read = [&](size_t i) {
             if (done[i]) return;
             done[i] = true;
@@ -407,10 +410,15 @@ struct Reader {
                 next = size_t(std::upper_bound(blocks.begin(), blocks.end(), units,
                                                [](UINT64 u, const Entry& b) { return u < b.time; }) -
                               blocks.begin());
-                // Back from there until each track has a cue that ended by then, for one that still shows.
+                // The ones before it that still show then: those the index gives as lasting until then, or back
+                // until each track has a cue that ended by then if it gives no durations.
                 std::vector<const TextTrack*> ended;
                 for (size_t i = next; i-- > 0 && ended.size() < tracks.size() && seekTarget < 0 &&
                                       !stop.load(std::memory_order_relaxed);) {
+                    if (timed) {
+                        if (blocks[i].time + blocks[i].duration > units) read(i);
+                        continue;
+                    }
                     read(i);
                     const auto [track, end] = last[i];
                     if (track && end <= t && std::find(ended.begin(), ended.end(), track) == ended.end()) {
@@ -476,17 +484,18 @@ struct Reader {
                     if (id2 == kCueTime) cueTime = UInt(d2, s2);
                     if (id2 != kCueTrackPositions) return;
                     TextTrack* t = nullptr;
-                    UINT64 cluster = kUnknown, relative = kUnknown;
+                    UINT64 cluster = kUnknown, relative = kUnknown, duration = kUnknown;
                     Children(d2, d2 + s2, [&](UINT32 field, const BYTE* v, size_t n) {
                         if (field == kCueTrack) t = Find(UInt(v, n));
                         if (field == kCueClusterPosition) cluster = segment + UInt(v, n);
                         if (field == kCueRelativePosition) relative = UInt(v, n);
+                        if (field == kCueDuration) duration = UInt(v, n);
                     });
                     if (cluster == kUnknown) return;
                     clusters.push_back({0, cluster, kUnknown});
                     if (!t) return;
                     t->listed = true;
-                    blocks.push_back({0, cluster, relative});
+                    blocks.push_back({0, cluster, relative, duration});
                 });
                 for (size_t i = firstBlock; i < blocks.size(); ++i) blocks[i].time = cueTime;
                 for (size_t i = firstPoint; i < clusters.size(); ++i) clusters[i].time = cueTime;
