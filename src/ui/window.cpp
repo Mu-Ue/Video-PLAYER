@@ -117,6 +117,7 @@ struct Window {
     SIZE drawnSize{};
     float drawnScale = 0;
     Control drag = kNone;  // kSeek or kVolumeBar while dragging along it
+    bool controlsChanged = false;  // by a drag; a WM_APP_FRAME redraws them
     // The engine's state, kept here so drawing never waits on the engine. playing changes as soon as it is
     // asked to, then follows the engine's events.
     bool playing = false;
@@ -380,6 +381,13 @@ bool DrawControls() {
 // Redraws the controls if they show and changed, for a new time, play state or volume.
 void UpdateControls() {
     if (g.controlsShown && DrawControls()) g.dcomp->Commit();
+}
+
+// UpdateControls just before the next frame, for a drag: a fast mouse reports far more often than frames are shown,
+// and each redraw draws them all.
+void UpdateControlsAtFrame() {
+    g.controlsChanged = true;
+    RequestFrame();
 }
 
 // The panel sits right above the seek bar at the right, as tall as its longest column, up to seven and a half rows
@@ -869,7 +877,9 @@ void MovePreview(POINT pt) {
     }
 }
 
+// Just before the frame RequestFrame asked for.
 void OnFrame() {
+    if (std::exchange(g.controlsChanged, false)) UpdateControls();
     POINT pt;
     if (!g.previewShown || !GetCursorPos(&pt) || !ScreenToClient(g.hwnd, &pt)) return;
     UpdatePreview(pt);
@@ -1237,7 +1247,7 @@ void SeekToX(int x, bool fast) {
     if (!(duration > 0)) return;
     g.seekCheck = false;
     RequestSeek(std::clamp(double(x - r.left) / std::max(1L, r.right - r.left), 0.0, 1.0) * duration, fast);
-    UpdateControls();
+    UpdateControlsAtFrame();
 }
 
 // Sets the volume under x on the volume slider.
@@ -1245,7 +1255,7 @@ void SetVolumeToX(int x) {
     const RECT r = VolumeTrack();
     g.volume = SetVolume(std::clamp(double(x - r.left) / std::max(1L, r.right - r.left), 0.0, 1.0));
     g.muted = g.muted && g.volume == 0;
-    UpdateControls();
+    UpdateControlsAtFrame();
 }
 
 // Switches between the normal window and a borderless one covering its monitor.
