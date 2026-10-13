@@ -2,7 +2,7 @@
 
 # VideoPLAYER
 
-A lightweight, highly optimized video player for Windows, built natively on Win32, Media Foundation and DirectComposition, with hardware decoding and subtitles (`.srt` files or built into the video).
+A lightweight, highly optimized video player for Windows, built natively on Win32, Media Foundation and DirectComposition. Minimal by design, it focuses on doing the essentials well: hardware-accelerated playback and subtitles (`.srt` files or built into the video), without the clutter.
 
 ## Build
 
