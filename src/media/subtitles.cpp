@@ -177,7 +177,7 @@ bool LoadSubtitles(const std::wstring& path, Subtitles& subs) {
         inCue = false;
     };
     // Tolerant: a timing line starts a cue (the index line before it is not needed) and a blank line ends it.
-    for (size_t pos = 0; pos < text.size();) {
+    for (size_t pos = 0; pos < text.size() && parsed.cues.size() < kMaxCues;) {
         size_t nl = text.find(L'\n', pos);
         if (nl == std::wstring::npos) nl = text.size();
         std::wstring_view line(text.data() + pos, nl - pos);
