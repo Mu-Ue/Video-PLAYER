@@ -137,6 +137,8 @@ struct Window {
     bool fullscreen = false;
     WINDOWPLACEMENT placement{sizeof(WINDOWPLACEMENT)};  // of the window before it went fullscreen
     bool cursorHidden = false;  // while playing with the mouse idle
+    ULONGLONG lastWake = 0;     // GetTickCount64 at the last Wake
+    bool idleTimerSet = false;
     LPARAM lastMouse = -1;
     LONG lastClick = 0;  // message time of the last click on the video
 } g;
@@ -569,16 +571,28 @@ void SetCursorHidden(bool hidden) {
     SetCursorPos(pt.x, pt.y);  // makes Windows send WM_SETCURSOR now
 }
 
-// Shows the controls and the cursor until the mouse has been idle for a while.
+// Starts the idle timer over, to fire in ms.
+void SetIdleTimer(UINT ms) {
+    g.idleTimerSet = SetTimer(g.hwnd, kIdleTimer, ms, nullptr) != 0;
+}
+
+// Shows the controls and the cursor until the mouse has been idle for a while. A fast mouse wakes them often, so
+// this only notes when; the idle timer, once set, checks it.
 void Wake() {
     SetCursorHidden(false);
     SetControlsShown(true);
-    SetTimer(g.hwnd, kIdleTimer, kIdleMs, nullptr);
+    g.lastWake = GetTickCount64();
+    if (!g.idleTimerSet) SetIdleTimer(kIdleMs);
 }
 
 // Hides the controls and the cursor while playing, unless the mouse is on the controls or the menu bar.
 void OnIdle() {
     KillTimer(g.hwnd, kIdleTimer);
+    g.idleTimerSet = false;
+    if (const ULONGLONG idle = GetTickCount64() - g.lastWake; idle < kIdleMs) {
+        SetIdleTimer(UINT(kIdleMs - idle));
+        return;
+    }
     POINT pt;
     GetCursorPos(&pt);
     ScreenToClient(g.hwnd, &pt);
@@ -1311,7 +1325,7 @@ void OnMediaEvent(WPARAM event, LPARAM param) {
             SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
             UpdateSubtitles(false);
             UpdateControls();
-            SetTimer(g.hwnd, kIdleTimer, kIdleMs, nullptr);
+            SetIdleTimer(kIdleMs);
             break;
         case MF_MEDIA_ENGINE_EVENT_PAUSE:
         case MF_MEDIA_ENGINE_EVENT_ENDED:
