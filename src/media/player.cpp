@@ -53,7 +53,7 @@ class Notify final : public IMFMediaEngineNotify {
     }
 };
 
-// Forwards the cues of the video's own subtitles, also from Media Foundation threads, as they start showing.
+// Forwards the cues of the video's own subtitles, also from Media Foundation threads, shortly before they start.
 class TextNotify final : public IMFTimedTextNotify {
   public:
     HWND hwnd = nullptr;
@@ -202,6 +202,8 @@ HRESULT CreateEngines() {
         FAILED(g.timedText->RegisterNotifications(&g.textNotify))) {
         g.timedText.Reset();
     }
+    // Deliver cues ahead of time so each is ready before its first frame; cues keep their own start times.
+    if (g.timedText) g.timedText->SetCueTimeOffset(0.1);
     return hr;
 }
 
