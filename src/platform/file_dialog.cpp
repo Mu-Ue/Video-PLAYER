@@ -47,9 +47,20 @@ std::wstring RunFileDialog(HWND owner, bool subtitles) {
     HANDLE read = nullptr, write = nullptr;
     if (!CreatePipe(&read, &write, &sa, kMaxPath * sizeof(wchar_t))) return {};
     SetHandleInformation(read, HANDLE_FLAG_INHERIT, 0);
-    STARTUPINFOW si{sizeof(si)};
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = write;
+    STARTUPINFOEXW si{{sizeof(si)}};
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdOutput = write;
+    // The helper inherits the pipe and no other handle.
+    alignas(void*) BYTE list[64];
+    SIZE_T listSize = sizeof(list);
+    si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(list);
+    if (!InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &listSize) ||
+        !UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &write, sizeof(write),
+                                   nullptr, nullptr)) {
+        CloseHandle(read);
+        CloseHandle(write);
+        return {};
+    }
     // The helper runs in a job that is killed when this process exits, so its dialog never outlives the player.
     static const HANDLE job = [] {
         const HANDLE h = CreateJobObjectW(nullptr, nullptr);
@@ -62,8 +73,10 @@ std::wstring RunFileDialog(HWND owner, bool subtitles) {
         return h;
     }();
     PROCESS_INFORMATION pi{};
-    const BOOL started = job && CreateProcessW(exe, cmd.data(), nullptr, nullptr, TRUE, CREATE_SUSPENDED, nullptr,
-                                               nullptr, &si, &pi);
+    const BOOL started = job && CreateProcessW(exe, cmd.data(), nullptr, nullptr, TRUE,
+                                               CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr,
+                                               &si.StartupInfo, &pi);
+    DeleteProcThreadAttributeList(si.lpAttributeList);
     CloseHandle(write);
     if (!started) {
         CloseHandle(read);
