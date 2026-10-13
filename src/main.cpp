@@ -13,14 +13,30 @@
 namespace {
 
 // Loads DLLs only from System32 and never from network shares or low-integrity locations,
-// so a DLL planted next to the exe or in the current folder is never picked up.
+// so a DLL planted next to the exe or in the current folder is never picked up. Also fails fast on a bad
+// handle and loads no fonts from outside the Windows font folder.
 void HardenProcess() {
     SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
-    PROCESS_MITIGATION_IMAGE_LOAD_POLICY policy{};
-    policy.NoRemoteImages = 1;
-    policy.NoLowMandatoryLabelImages = 1;
-    policy.PreferSystem32Images = 1;
-    SetProcessMitigationPolicy(ProcessImageLoadPolicy, &policy, sizeof(policy));
+    PROCESS_MITIGATION_IMAGE_LOAD_POLICY image{};
+    image.NoRemoteImages = 1;
+    image.NoLowMandatoryLabelImages = 1;
+    image.PreferSystem32Images = 1;
+    SetProcessMitigationPolicy(ProcessImageLoadPolicy, &image, sizeof(image));
+    PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY handles{};
+    handles.RaiseExceptionOnInvalidHandleReference = 1;
+    handles.HandleExceptionsPermanentlyEnabled = 1;
+    SetProcessMitigationPolicy(ProcessStrictHandleCheckPolicy, &handles, sizeof(handles));
+    PROCESS_MITIGATION_FONT_DISABLE_POLICY fonts{};
+    fonts.DisableNonSystemFonts = 1;
+    SetProcessMitigationPolicy(ProcessFontDisablePolicy, &fonts, sizeof(fonts));
+}
+
+// The player (not the file dialog, which needs IMEs) also loads no legacy extension DLLs, such as AppInit DLLs
+// and global hooks that inject into every process.
+void HardenPlayer() {
+    PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY extensions{};
+    extensions.DisableExtensionPoints = 1;
+    SetProcessMitigationPolicy(ProcessExtensionPointDisablePolicy, &extensions, sizeof(extensions));
 }
 
 // Splits the command line into quoted or space-separated arguments. An unquoted line that names an existing
@@ -54,6 +70,7 @@ std::vector<std::wstring> ParseArgs(const wchar_t* s) {
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int showCmd) {
     HardenProcess();
     if (wcsncmp(cmdLine, L"--dialog ", 9) == 0) return DialogMain();
+    HardenPlayer();
     if (wcscmp(cmdLine, L"--register") == 0) {
         if (RegisterApp()) return 0;
         MessageBoxW(nullptr, L"Could not register the player with Windows.", kAppName, MB_ICONERROR);
