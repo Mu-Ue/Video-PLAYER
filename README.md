@@ -1,8 +1,14 @@
-<p align="center"><img src="docs/icon.png" width="128" alt="VideoPLAYER icon"></p>
+<p align="center">
+  <img src="docs/icon.png" width="128" alt="VideoPLAYER icon">
+</p>
 
-# VideoPLAYER
+<h1 align="center">VideoPLAYER</h1>
 
-A highly optimized and minimalistic video player for Windows, built with native tools.
+<p align="center">A highly optimized and minimalistic video player for Windows, built with native tools.</p>
+
+<p align="center">
+  <img src="docs/screenshot.png" alt="VideoPLAYER playing a video">
+</p>
 
 ## Build
 
