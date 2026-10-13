@@ -22,6 +22,7 @@
 #include <utility>
 
 #include "config.h"
+#include "media/mkv.h"
 #include "media/subtitles.h"
 #include "ui/overlay.h"
 
@@ -699,6 +700,7 @@ HRESULT OpenVideo(const std::wstring& path) {
     HRESULT hr = MFCreateFile(MF_ACCESSMODE_READ, MF_OPENMODE_FAIL_IF_NOT_EXIST, MF_FILEFLAGS_NONE, path.c_str(),
                               &stream);
     if (FAILED(hr)) return hr;
+    WrapMkvStream(stream);
     BSTR name = SysAllocString(path.c_str());  // the extension helps pick the container parser
     if (!name) return E_OUTOFMEMORY;
     hr = g.engine->SetSourceFromByteStream(stream.Get(), name);
