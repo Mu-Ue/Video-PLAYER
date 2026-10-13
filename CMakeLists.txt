@@ -9,6 +9,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)  # lets VS Code IntelliSense see the real 
 
 add_executable(VideoPLAYER WIN32
     src/main.cpp
+    src/media/mkv.cpp
     src/media/player.cpp
     src/media/subtitles.cpp
     src/platform/file_dialog.cpp

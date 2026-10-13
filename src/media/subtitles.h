@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <string>
+#include <string_view>
 #include <vector>
 
 // A run of italic and/or bold text within a cue.
@@ -25,6 +26,10 @@ struct Subtitles {
 
 // Reads an SRT file in UTF-8, UTF-16 or the ANSI code page. Returns false if it can't be read or has no cues.
 bool LoadSubtitles(const std::wstring& path, Subtitles& subs);
+
+// Sets the cue's text from its raw lines: keeps <i> and <b> as styles, takes {\an8} and the like as top and drops
+// other tags.
+void SetCueText(std::wstring_view raw, Cue& cue);
 
 // Adds a cue in start order, unless the same one is already there; returns true if added.
 bool AddCue(Subtitles& subs, Cue cue);

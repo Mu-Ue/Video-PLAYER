@@ -16,6 +16,7 @@
 #include <unordered_map>
 
 #include "config.h"
+#include "media/mkv.h"
 #include "media/player.h"
 #include "media/subtitles.h"
 #include "platform/file_dialog.h"
@@ -38,12 +39,13 @@ constexpr float kFadeSeconds = 0.2f;    // of the controls
 // The icon popped up in the middle: in by kFlashIn, out from kFlashOut to kFlashEnd, in seconds.
 constexpr float kFlashIn = 0.15f, kFlashOut = 0.55f, kFlashEnd = 0.8f;
 
-// A subtitle track: one of the video's own, whose cues are added as they show, or an SRT file.
+// A subtitle track: one of the video's own, whose cues are added as they are read or show, or an SRT file.
 struct SubtitleTrack {
     std::wstring label;
     std::wstring path;  // of the file; empty for the video's own
     DWORD id = 0;       // of the video's own
     Subtitles subs;
+    bool read = false;  // one of the video's own that the player reads from the file itself
 };
 
 // A column of the track panel.
@@ -935,7 +937,7 @@ void ShowVideoError(LPARAM code) {
 void SelectSubtitle(int index) {
     if (index >= 0) {
         SubtitleTrack& track = g.tracks[size_t(index)];
-        if (track.path.empty()) SelectSubtitleTrack(track.id);
+        if (track.path.empty() && !track.read) SelectSubtitleTrack(track.id);
         g.lastSubtitle = index;
     }
     g.subtitle = index;
@@ -1005,13 +1007,19 @@ bool OpenVideoFile(const std::wstring& path) {
     g.subtitle = g.lastSubtitle = g.audioTrack = -1;
     g.ownTrackSelected = false;
     g.audio.clear();
-    // Drop any cues of the previous video still queued.
+    // Stop reading the previous video's subtitles and drop any of its cues still queued.
+    StopMkvSubtitles();
     for (MSG msg; PeekMessageW(&msg, g.hwnd, WM_APP_SUBTITLE_CUE, WM_APP_SUBTITLE_CUE, PM_REMOVE);) {
         delete reinterpret_cast<Cue*>(msg.lParam);
     }
+    for (MSG msg; PeekMessageW(&msg, g.hwnd, WM_APP_SUBTITLE_CUES, WM_APP_SUBTITLE_CUES, PM_REMOVE);) {
+        delete reinterpret_cast<std::vector<Cue>*>(msg.lParam);
+    }
+    for (const Track& t : StartMkvSubtitles(path, g.hwnd)) g.tracks.push_back({TrackLabel(t), L"", t.id, {}, true});
     AddSidecarSubtitles(path);
     ShowSubtitles();
     HideOsd();
+    if (HasSubtitles() && g.tracks[0].read) ShowOsd(L"Subtitles available (S)");
     SetWindowTextW(g.hwnd, FileName(path).c_str());
     g.title = FileName(path);
     g.title = g.title.substr(0, g.title.find_last_of(L'.'));
@@ -1046,6 +1054,7 @@ void AddSubtitles() {
 // The video has subtitle tracks of its own, listed before the files. They start off, as they are often in another
 // language or for the hard of hearing, but the first one is selected in the engine so S can show its cues.
 void OnSubtitleTrack() {
+    if (HasSubtitles() && g.tracks[0].read) return;  // the player reads them from the file itself
     size_t own = size_t(std::count_if(g.tracks.begin(), g.tracks.end(),
                                       [](const SubtitleTrack& t) { return t.path.empty(); }));
     const size_t before = own;
@@ -1071,10 +1080,20 @@ void OnSubtitleTrack() {
 void OnSubtitleCue(WPARAM track, LPARAM cue) {
     const std::unique_ptr<Cue> owned(reinterpret_cast<Cue*>(cue));
     const auto it = std::find_if(g.tracks.begin(), g.tracks.end(),
-                                 [&](const SubtitleTrack& t) { return t.path.empty() && t.id == DWORD(track); });
+                                 [&](const SubtitleTrack& t) { return t.path.empty() && !t.read && t.id == DWORD(track); });
     if (it != g.tracks.end() && AddCue(it->subs, std::move(*owned)) && it - g.tracks.begin() == g.subtitle) {
         ShowSubtitles();
     }
+}
+
+void OnSubtitleCues(WPARAM track, LPARAM cues) {
+    const std::unique_ptr<std::vector<Cue>> owned(reinterpret_cast<std::vector<Cue>*>(cues));
+    const auto it = std::find_if(g.tracks.begin(), g.tracks.end(),
+                                 [&](const SubtitleTrack& t) { return t.read && t.id == DWORD(track); });
+    if (it == g.tracks.end()) return;
+    bool added = false;
+    for (Cue& cue : *owned) added |= AddCue(it->subs, std::move(cue));
+    if (added && it - g.tracks.begin() == g.subtitle) ShowSubtitles();
 }
 
 // Plays the audio track or shows the subtitle track (0 for off) in the panel's column and row.
@@ -1387,6 +1406,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_APP_SUBTITLE_CUE:
             OnSubtitleCue(wp, lp);
             return 0;
+        case WM_APP_SUBTITLE_CUES:
+            OnSubtitleCues(wp, lp);
+            return 0;
         case WM_APP_FRAME:
             OnFrame();
             return 0;
@@ -1553,6 +1575,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_DESTROY:
+            StopMkvSubtitles();
             ShutdownPlayer();
             SetThreadExecutionState(ES_CONTINUOUS);
             PostQuitMessage(0);

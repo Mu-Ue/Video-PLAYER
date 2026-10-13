@@ -104,8 +104,9 @@ void ApplyOverrides(std::wstring_view codes, Cue& cue, bool& italic, bool& bold)
     }
 }
 
-// Sets the cue's text from its raw lines: keeps <i> and <b> as styles and drops other tags.
-void SetText(std::wstring_view raw, Cue& cue) {
+}  // namespace
+
+void SetCueText(std::wstring_view raw, Cue& cue) {
     std::wstring& out = cue.text;
     bool italic = false, bold = false;      // style of the text that follows
     bool spanItalic = false, spanBold = false;  // style of the text since spanStart
@@ -157,8 +158,6 @@ void SetText(std::wstring_view raw, Cue& cue) {
     for (StyleSpan& s : cue.spans) s.length = std::min(s.length, UINT32(std::max(out.size(), size_t(s.start)) - s.start));
 }
 
-}  // namespace
-
 bool LoadSubtitles(const std::wstring& path, Subtitles& subs) {
     std::string bytes;
     if (!ReadAll(path, bytes)) return false;
@@ -171,7 +170,7 @@ bool LoadSubtitles(const std::wstring& path, Subtitles& subs) {
     bool inCue = false;
     const auto finish = [&] {
         if (inCue && cue.end > cue.start) {
-            SetText(raw, cue);
+            SetCueText(raw, cue);
             if (!cue.text.empty()) parsed.cues.push_back(std::move(cue));
         }
         inCue = false;
