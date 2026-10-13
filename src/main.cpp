@@ -32,11 +32,14 @@ void HardenProcess() {
 }
 
 // The player (not the file dialog, which needs IMEs) also loads no legacy extension DLLs, such as AppInit DLLs
-// and global hooks that inject into every process.
+// and global hooks that inject into every process, and never makes memory executable.
 void HardenPlayer() {
     PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY extensions{};
     extensions.DisableExtensionPoints = 1;
     SetProcessMitigationPolicy(ProcessExtensionPointDisablePolicy, &extensions, sizeof(extensions));
+    PROCESS_MITIGATION_DYNAMIC_CODE_POLICY code{};
+    code.ProhibitDynamicCode = 1;
+    SetProcessMitigationPolicy(ProcessDynamicCodePolicy, &code, sizeof(code));
 }
 
 // Splits the command line into quoted or space-separated arguments. An unquoted line that names an existing
