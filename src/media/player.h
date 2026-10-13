@@ -50,6 +50,9 @@ bool SelectSubtitleTrack(DWORD id);
 SIZE VideoSize();  // display size in pixels, or 0 x 0
 // Sizes the video's swap chain; the first call creates it.
 void SetVideoSize(int width, int height);
+// Has frames drawn at the video's size on screen, at most the swap chain's, and stretched to the swap chain's,
+// so the visual's scaling back down to that size shows each pixel as drawn.
+void SetVideoTarget(int width, int height);
 // The swap chain, as content for a DirectComposition visual, or null before SetVideoSize.
 IUnknown* VideoSwapChain();
 

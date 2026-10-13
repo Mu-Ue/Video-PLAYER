@@ -886,9 +886,10 @@ SIZE ChainSize(SIZE v) {
     return Fit(v, mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top);
 }
 
-// Fits the video below the menu bar, keeping its aspect ratio. The engine renders it at the size it fills the
-// monitor at, which only changes with the video or the monitor, and composition scales that to the window, so
-// resizing and fullscreen take effect in the same frame as the window, with no wait on the engine.
+// Fits the video below the menu bar, keeping its aspect ratio. Its swap chain is the size it fills the monitor at,
+// which only changes with the video or the monitor, and composition scales that to the window, so resizing and
+// fullscreen take effect in the same frame as the window, with no wait on the engine. The engine's next frame is
+// then drawn at the size on screen, which composition shows pixel for pixel.
 void Layout() {
     RECT client;
     GetClientRect(g.hwnd, &client);
@@ -909,6 +910,7 @@ void Layout() {
         const SIZE s = Fit(v, cw, ah);
         const int x = (cw - s.cx) / 2, y = top + (ah - s.cy) / 2;
         g.videoRect = {x, y, x + s.cx, y + s.cy};
+        SetVideoTarget(s.cx, s.cy);
         g.video->SetTransform(D2D_MATRIX_3X2_F{float(s.cx) / chain.cx, 0, 0, float(s.cy) / chain.cy, float(x),
                                                float(y)});
         // The swap chain exists once it has a size.

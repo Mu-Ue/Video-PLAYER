@@ -6,7 +6,7 @@
 #include <avrt.h>
 #include <d3d11_4.h>
 #include <dcomp.h>
-#include <dxgi1_2.h>
+#include <dxgi1_3.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfmediaengine.h>
@@ -139,7 +139,9 @@ struct {
     // The swap chain, guarded by lock: the render thread presents into it and the window thread sizes it.
     SRWLOCK lock = SRWLOCK_INIT;
     ComPtr<IDXGISwapChain1> chain;
+    ComPtr<IDXGISwapChain2> chain2;  // null before Windows 8.1: then the whole swap chain is drawn
     UINT width = 0, height = 0;
+    UINT drawWidth = 0, drawHeight = 0;  // the part drawn: the video's size on screen, at most the swap chain's
     std::atomic<bool> redraw = false;  // present the current frame even if it isn't new; set with Redraw
     std::atomic<bool> frameWanted = false;  // post WM_APP_FRAME before the next frame; set with RequestFrame
     HANDLE stop = nullptr;             // tells the render thread and the previewer to exit
@@ -196,14 +198,17 @@ HRESULT CreateEngines() {
     return hr;
 }
 
-// Copies the engine's current frame into the w x h swap chain and presents it.
-bool PresentFrame(IMFMediaEngineEx* engine, IDXGISwapChain1* chain, UINT w, UINT h) {
+// Copies the engine's current frame into the top left w x h of the swap chain and presents just that, which the
+// swap chain stretches to its whole size. Call with lock held.
+bool PresentFrame(UINT w, UINT h) {
     ComPtr<ID3D11Texture2D> buffer;
-    if (FAILED(chain->GetBuffer(0, IID_PPV_ARGS(&buffer)))) return false;
+    if (FAILED(g.chain->GetBuffer(0, IID_PPV_ARGS(&buffer)))) return false;
     const RECT dest{0, 0, LONG(w), LONG(h)};
     const MFARGB black{0, 0, 0, 255};
-    if (FAILED(engine->TransferVideoFrame(buffer.Get(), nullptr, &dest, &black))) return false;
-    return SUCCEEDED(chain->Present(0, 0));
+    if (FAILED(g.engine->TransferVideoFrame(buffer.Get(), nullptr, &dest, &black))) return false;
+    // Takes effect with this present, so the picture and its size change in the same compositor frame.
+    if (g.chain2 && FAILED(g.chain2->SetSourceSize(w, h))) return false;
+    return SUCCEEDED(g.chain->Present(0, 0));
 }
 
 // Sizes a swap chain for DirectComposition, creating it on the first call. Call with lock held.
@@ -328,7 +333,9 @@ void RenderLoop() {
         LONGLONG pts;
         if (g.engine->OnVideoStreamTick(&pts) == S_OK || g.redraw) {
             AcquireSRWLockExclusive(&g.lock);
-            g.redraw = !g.chain || !PresentFrame(g.engine.Get(), g.chain.Get(), g.width, g.height);
+            const bool part = g.chain2 && g.drawWidth && g.drawHeight;
+            g.redraw = !g.chain || !PresentFrame(part ? std::min(g.drawWidth, g.width) : g.width,
+                                                 part ? std::min(g.drawHeight, g.height) : g.height);
             ReleaseSRWLockExclusive(&g.lock);
             if (!g.redraw) idle = 0;
         }
@@ -601,6 +608,7 @@ void ShutdownPlayer() {
     if (g.renderer.joinable()) g.renderer.join();
     if (g.previewer.joinable()) g.previewer.join();
     g.previewFence.Reset();
+    g.chain2.Reset();
     g.chain.Reset();
     g.ready.Reset();
     g.taken.Reset();
@@ -738,9 +746,20 @@ void SetVideoSize(int width, int height) {
     AcquireSRWLockExclusive(&g.lock);
     const HRESULT hr = SizeChain(g.chain, UINT(width), UINT(height));
     if (SUCCEEDED(hr)) {
+        if (!g.chain2) g.chain.As(&g.chain2);
         g.width = UINT(width);
         g.height = UINT(height);
         Redraw();  // at the new size, even while paused
+    }
+    ReleaseSRWLockExclusive(&g.lock);
+}
+
+void SetVideoTarget(int width, int height) {
+    AcquireSRWLockExclusive(&g.lock);
+    if (UINT(width) != g.drawWidth || UINT(height) != g.drawHeight) {
+        g.drawWidth = UINT(std::max(width, 0));
+        g.drawHeight = UINT(std::max(height, 0));
+        Redraw();
     }
     ReleaseSRWLockExclusive(&g.lock);
 }
