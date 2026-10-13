@@ -10,16 +10,9 @@
   <img src="docs/screenshot.png" alt="VideoPLAYER playing a video">
 </p>
 
-## Build
+## Download
 
-Requires Visual Studio or Build Tools with the C++ workload. Run `build.bat`, or from a Developer Command Prompt:
-
-```
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-```
-
-Output: `build\VideoPLAYER.exe`, a single file with no dependencies.
+Get `VideoPLAYER.exe` from the [latest release](https://github.com/Mu-Ue/VideoPLAYER/releases/latest). It's a single file with no dependencies.
 
 ## Use
 
@@ -49,3 +42,14 @@ Move the mouse to show the controls. Hover over the seek bar to preview any fram
 | `Alt+F`                | File menu               |
 | `Alt+S`                | Subtitles menu          |
 | `Esc`                  | Exit fullscreen / close |
+
+## Build
+
+Requires Visual Studio or Build Tools with the C++ workload. Run `build.bat`, or from a Developer Command Prompt:
+
+```
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
+
+The output is `build\VideoPLAYER.exe`.
