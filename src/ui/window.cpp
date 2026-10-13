@@ -75,7 +75,6 @@ struct Window {
     ComPtr<IDCompositionVisual> previewShadow, previewFrame, previewImage, previewTime;
     ComPtr<IDCompositionRectangleClip> previewClip;
     bool previewShown = false;
-    bool previewChanged = false;  // its picture changed since the last commit; a WM_APP_FRAME is coming
     int previewX = INT_MIN;  // the seek bar position it shows
     std::wstring previewText;
     SIZE previewTextSize{};
@@ -757,8 +756,7 @@ ComPtr<IDCompositionSurface> CopyPreviewPicture(HANDLE handle) {
 }
 
 // Keeps a decoded picture, and shows it unless the wanted one already shows: one the mouse moved on from while it
-// decoded is still the nearest there is, so a fast sweep updates as often as a slow one. It shows with the next
-// frame's placing, as a second commit in a frame waits for the next one.
+// decoded is still the nearest there is, so a fast sweep updates as often as a slow one.
 void OnPreviewPicture() {
     LONGLONG time;
     const HANDLE handle = TakePreviewPicture(time);
@@ -769,15 +767,13 @@ void OnPreviewPicture() {
     if (g.previewOnScreen == g.previewWanted) return;
     g.previewImage->SetContent(surface.Get());
     g.previewOnScreen = time;
-    if (g.previewShown) {
-        g.previewChanged = true;
-        RequestFrame();
-    }
+    if (g.previewShown) g.dcomp->Commit();
 }
 
 // While the mouse is on the seek bar, or dragging it, shows the frame and the time at pt's x above it, like
-// YouTube's; else hides them. Returns whether they show.
-bool UpdatePreview(POINT pt) {
+// YouTube's; else hides them. It moves with each mouse move: placing it only sets a few properties, and composition
+// shows the latest of them once per frame.
+void UpdatePreview(POINT pt) {
     const bool show = g.controlsShown && g.duration > 0 && (g.drag == kSeek || (!g.drag && g.hot == kSeek));
     if (!show) {
         if (g.previewShown) {
@@ -787,7 +783,7 @@ bool UpdatePreview(POINT pt) {
             g.previewShown = false;
             g.dcomp->Commit();
         }
-        return false;
+        return;
     }
     RECT seek = ControlRect(kSeek);
     OffsetRect(&seek, 0, -ControlsTop());
@@ -799,10 +795,8 @@ bool UpdatePreview(POINT pt) {
     // A move along y only leaves it where it is.
     if (g.previewShown && x == g.previewX && picture.cx == g.previewPictureSize.cx &&
         picture.cy == g.previewPictureSize.cy) {
-        if (std::exchange(g.previewChanged, false)) g.dcomp->Commit();  // a new picture
-        return true;
+        return;
     }
-    g.previewChanged = false;  // committed below
     if (x != g.previewX) {
         g.previewX = x;
         const double seconds = double(x - left) / std::max(1, right - left) * g.duration;
@@ -864,25 +858,11 @@ bool UpdatePreview(POINT pt) {
         g.previewShown = true;
     }
     g.dcomp->Commit();
-    return true;
-}
-
-// UpdatePreview for a mouse move. A shown preview moves once per frame shown, just before it, to where the mouse is
-// by then: a fast mouse reports far more often than frames are shown. A hidden one needs no pacing.
-void MovePreview(POINT pt) {
-    if (g.previewShown) {
-        RequestFrame();
-    } else {
-        UpdatePreview(pt);
-    }
 }
 
 // Just before the frame RequestFrame asked for.
 void OnFrame() {
     if (std::exchange(g.controlsChanged, false)) UpdateControls();
-    POINT pt;
-    if (!g.previewShown || !GetCursorPos(&pt) || !ScreenToClient(g.hwnd, &pt)) return;
-    UpdatePreview(pt);
 }
 
 // The video's swap chain size: the video v fitted to the window's monitor.
@@ -1558,7 +1538,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SetHot(HitTest({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}));
                 SetPanelHot({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
             }
-            MovePreview({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+            UpdatePreview({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
             return 0;
         case WM_MOUSELEAVE:
             g.tracking = false;
