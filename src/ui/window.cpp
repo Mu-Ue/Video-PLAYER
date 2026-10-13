@@ -26,7 +26,7 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
-enum : UINT_PTR { kSubtitleTimer = 1, kOsdTimer, kIdleTimer, kShowTimer };
+enum : UINT_PTR { kOsdTimer = 1, kIdleTimer, kShowTimer };
 enum : UINT { kCmdOpen = 1, kCmdAddSubtitles };
 // The buttons on the menu bar, then the controls: buttons left to right, the seek bar, the volume slider, and two
 // labels.
@@ -63,14 +63,13 @@ struct PanelGeometry {
 struct Window {
     HWND hwnd = nullptr;
     int showCmd = SW_SHOWNORMAL;
-    // Bottom to top: black background, video, subtitles at the bottom and top, seek / volume feedback, the icon
-    // popped up in the middle, the controls over the bottom of the video, the track panel above them, and the menu
-    // bar, which the video doesn't overlap. The seek bar preview is part of the controls.
+    // Bottom to top: black background, video (with the subtitles drawn into each frame), seek / volume feedback,
+    // the icon popped up in the middle, the controls over the bottom of the video, the track panel above them, and
+    // the menu bar, which the video doesn't overlap. The seek bar preview is part of the controls.
     ComPtr<ID3D11Device> device;  // for composition and the overlay
     ComPtr<IDCompositionDevice> dcomp;
     ComPtr<IDCompositionTarget> target;
-    ComPtr<IDCompositionVisual> root, background, video, subtitleBottom, subtitleTop, osd, flash, controls, panel,
-        menuBar;
+    ComPtr<IDCompositionVisual> root, background, video, osd, flash, controls, panel, menuBar;
     // The preview's shadow, its frame, its rounded clip and the scaled image in it, and its time below.
     ComPtr<IDCompositionVisual> previewShadow, previewFrame, previewImage, previewTime;
     ComPtr<IDCompositionRectangleClip> previewClip;
@@ -104,8 +103,6 @@ struct Window {
     bool panelOpen = false;
     PanelColumn columns[2];
     int hotColumn = -1, hotRow = -1;
-    std::vector<size_t> shown;  // indices of the cues on screen
-    float subtitleHeight = 0;   // of the bottom ones
     std::wstring osdText;
     bool osdCentered = false;  // at the top center rather than the top left
     Control hot = kNone;    // under the mouse
@@ -152,8 +149,10 @@ bool HasSubtitles() { return !g.tracks.empty(); }
 // Whether the track panel has anything to choose from.
 bool HasTrackChoice() { return HasSubtitles() || g.audio.size() >= 2; }
 
-// The cues of the subtitles shown, or null if off.
-const Subtitles* ShownSubtitles() { return g.subtitle >= 0 ? &g.tracks[size_t(g.subtitle)].subs : nullptr; }
+// Has the player draw the cues of the subtitle track shown, or none, into the frames from now on.
+void ShowSubtitles() {
+    SetSubtitles(g.subtitle >= 0 ? std::make_shared<const Subtitles>(g.tracks[size_t(g.subtitle)].subs) : nullptr);
+}
 
 bool IsSubtitleFile(const std::wstring& path) {
     return path.size() >= 4 && CompareStringOrdinal(path.c_str() + path.size() - 4, 4, L".srt", 4, TRUE) == CSTR_EQUAL;
@@ -533,12 +532,14 @@ void SetHot(Control c) {
     g.dcomp->Commit();
 }
 
-// Keeps the bottom subtitles above the controls while they show.
-void PlaceBottomSubtitles() {
+// Tells the player where the subtitles go: near the video's top and bottom edges, the bottom ones above the
+// controls while they show.
+void PlaceSubtitles() {
     const RECT& v = g.videoRect;
-    float y = v.bottom - (v.bottom - v.top) * 0.06f - g.subtitleHeight;
-    if (g.controlsShown) y = std::min(y, float(ControlRect(kSeek).top) - g.subtitleHeight);
-    g.subtitleBottom->SetOffsetY(std::round(std::max(float(v.top), y)));
+    const float w = float(v.right - v.left), h = float(v.bottom - v.top), margin = h * 0.06f;
+    SubtitleLayout layout{w, std::max(12.0f, TextScale() * 0.05f), w * 0.9f, margin, h - margin};
+    if (g.controlsShown) layout.bottom = std::min(layout.bottom, float(ControlRect(kSeek).top - v.top));
+    SetSubtitleLayout(layout);
 }
 
 // Fades the controls in or out.
@@ -559,7 +560,7 @@ void SetControlsShown(bool shown) {
     } else {
         g.controlsFade->SetOpacity(to);
     }
-    PlaceBottomSubtitles();
+    PlaceSubtitles();
     g.dcomp->Commit();
 }
 
@@ -599,56 +600,6 @@ void OnIdle() {
     if (!g.playing || g.drag || g.panelOpen || IsOnBar(pt)) return;
     SetControlsShown(false);
     SetCursorHidden(true);
-}
-
-void DrawSubtitles() {
-    std::wstring text[2];  // bottom, top
-    std::vector<StyleSpan> spans[2];
-    const Subtitles* subs = ShownSubtitles();  // not null while cues are shown
-    for (const size_t i : g.shown) {
-        const Cue& cue = subs->cues[i];
-        std::wstring& t = text[cue.top];
-        if (!t.empty()) t += L'\n';
-        const UINT32 at = UINT32(t.size());
-        t += cue.text;
-        for (StyleSpan s : cue.spans) {
-            s.start += at;
-            spans[cue.top].push_back(s);
-        }
-    }
-    const RECT& v = g.videoRect;
-    const float videoW = float(v.right - v.left);
-    const float fontSize = std::max(12.0f, TextScale() * 0.05f), margin = (v.bottom - v.top) * 0.06f;
-    for (int top = 0; top < 2; ++top) {
-        IDCompositionVisual* visual = top ? g.subtitleTop.Get() : g.subtitleBottom.Get();
-        const SIZE s = DrawOutlinedText(g.dcomp.Get(), visual, text[top], spans[top], fontSize, videoW * 0.9f, true);
-        visual->SetOffsetX(std::round(v.left + (videoW - float(s.cx)) / 2));
-        if (top) {
-            visual->SetOffsetY(std::round(v.top + margin));
-        } else {
-            g.subtitleHeight = float(s.cy);
-            PlaceBottomSubtitles();
-        }
-    }
-}
-
-// Shows the cues for the current time and sets a timer for the next change. TIMEUPDATE events (4 a second
-// while playing) also call this, so a late timer never leaves a cue up long.
-void UpdateSubtitles(bool redraw) {
-    KillTimer(g.hwnd, kSubtitleTimer);
-    std::vector<size_t> active;
-    double next = INFINITY;
-    const double now = PlaybackTime();
-    if (const Subtitles* subs = ShownSubtitles(); subs && HasVideo()) next = ActiveCues(*subs, now, active);
-    if (redraw || active != g.shown) {
-        g.shown = std::move(active);
-        DrawSubtitles();
-        g.dcomp->Commit();
-    }
-    if (g.playing && std::isfinite(next)) {
-        SetTimer(g.hwnd, kSubtitleTimer, UINT(std::clamp(std::ceil((next - now) * 1000) + 1, 1.0, 3600000.0)),
-                 nullptr);
-    }
 }
 
 void DrawOsd() {
@@ -927,7 +878,7 @@ void Layout() {
     g.previewText.clear();  // redrawn on the next move, for a new DPI or size
     g.previewShadowSize = {};
     g.previewX = INT_MIN;
-    UpdateSubtitles(true);
+    PlaceSubtitles();
     if (!g.osdText.empty()) DrawOsd();
     g.dcomp->Commit();
 }
@@ -989,7 +940,7 @@ void SelectSubtitle(int index) {
     }
     g.subtitle = index;
     DrawPanel();
-    UpdateSubtitles(true);
+    ShowSubtitles();
 }
 
 // Adds an SRT file as a subtitle track, unless it is already one, and returns its index, or -1 if it can't be read.
@@ -1059,7 +1010,7 @@ bool OpenVideoFile(const std::wstring& path) {
         delete reinterpret_cast<Cue*>(msg.lParam);
     }
     AddSidecarSubtitles(path);
-    UpdateSubtitles(false);
+    ShowSubtitles();
     HideOsd();
     SetWindowTextW(g.hwnd, FileName(path).c_str());
     g.title = FileName(path);
@@ -1122,7 +1073,7 @@ void OnSubtitleCue(WPARAM track, LPARAM cue) {
     const auto it = std::find_if(g.tracks.begin(), g.tracks.end(),
                                  [&](const SubtitleTrack& t) { return t.path.empty() && t.id == DWORD(track); });
     if (it != g.tracks.end() && AddCue(it->subs, std::move(*owned)) && it - g.tracks.begin() == g.subtitle) {
-        UpdateSubtitles(true);
+        ShowSubtitles();
     }
 }
 
@@ -1212,7 +1163,6 @@ void Seek(double seconds) {
 void TogglePlay() {
     g.playing = !g.playing;
     SetPlaying(g.playing);
-    UpdateSubtitles(false);
     UpdateControls();
     ShowFlash(g.playing ? L"\xF5B0" : L"\xE769");
 }
@@ -1325,7 +1275,6 @@ void OnMediaEvent(WPARAM event, LPARAM param) {
             g.playing = IsPlaying();  // not if paused again since
             // Keep the display on while playing.
             SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
-            UpdateSubtitles(false);
             UpdateControls();
             SetIdleTimer(kIdleMs);
             break;
@@ -1333,7 +1282,6 @@ void OnMediaEvent(WPARAM event, LPARAM param) {
         case MF_MEDIA_ENGINE_EVENT_ENDED:
             g.playing = IsPlaying();
             SetThreadExecutionState(ES_CONTINUOUS);
-            UpdateSubtitles(false);
             Wake();
             UpdateControls();
             break;
@@ -1341,7 +1289,6 @@ void OnMediaEvent(WPARAM event, LPARAM param) {
             OnSeeked();
             [[fallthrough]];
         case MF_MEDIA_ENGINE_EVENT_TIMEUPDATE:
-            UpdateSubtitles(false);
             UpdateControls();
             break;
         case MF_MEDIA_ENGINE_EVENT_DURATIONCHANGE:
@@ -1475,7 +1422,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_TIMER:
             switch (wp) {
-                case kSubtitleTimer: UpdateSubtitles(false); break;
                 case kOsdTimer: HideOsd(); break;
                 case kShowTimer: ShowMainWindow(); break;
                 case kIdleTimer: OnIdle(); break;
@@ -1629,10 +1575,9 @@ bool InitComposition() {
     if (SUCCEEDED(hr)) hr = DCompositionCreateDevice(dxgi.Get(), IID_PPV_ARGS(&g.dcomp));
     if (SUCCEEDED(hr)) hr = g.dcomp->CreateTargetForHwnd(g.hwnd, TRUE, &g.target);
     if (SUCCEEDED(hr)) hr = g.dcomp->CreateVisual(&g.root);
-    for (IDCompositionVisual** v : {g.background.GetAddressOf(), g.video.GetAddressOf(),
-                                    g.subtitleBottom.GetAddressOf(), g.subtitleTop.GetAddressOf(),
-                                    g.osd.GetAddressOf(), g.flash.GetAddressOf(), g.controls.GetAddressOf(),
-                                    g.panel.GetAddressOf(), g.menuBar.GetAddressOf()}) {
+    for (IDCompositionVisual** v : {g.background.GetAddressOf(), g.video.GetAddressOf(), g.osd.GetAddressOf(),
+                                    g.flash.GetAddressOf(), g.controls.GetAddressOf(), g.panel.GetAddressOf(),
+                                    g.menuBar.GetAddressOf()}) {
         if (SUCCEEDED(hr)) hr = g.dcomp->CreateVisual(v);
         if (SUCCEEDED(hr)) hr = g.root->AddVisual(*v, FALSE, nullptr);  // in front of the previous ones
     }

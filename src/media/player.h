@@ -3,8 +3,11 @@
 #include <windows.h>
 #include <unknwn.h>
 
+#include <memory>
 #include <string>
 #include <vector>
+
+struct Subtitles;
 
 // Posted to the window for each media engine event: wParam is the MF_MEDIA_ENGINE_EVENT, lParam its first
 // parameter (the MF_MEDIA_ENGINE_ERR code for an error).
@@ -55,6 +58,18 @@ void SetVideoSize(int width, int height);
 void SetVideoTarget(int width, int height);
 // The swap chain, as content for a DirectComposition visual, or null before SetVideoSize.
 IUnknown* VideoSwapChain();
+
+// Where the subtitles go, in pixels of the video on screen, which is width wide.
+struct SubtitleLayout {
+    float width, fontSize, maxWidth;
+    float top;     // of the top cues
+    float bottom;  // of the bottom cues
+    bool operator==(const SubtitleLayout&) const = default;
+};
+// Has the cues of subs (null for none) drawn into each frame as it presents: the cues showing at the frame's own
+// time, as if burned into it, so they change with the frame on screen and never apart from it.
+void SetSubtitles(std::shared_ptr<const Subtitles> subs);
+void SetSubtitleLayout(const SubtitleLayout& layout);
 
 // The seek bar preview shows one picture for each 1/200 of the video (1 second at least): the key frame nearest
 // the span's middle, which needs no decoding up to it. Returns that key frame for a time, in 100 ns units.

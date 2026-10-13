@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <cmath>
 #include <memory>
 #include <thread>
@@ -22,6 +23,7 @@
 
 #include "config.h"
 #include "media/subtitles.h"
+#include "ui/overlay.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -142,6 +144,11 @@ struct {
     ComPtr<IDXGISwapChain2> chain2;  // null before Windows 8.1: then the whole swap chain is drawn
     UINT width = 0, height = 0;
     UINT drawWidth = 0, drawHeight = 0;  // the part drawn: the video's size on screen, at most the swap chain's
+    // The subtitles drawn into the frames, which the window sets under subsLock, counting each change in subsVersion.
+    SRWLOCK subsLock = SRWLOCK_INIT;
+    std::shared_ptr<const Subtitles> subs;
+    SubtitleLayout subsLayout{};
+    std::atomic<UINT> subsVersion = 0;
     std::atomic<bool> redraw = false;  // present the current frame even if it isn't new; set with Redraw
     std::atomic<bool> frameWanted = false;  // post WM_APP_FRAME before the next frame; set with RequestFrame
     HANDLE stop = nullptr;             // tells the render thread and the previewer to exit
@@ -198,14 +205,67 @@ HRESULT CreateEngines() {
     return hr;
 }
 
-// Copies the engine's current frame into the top left w x h of the swap chain and presents just that, which the
-// swap chain stretches to its whole size. Call with lock held.
-bool PresentFrame(UINT w, UINT h) {
+// The render thread's subtitles: the cues drawn into the frames from time `from` until `next` (100 ns units).
+struct FrameSubtitles {
+    FramePainter painter;
+    UINT version = UINT_MAX;
+    UINT width = 0;  // of the frames they are laid out for
+    LONGLONG from = LLONG_MAX, next = LLONG_MIN;
+    std::vector<size_t> shown;  // indices of the cues
+    POINT at[2]{};              // where the bottom and top ones go
+};
+
+// Draws the cues showing at time t, a frame's (negative before the first), into the painter's images for frames w
+// wide, unless they already are.
+void UpdateFrameSubtitles(FrameSubtitles& f, LONGLONG t, UINT w) {
+    const UINT version = g.subsVersion;
+    if (version == f.version && w == f.width && t >= f.from && t < f.next) return;
+    AcquireSRWLockShared(&g.subsLock);
+    const std::shared_ptr<const Subtitles> subs = g.subs;
+    const SubtitleLayout layout = g.subsLayout;
+    ReleaseSRWLockShared(&g.subsLock);
+    std::vector<size_t> active;
+    double next = INFINITY;
+    // Half a 100 ns unit past the frame, so a cue time that rounding puts just past it still counts as reached.
+    if (subs && t >= 0) next = ActiveCues(*subs, (double(t) + 0.5) / 1e7, active);
+    f.from = t;
+    f.next = t < 0 ? 0 : next < 1e11 ? LONGLONG(std::ceil(next * 1e7 - 0.5)) : LLONG_MAX;
+    if (version == f.version && w == f.width && active == f.shown) return;
+    f.version = version;
+    f.width = w;
+    f.shown = std::move(active);
+    std::wstring text[2];  // bottom, top
+    std::vector<StyleSpan> spans[2];
+    for (const size_t i : f.shown) {
+        const Cue& cue = subs->cues[i];
+        std::wstring& s = text[cue.top];
+        if (!s.empty()) s += L'\n';
+        const UINT32 at = UINT32(s.size());
+        s += cue.text;
+        for (StyleSpan span : cue.spans) {
+            span.start += at;
+            spans[cue.top].push_back(span);
+        }
+    }
+    // Frames are drawn at another size than on screen only before Windows 8.1.
+    const float scale = layout.width > 0 ? float(w) / layout.width : 1;
+    for (int top = 0; top < 2; ++top) {
+        const SIZE s =
+            f.painter.Prepare(top, text[top], spans[top], layout.fontSize * scale, layout.maxWidth * scale);
+        f.at[top].x = LONG(std::round((float(w) - float(s.cx)) / 2));
+        f.at[top].y = LONG(std::round(top ? layout.top * scale : std::max(0.0f, layout.bottom * scale - float(s.cy))));
+    }
+}
+
+// Copies the engine's current frame into the top left w x h of the swap chain, draws the subtitles over it and
+// presents just that, which the swap chain stretches to its whole size. Call with lock held.
+bool PresentFrame(UINT w, UINT h, FrameSubtitles& subtitles) {
     ComPtr<ID3D11Texture2D> buffer;
     if (FAILED(g.chain->GetBuffer(0, IID_PPV_ARGS(&buffer)))) return false;
     const RECT dest{0, 0, LONG(w), LONG(h)};
     const MFARGB black{0, 0, 0, 255};
     if (FAILED(g.engine->TransferVideoFrame(buffer.Get(), nullptr, &dest, &black))) return false;
+    subtitles.painter.Draw(buffer.Get(), subtitles.at);  // the frame still shows if they can't be
     // Takes effect with this present, so the picture and its size change in the same compositor frame.
     if (g.chain2 && FAILED(g.chain2->SetSourceSize(w, h))) return false;
     return SUCCEEDED(g.chain->Present(0, 0));
@@ -312,6 +372,9 @@ void RenderLoop() {
     constexpr int kLatchTicks = 30;  // frames to keep waiting for WM_APP_FRAME's moment after the last request
     const HANDLE events[] = {g.stop, g.renderWake};
     int idle = 0, latchGrace = 0;
+    FrameSubtitles subtitles;
+    subtitles.painter.Open(g.device.Get());
+    LONGLONG frameTime = -1;  // of the frame on screen
     for (;;) {
         if (idle >= kIdleTicks && (!g.engine->HasVideo() || (g.engine->IsPaused() && !g.redraw))) {
             if (WaitForMultipleObjects(2, events, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) break;
@@ -331,11 +394,18 @@ void RenderLoop() {
         // An event that came while awake restarts the grace.
         idle = WaitForSingleObject(g.renderWake, 0) == WAIT_OBJECT_0 ? 0 : idle + 1;
         LONGLONG pts;
-        if (g.engine->OnVideoStreamTick(&pts) == S_OK || g.redraw) {
-            AcquireSRWLockExclusive(&g.lock);
+        const bool fresh = g.engine->OnVideoStreamTick(&pts) == S_OK;
+        if (fresh || g.redraw) {
+            if (fresh) frameTime = pts;
+            // The subtitles are laid out outside the lock, so the window never waits for that.
+            AcquireSRWLockShared(&g.lock);
             const bool part = g.chain2 && g.drawWidth && g.drawHeight;
-            g.redraw = !g.chain || !PresentFrame(part ? std::min(g.drawWidth, g.width) : g.width,
-                                                 part ? std::min(g.drawHeight, g.height) : g.height);
+            const UINT w = part ? std::min(g.drawWidth, g.width) : g.width;
+            const UINT h = part ? std::min(g.drawHeight, g.height) : g.height;
+            ReleaseSRWLockShared(&g.lock);
+            UpdateFrameSubtitles(subtitles, frameTime, w);
+            AcquireSRWLockExclusive(&g.lock);
+            g.redraw = !g.chain || !w || !h || !PresentFrame(std::min(w, g.width), std::min(h, g.height), subtitles);
             ReleaseSRWLockExclusive(&g.lock);
             if (!g.redraw) idle = 0;
         }
@@ -610,6 +680,7 @@ void ShutdownPlayer() {
     g.previewFence.Reset();
     g.chain2.Reset();
     g.chain.Reset();
+    g.subs.reset();
     g.ready.Reset();
     g.taken.Reset();
     CloseKeyFrames();
@@ -765,6 +836,25 @@ void SetVideoTarget(int width, int height) {
 }
 
 IUnknown* VideoSwapChain() { return g.chain.Get(); }
+
+void SetSubtitles(std::shared_ptr<const Subtitles> subs) {
+    AcquireSRWLockExclusive(&g.subsLock);
+    g.subs.swap(subs);
+    ++g.subsVersion;
+    ReleaseSRWLockExclusive(&g.subsLock);
+    Redraw();  // even while paused
+}
+
+void SetSubtitleLayout(const SubtitleLayout& layout) {
+    AcquireSRWLockExclusive(&g.subsLock);
+    const bool changed = !(layout == g.subsLayout);
+    if (changed) {
+        g.subsLayout = layout;
+        ++g.subsVersion;
+    }
+    ReleaseSRWLockExclusive(&g.subsLock);
+    if (changed) Redraw();
+}
 
 bool IsPlaying() { return g.engine && !g.engine->IsPaused() && !g.engine->IsEnded(); }
 

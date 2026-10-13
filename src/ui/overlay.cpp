@@ -30,27 +30,43 @@ struct Target {
     UINT width, height;
 };
 
-struct {
-    ComPtr<ID3D11Device> device;
+// Direct2D on one device, for one thread, with what outlined text needs.
+struct TextKit {
     ComPtr<ID2D1Factory1> factory;
     ComPtr<ID2D1DeviceContext> context;
-    ComPtr<IDWriteFactory> dwrite;
     ComPtr<ID2D1SolidColorBrush> brush;
-    ComPtr<ID2D1LinearGradientBrush> shade;  // under the controls
-    ComPtr<ID2D1LinearGradientBrush> fade;   // over the bottom of a track panel column that scrolls
     ComPtr<ID2D1StrokeStyle> round;
     ComPtr<ID2D1Effect> shadow;  // under the outlined text
-    std::vector<Run> runs;  // of the text being drawn
+    std::vector<Run> runs;       // of the text being drawn
+    // The outlined text's format, for one size.
+    float textSize = 0;
+    ComPtr<IDWriteTextFormat> text;
+};
+
+struct {
+    ComPtr<ID3D11Device> device;
+    TextKit kit;
+    ComPtr<IDWriteFactory> dwrite;
+    ComPtr<ID2D1LinearGradientBrush> shade;  // under the controls
+    ComPtr<ID2D1LinearGradientBrush> fade;   // over the bottom of a track panel column that scrolls
     std::vector<Target> targets;
     // The text formats of the bars and controls, for one DPI scale.
     float scale = 0;
     ComPtr<IDWriteTextFormat> menu, time, title, icons, number, header, row, check;
     ComPtr<IDWriteInlineObject> ellipsis, rowEllipsis;
     ComPtr<IDWriteTypography> tabular;  // digits all one width, null until first used
-    // The outlined text's format, for one size.
-    float textSize = 0;
-    ComPtr<IDWriteTextFormat> text;
 } g;
+
+// The shared DirectWrite factory, which any thread can use.
+IDWriteFactory* DWrite() {
+    static const ComPtr<IDWriteFactory> factory = [] {
+        ComPtr<IDWriteFactory> f;
+        DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                            reinterpret_cast<IUnknown**>(f.GetAddressOf()));
+        return f;
+    }();
+    return factory.Get();
+}
 
 // Collects each glyph run's outline, so all outlines are stroked before any is filled and no stroke covers a
 // neighbor's fill.
@@ -80,11 +96,13 @@ class OutlineCollector final : public IDWriteTextRenderer {
         *pixels = 1;
         return S_OK;
     }
-    STDMETHODIMP DrawGlyphRun(void*, FLOAT x, FLOAT y, DWRITE_MEASURING_MODE, const DWRITE_GLYPH_RUN* run,
+    // context is the TextKit to collect into.
+    STDMETHODIMP DrawGlyphRun(void* context, FLOAT x, FLOAT y, DWRITE_MEASURING_MODE, const DWRITE_GLYPH_RUN* run,
                               const DWRITE_GLYPH_RUN_DESCRIPTION*, IUnknown*) override {
+        TextKit& kit = *static_cast<TextKit*>(context);
         Run r{nullptr, {x, y}};
         ComPtr<ID2D1GeometrySink> sink;
-        HRESULT hr = g.factory->CreatePathGeometry(&r.outline);
+        HRESULT hr = kit.factory->CreatePathGeometry(&r.outline);
         if (SUCCEEDED(hr)) hr = r.outline->Open(&sink);
         if (SUCCEEDED(hr)) {
             hr = run->fontFace->GetGlyphRunOutline(run->fontEmSize, run->glyphIndices, run->glyphAdvances,
@@ -92,7 +110,7 @@ class OutlineCollector final : public IDWriteTextRenderer {
                                                    run->bidiLevel % 2, sink.Get());
         }
         if (SUCCEEDED(hr)) hr = sink->Close();
-        if (SUCCEEDED(hr)) g.runs.push_back(std::move(r));
+        if (SUCCEEDED(hr)) kit.runs.push_back(std::move(r));
         return hr;
     }
     STDMETHODIMP DrawUnderline(void*, FLOAT, FLOAT, const DWRITE_UNDERLINE*, IUnknown*) override { return S_OK; }
@@ -104,41 +122,46 @@ class OutlineCollector final : public IDWriteTextRenderer {
     }
 } collector;
 
-bool Init() {
-    if (g.context) return true;
+// Opens Direct2D on the device for the kit's thread. Returns false, with the kit's context null, if it can't.
+bool InitKit(TextKit& kit, ID3D11Device* device) {
     ComPtr<IDXGIDevice> dxgi;
-    ComPtr<ID2D1Device> device;
-    HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, g.factory.GetAddressOf());
-    if (SUCCEEDED(hr)) hr = g.device.As(&dxgi);
-    if (SUCCEEDED(hr)) hr = g.factory->CreateDevice(dxgi.Get(), &device);
-    if (SUCCEEDED(hr)) hr = device->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &g.context);
+    ComPtr<ID2D1Device> d2d;
+    HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, kit.factory.GetAddressOf());
+    if (SUCCEEDED(hr)) hr = device->QueryInterface(IID_PPV_ARGS(&dxgi));
+    if (SUCCEEDED(hr)) hr = kit.factory->CreateDevice(dxgi.Get(), &d2d);
+    if (SUCCEEDED(hr)) hr = d2d->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &kit.context);
+    if (SUCCEEDED(hr) && !DWrite()) hr = E_FAIL;
+    if (SUCCEEDED(hr)) hr = kit.context->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White), &kit.brush);
     if (SUCCEEDED(hr)) {
-        hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
-                                 reinterpret_cast<IUnknown**>(g.dwrite.GetAddressOf()));
+        hr = kit.factory->CreateStrokeStyle(D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND,
+                                                                        D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND),
+                                            nullptr, 0, &kit.round);
     }
-    if (SUCCEEDED(hr)) hr = g.context->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White), &g.brush);
-    if (SUCCEEDED(hr)) {
-        hr = g.factory->CreateStrokeStyle(D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND,
-                                                                      D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND),
-                                          nullptr, 0, &g.round);
-    }
-    if (SUCCEEDED(hr)) hr = g.context->CreateEffect(CLSID_D2D1Shadow, &g.shadow);
+    if (SUCCEEDED(hr)) hr = kit.context->CreateEffect(CLSID_D2D1Shadow, &kit.shadow);
+    if (FAILED(hr)) kit.context.Reset();
+    return SUCCEEDED(hr);
+}
+
+bool Init() {
+    if (g.kit.context) return true;
+    g.dwrite = DWrite();
+    HRESULT hr = g.device && InitKit(g.kit, g.device.Get()) ? S_OK : E_FAIL;
     const D2D1_GRADIENT_STOP stops[] = {
         {0, D2D1::ColorF(0, 0, 0, 0)}, {0.5f, D2D1::ColorF(0, 0, 0, 0.5f)}, {1, D2D1::ColorF(0, 0, 0, 0.85f)}};
     ComPtr<ID2D1GradientStopCollection> collection;
-    if (SUCCEEDED(hr)) hr = g.context->CreateGradientStopCollection(stops, UINT32(std::size(stops)), &collection);
+    if (SUCCEEDED(hr)) hr = g.kit.context->CreateGradientStopCollection(stops, UINT32(std::size(stops)), &collection);
     if (SUCCEEDED(hr)) {
-        hr = g.context->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties({0, 0}, {0, 1}),
+        hr = g.kit.context->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties({0, 0}, {0, 1}),
                                                   collection.Get(), &g.shade);
     }
     const D2D1_GRADIENT_STOP fade[] = {{0, D2D1::ColorF(kPanelColor, 0)}, {1, D2D1::ColorF(kPanelColor, 1)}};
     collection.Reset();
-    if (SUCCEEDED(hr)) hr = g.context->CreateGradientStopCollection(fade, UINT32(std::size(fade)), &collection);
+    if (SUCCEEDED(hr)) hr = g.kit.context->CreateGradientStopCollection(fade, UINT32(std::size(fade)), &collection);
     if (SUCCEEDED(hr)) {
-        hr = g.context->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties({0, 0}, {0, 1}),
+        hr = g.kit.context->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties({0, 0}, {0, 1}),
                                                   collection.Get(), &g.fade);
     }
-    if (FAILED(hr)) g.context.Reset();
+    if (FAILED(hr)) g.kit.context.Reset();
     return SUCCEEDED(hr);
 }
 
@@ -146,7 +169,7 @@ bool IsFontInstalled(const wchar_t* family) {
     ComPtr<IDWriteFontCollection> fonts;
     UINT32 index;
     BOOL found = FALSE;
-    if (SUCCEEDED(g.dwrite->GetSystemFontCollection(&fonts))) fonts->FindFamilyName(family, &index, &found);
+    if (SUCCEEDED(DWrite()->GetSystemFontCollection(&fonts))) fonts->FindFamilyName(family, &index, &found);
     return found;
 }
 
@@ -156,21 +179,21 @@ const wchar_t* SubtitleFont() {
     return font;
 }
 
-ComPtr<IDWriteTextLayout> CreateLayout(std::wstring_view text, const std::vector<StyleSpan>& spans, float fontSize,
-                                       float maxWidth, bool center) {
-    if (!g.text || g.textSize != fontSize) {
-        g.text.Reset();
-        if (FAILED(g.dwrite->CreateTextFormat(SubtitleFont(), nullptr, DWRITE_FONT_WEIGHT_BOLD,
+ComPtr<IDWriteTextLayout> CreateLayout(TextKit& kit, std::wstring_view text, const std::vector<StyleSpan>& spans,
+                                       float fontSize, float maxWidth, bool center) {
+    if (!kit.text || kit.textSize != fontSize) {
+        kit.text.Reset();
+        if (FAILED(DWrite()->CreateTextFormat(SubtitleFont(), nullptr, DWRITE_FONT_WEIGHT_BOLD,
                                               DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, fontSize, L"",
-                                              &g.text))) {
+                                              &kit.text))) {
             return nullptr;
         }
-        g.textSize = fontSize;
+        kit.textSize = fontSize;
     }
     ComPtr<IDWriteTextLayout> layout;
-    g.text->SetTextAlignment(center ? DWRITE_TEXT_ALIGNMENT_CENTER : DWRITE_TEXT_ALIGNMENT_LEADING);
+    kit.text->SetTextAlignment(center ? DWRITE_TEXT_ALIGNMENT_CENTER : DWRITE_TEXT_ALIGNMENT_LEADING);
     const HRESULT hr =
-        g.dwrite->CreateTextLayout(text.data(), UINT32(text.size()), g.text.Get(), maxWidth, 0, &layout);
+        DWrite()->CreateTextLayout(text.data(), UINT32(text.size()), kit.text.Get(), maxWidth, 0, &layout);
     if (FAILED(hr)) return nullptr;
     for (const StyleSpan& s : spans) {
         const DWRITE_TEXT_RANGE range{s.start, s.length};
@@ -236,7 +259,7 @@ void DrawReplayArrow(ID2D1DeviceContext* dc, D2D1_POINT_2F center, float radius,
     const float m = float(-dir), x = center.x, y = center.y - radius, head = stroke * 2;
     ComPtr<ID2D1PathGeometry> path;
     ComPtr<ID2D1GeometrySink> sink;
-    if (FAILED(g.factory->CreatePathGeometry(&path)) || FAILED(path->Open(&sink))) return;
+    if (FAILED(g.kit.factory->CreatePathGeometry(&path)) || FAILED(path->Open(&sink))) return;
     sink->BeginFigure({x, y}, D2D1_FIGURE_BEGIN_HOLLOW);
     sink->AddArc(D2D1::ArcSegment({x - m * radius * 0.866f, center.y - radius * 0.5f}, {radius, radius}, 0,
                                   m > 0 ? D2D1_SWEEP_DIRECTION_CLOCKWISE : D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
@@ -247,8 +270,8 @@ void DrawReplayArrow(ID2D1DeviceContext* dc, D2D1_POINT_2F center, float radius,
     sink->AddLines(base, 2);
     sink->EndFigure(D2D1_FIGURE_END_CLOSED);
     if (FAILED(sink->Close())) return;
-    dc->DrawGeometry(path.Get(), g.brush.Get(), stroke, g.round.Get());
-    dc->FillGeometry(path.Get(), g.brush.Get());
+    dc->DrawGeometry(path.Get(), g.kit.brush.Get(), stroke, g.kit.round.Get());
+    dc->FillGeometry(path.Get(), g.kit.brush.Get());
 }
 
 // The visual's surface, sized w x h: the one it had, resized if need be, or a new one.
@@ -285,9 +308,9 @@ bool Paint(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT w, UINT
         D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
                                 D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
     ComPtr<ID2D1Bitmap1> bitmap;
-    const bool drawn = SUCCEEDED(g.context->CreateBitmapFromDxgiSurface(target.Get(), &props, &bitmap));
+    const bool drawn = SUCCEEDED(g.kit.context->CreateBitmapFromDxgiSurface(target.Get(), &props, &bitmap));
     if (drawn) {
-        ID2D1DeviceContext* dc = g.context.Get();
+        ID2D1DeviceContext* dc = g.kit.context.Get();
         dc->SetTarget(bitmap.Get());
         dc->BeginDraw();
         const D2D1_MATRIX_3X2_F base = D2D1::Matrix3x2F::Translation(float(offset.x), float(offset.y));
@@ -348,10 +371,10 @@ bool DrawGlyphs(IDCompositionDevice* dcomp, float scale) {
                              [&](ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F&) {
                                  dc->Clear(D2D1::ColorF(0, 0, 0, 0));
                                  dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-                                 g.brush->SetColor(D2D1::ColorF(0xffffff));
+                                 g.kit.brush->SetColor(D2D1::ColorF(0xffffff));
                                  for (int i = 0; i < kGlyphCount; ++i) {
                                      dc->DrawTextLayout(D2D1::Point2F(float(i * cell + pad), 0), layouts[i].Get(),
-                                                        g.brush.Get());
+                                                        g.kit.brush.Get());
                                  }
                              });
     if (!drawn) return false;
@@ -369,16 +392,19 @@ bool DrawGlyphs(IDCompositionDevice* dcomp, float scale) {
 
 void SetOverlayDevice(ID3D11Device* device) { g.device = device; }
 
-SIZE DrawOutlinedText(IDCompositionDevice* dcomp, IDCompositionVisual* visual, std::wstring_view text,
-                      const std::vector<StyleSpan>& spans, float fontSize, float maxWidth, bool center) {
+namespace {
+
+// Lays out and outlines text in white with a soft black outline, then has paint(w, h, draw) draw it into a w x h
+// target with draw(context, transform to the target's pixels). Returns the size, or 0 x 0 if there is nothing to
+// draw or paint fails.
+template <typename PaintFn>
+SIZE OutlineText(TextKit& kit, std::wstring_view text, const std::vector<StyleSpan>& spans, float fontSize,
+                 float maxWidth, bool center, PaintFn paint) {
     const ComPtr<IDWriteTextLayout> layout =
-        text.empty() || !Init() ? nullptr : CreateLayout(text, spans, fontSize, maxWidth, center);
+        text.empty() ? nullptr : CreateLayout(kit, text, spans, fontSize, maxWidth, center);
     DWRITE_TEXT_METRICS m;
     DWRITE_OVERHANG_METRICS o;
-    if (!layout || FAILED(layout->GetMetrics(&m)) || FAILED(layout->GetOverhangMetrics(&o))) {
-        visual->SetContent(nullptr);
-        return {};
-    }
+    if (!layout || FAILED(layout->GetMetrics(&m)) || FAILED(layout->GetOverhangMetrics(&o))) return {};
 
     // The ink box (overhangs are relative to the maxWidth x 0 layout box) and the logical box, plus the shadow,
     // which reaches 3 standard deviations of its blur past its offset glyphs.
@@ -389,52 +415,125 @@ SIZE DrawOutlinedText(IDCompositionDevice* dcomp, IDCompositionVisual* visual, s
     const float right = std::max(m.left + m.width, maxWidth + o.right), bottom = std::max(m.top + m.height, o.bottom);
     const UINT w = UINT(std::ceil(right - left + 2 * pad)), h = UINT(std::ceil(bottom - top + 2 * pad));
 
-    g.runs.clear();
-    if (FAILED(layout->Draw(nullptr, &collector, pad - left, pad - top))) {
-        visual->SetContent(nullptr);
-        return {};
-    }
+    kit.runs.clear();
+    if (FAILED(layout->Draw(&kit, &collector, pad - left, pad - top))) return {};
     // Each pass over all runs: the glyphs filled (width 0) or stroked.
     const auto drawRuns = [&](ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F& base, float width) {
-        for (const Run& r : g.runs) {
+        for (const Run& r : kit.runs) {
             dc->SetTransform(D2D1::Matrix3x2F::Translation(r.origin.x, r.origin.y) * base);
             if (width > 0) {
-                dc->DrawGeometry(r.outline.Get(), g.brush.Get(), width, g.round.Get());
+                dc->DrawGeometry(r.outline.Get(), kit.brush.Get(), width, kit.round.Get());
             } else {
-                dc->FillGeometry(r.outline.Get(), g.brush.Get());
+                dc->FillGeometry(r.outline.Get(), kit.brush.Get());
             }
         }
     };
     // The glyphs' shapes, for the shadow effect to blur.
     ComPtr<ID2D1CommandList> shapes;
-    ID2D1DeviceContext* context = g.context.Get();
+    ID2D1DeviceContext* context = kit.context.Get();
     if (SUCCEEDED(context->CreateCommandList(&shapes))) {
         context->SetTarget(shapes.Get());
         context->BeginDraw();
-        g.brush->SetColor(D2D1::ColorF(0, 0, 0, 1));
+        kit.brush->SetColor(D2D1::ColorF(0, 0, 0, 1));
         drawRuns(context, D2D1::Matrix3x2F::Identity(), stroke);
         drawRuns(context, D2D1::Matrix3x2F::Identity(), 0);
         if (FAILED(context->EndDraw()) || FAILED(shapes->Close())) shapes.Reset();
         context->SetTarget(nullptr);
     }
-    const bool drawn = Paint(dcomp, visual, w, h, [&](ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F& base) {
+    const bool drawn = paint(w, h, [&](ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F& base) {
         dc->Clear(D2D1::ColorF(0, 0, 0, 0));
         // A soft drop shadow, a faint thin outline that keeps the edges on bright video, then the white fill.
         if (shapes) {
-            g.shadow->SetInput(0, shapes.Get());
-            g.shadow->SetValue(D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION, blur);
-            g.shadow->SetValue(D2D1_SHADOW_PROP_COLOR, D2D1::Vector4F(0, 0, 0, 0.9f));
+            kit.shadow->SetInput(0, shapes.Get());
+            kit.shadow->SetValue(D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION, blur);
+            kit.shadow->SetValue(D2D1_SHADOW_PROP_COLOR, D2D1::Vector4F(0, 0, 0, 0.9f));
             dc->SetTransform(D2D1::Matrix3x2F::Translation(drop * 0.5f, drop) * base);
-            dc->DrawImage(g.shadow.Get());
-            g.shadow->SetInput(0, nullptr);
+            dc->DrawImage(kit.shadow.Get());
+            kit.shadow->SetInput(0, nullptr);
         }
-        g.brush->SetColor(D2D1::ColorF(0, 0, 0, 0.45f));
+        kit.brush->SetColor(D2D1::ColorF(0, 0, 0, 0.45f));
         drawRuns(dc, base, stroke);
-        g.brush->SetColor(D2D1::ColorF(1, 1, 1, 1));
+        kit.brush->SetColor(D2D1::ColorF(1, 1, 1, 1));
         drawRuns(dc, base, 0);
     });
-    g.runs.clear();
+    kit.runs.clear();
     return drawn ? SIZE{LONG(w), LONG(h)} : SIZE{};
+}
+
+}  // namespace
+
+SIZE DrawOutlinedText(IDCompositionDevice* dcomp, IDCompositionVisual* visual, std::wstring_view text,
+                      const std::vector<StyleSpan>& spans, float fontSize, float maxWidth, bool center) {
+    const SIZE s = text.empty() || !Init() ? SIZE{}
+                                           : OutlineText(g.kit, text, spans, fontSize, maxWidth, center,
+                                                         [&](UINT w, UINT h, const auto& draw) {
+                                                             return Paint(dcomp, visual, w, h, draw);
+                                                         });
+    if (!s.cx) visual->SetContent(nullptr);
+    return s;
+}
+
+
+struct FramePainter::Kit : TextKit {
+    ComPtr<ID2D1Bitmap1> images[2];
+    SIZE sizes[2]{};
+};
+
+FramePainter::FramePainter() = default;
+FramePainter::~FramePainter() = default;
+
+bool FramePainter::Open(ID3D11Device* device) {
+    kit_ = std::make_unique<Kit>();
+    if (!InitKit(*kit_, device)) kit_.reset();
+    return kit_ != nullptr;
+}
+
+SIZE FramePainter::Prepare(int slot, std::wstring_view text, const std::vector<StyleSpan>& spans, float fontSize,
+                           float maxWidth) {
+    if (!kit_) return {};
+    Kit& kit = *kit_;
+    kit.images[slot].Reset();
+    kit.sizes[slot] = OutlineText(kit, text, spans, fontSize, maxWidth, true, [&](UINT w, UINT h, const auto& draw) {
+        const D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_TARGET, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+        ComPtr<ID2D1Bitmap1> image;
+        if (FAILED(kit.context->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, props, &image))) return false;
+        kit.context->SetTarget(image.Get());
+        kit.context->BeginDraw();
+        draw(kit.context.Get(), D2D1::Matrix3x2F::Identity());
+        const bool drawn = SUCCEEDED(kit.context->EndDraw());
+        kit.context->SetTarget(nullptr);
+        if (drawn) kit.images[slot] = std::move(image);
+        return drawn;
+    });
+    return kit.sizes[slot];
+}
+
+bool FramePainter::Draw(ID3D11Texture2D* target, const POINT at[2]) {
+    if (!kit_ || (!kit_->images[0] && !kit_->images[1])) return true;
+    Kit& kit = *kit_;
+    ComPtr<IDXGISurface> surface;
+    ComPtr<ID2D1Bitmap1> bitmap;
+    const D2D1_BITMAP_PROPERTIES1 props =
+        D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
+    if (FAILED(target->QueryInterface(IID_PPV_ARGS(&surface))) ||
+        FAILED(kit.context->CreateBitmapFromDxgiSurface(surface.Get(), &props, &bitmap))) {
+        return false;
+    }
+    kit.context->SetTarget(bitmap.Get());
+    kit.context->BeginDraw();
+    kit.context->SetTransform(D2D1::Matrix3x2F::Identity());
+    for (int i = 0; i < 2; ++i) {
+        if (!kit.images[i]) continue;
+        const D2D1_SIZE_F s = kit.images[i]->GetSize();
+        const float x = float(at[i].x), y = float(at[i].y);
+        kit.context->DrawBitmap(kit.images[i].Get(), D2D1::RectF(x, y, x + s.width, y + s.height), 1.0f,
+                                D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+    }
+    const bool drawn = SUCCEEDED(kit.context->EndDraw());
+    kit.context->SetTarget(nullptr);
+    return drawn;
 }
 
 void DrawBar(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT width, UINT height, float scale,
@@ -450,13 +549,13 @@ void DrawBar(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT width
         for (const BarItem& item : items) {
             const D2D1_RECT_F r = RectF(item.rect);
             if (item.hot) {
-                g.brush->SetColor(D2D1::ColorF(0x3a3a3a));
+                g.kit.brush->SetColor(D2D1::ColorF(0x3a3a3a));
                 dc->FillRoundedRectangle(
                     D2D1::RoundedRect(D2D1::RectF(r.left, r.top + inset, r.right, r.bottom - inset), radius, radius),
-                    g.brush.Get());
+                    g.kit.brush.Get());
             }
-            g.brush->SetColor(D2D1::ColorF(item.dim ? 0x707070 : 0xffffff));
-            dc->DrawText(item.text.data(), UINT32(item.text.size()), g.menu.Get(), r, g.brush.Get(),
+            g.kit.brush->SetColor(D2D1::ColorF(item.dim ? 0x707070 : 0xffffff));
+            dc->DrawText(item.text.data(), UINT32(item.text.size()), g.menu.Get(), r, g.kit.brush.Get(),
                          D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
     });
@@ -478,38 +577,38 @@ void DrawControls(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT 
         const D2D1_RECT_F seek = RectF(c.seekBar);
         const float y = (seek.top + seek.bottom) / 2, half = (c.seekHot ? 4 : 2.5f) * scale;
         const float x = seek.left + float(c.progress) * (seek.right - seek.left), knob = (c.seekHot ? 8 : 6) * scale;
-        g.brush->SetColor(D2D1::ColorF(1, 1, 1, 0.35f));
-        dc->FillRectangle(D2D1::RectF(x, y - half, seek.right, y + half), g.brush.Get());
-        g.brush->SetColor(D2D1::ColorF(0xe50914));
-        dc->FillRectangle(D2D1::RectF(seek.left, y - half, x, y + half), g.brush.Get());
-        dc->FillEllipse(D2D1::Ellipse({x, y}, knob, knob), g.brush.Get());
+        g.kit.brush->SetColor(D2D1::ColorF(1, 1, 1, 0.35f));
+        dc->FillRectangle(D2D1::RectF(x, y - half, seek.right, y + half), g.kit.brush.Get());
+        g.kit.brush->SetColor(D2D1::ColorF(0xe50914));
+        dc->FillRectangle(D2D1::RectF(seek.left, y - half, x, y + half), g.kit.brush.Get());
+        dc->FillEllipse(D2D1::Ellipse({x, y}, knob, knob), g.kit.brush.Get());
 
         // The volume slider, the same way in white.
         if (c.volumeTrack.right > c.volumeTrack.left) {
             const D2D1_RECT_F v = RectF(c.volumeTrack);
             const float vy = (v.top + v.bottom) / 2, vhalf = 1.5f * scale;
             const float vx = v.left + float(c.volumeLevel) * (v.right - v.left);
-            g.brush->SetColor(D2D1::ColorF(1, 1, 1, 0.35f));
-            dc->FillRectangle(D2D1::RectF(vx, vy - vhalf, v.right, vy + vhalf), g.brush.Get());
-            g.brush->SetColor(D2D1::ColorF(0xffffff));
-            dc->FillRectangle(D2D1::RectF(v.left, vy - vhalf, vx, vy + vhalf), g.brush.Get());
-            dc->FillEllipse(D2D1::Ellipse({vx, vy}, 6 * scale, 6 * scale), g.brush.Get());
+            g.kit.brush->SetColor(D2D1::ColorF(1, 1, 1, 0.35f));
+            dc->FillRectangle(D2D1::RectF(vx, vy - vhalf, v.right, vy + vhalf), g.kit.brush.Get());
+            g.kit.brush->SetColor(D2D1::ColorF(0xffffff));
+            dc->FillRectangle(D2D1::RectF(v.left, vy - vhalf, vx, vy + vhalf), g.kit.brush.Get());
+            dc->FillEllipse(D2D1::Ellipse({vx, vy}, 6 * scale, 6 * scale), g.kit.brush.Get());
         }
 
-        g.brush->SetColor(D2D1::ColorF(0xffffff));
-        dc->DrawText(c.time.data(), UINT32(c.time.size()), g.time.Get(), RectF(c.timeRect), g.brush.Get(),
+        g.kit.brush->SetColor(D2D1::ColorF(0xffffff));
+        dc->DrawText(c.time.data(), UINT32(c.time.size()), g.time.Get(), RectF(c.timeRect), g.kit.brush.Get(),
                      D2D1_DRAW_TEXT_OPTIONS_CLIP);
-        dc->DrawText(c.title.data(), UINT32(c.title.size()), g.title.Get(), RectF(c.titleRect), g.brush.Get(),
+        dc->DrawText(c.title.data(), UINT32(c.title.size()), g.title.Get(), RectF(c.titleRect), g.kit.brush.Get(),
                      D2D1_DRAW_TEXT_OPTIONS_CLIP);
         for (const BarItem& item : c.buttons) {
             const D2D1_RECT_F r = RectF(item.rect);
             const D2D1_POINT_2F center{(r.left + r.right) / 2, (r.top + r.bottom) / 2};
             const float zoom = item.hot ? 1.2f : 1;
             dc->SetTransform(D2D1::Matrix3x2F::Scale(item.mirror ? -zoom : zoom, zoom, center) * base);
-            g.brush->SetColor(D2D1::ColorF(item.dim ? 0x808080 : 0xffffff));
+            g.kit.brush->SetColor(D2D1::ColorF(item.dim ? 0x808080 : 0xffffff));
             if (item.replay) DrawReplayArrow(dc, center, 11 * scale, 2 * scale, item.replay);
             dc->DrawText(item.text.data(), UINT32(item.text.size()), item.replay ? g.number.Get() : g.icons.Get(),
-                         r, g.brush.Get());
+                         r, g.kit.brush.Get());
         }
     });
 }
@@ -527,13 +626,13 @@ void DrawFlash(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT siz
     Paint(dcomp, visual, size, size, [&](ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F&) {
         dc->Clear(D2D1::ColorF(0, 0, 0, 0));
         dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-        g.brush->SetColor(D2D1::ColorF(0, 0, 0, 0.5f));
-        dc->FillEllipse(D2D1::Ellipse({s / 2, s / 2}, s / 2, s / 2), g.brush.Get());
-        g.brush->SetColor(D2D1::ColorF(0xffffff));
-        dc->DrawText(glyph.data(), UINT32(glyph.size()), icon.Get(), D2D1::RectF(0, 0, s, s), g.brush.Get());
+        g.kit.brush->SetColor(D2D1::ColorF(0, 0, 0, 0.5f));
+        dc->FillEllipse(D2D1::Ellipse({s / 2, s / 2}, s / 2, s / 2), g.kit.brush.Get());
+        g.kit.brush->SetColor(D2D1::ColorF(0xffffff));
+        dc->DrawText(glyph.data(), UINT32(glyph.size()), icon.Get(), D2D1::RectF(0, 0, s, s), g.kit.brush.Get());
         if (slash) {
             const float a = s * 0.3f, b = s - a;
-            dc->DrawLine({a, a}, {b, b}, g.brush.Get(), s * 0.035f, g.round.Get());
+            dc->DrawLine({a, a}, {b, b}, g.kit.brush.Get(), s * 0.035f, g.kit.round.Get());
         }
     });
 }
@@ -551,8 +650,8 @@ SIZE DrawTimeLabel(IDCompositionDevice* dcomp, IDCompositionVisual* visual, floa
         const bool drawn = Paint(dcomp, visual, w, h, [&](ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F&) {
             dc->Clear(D2D1::ColorF(0, 0, 0, 0));
             const float r = h / 2.0f;
-            g.brush->SetColor(D2D1::ColorF(kPanelColor, 0.9f));
-            dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(0, 0, float(w), float(h)), r, r), g.brush.Get());
+            g.kit.brush->SetColor(D2D1::ColorF(kPanelColor, 0.9f));
+            dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(0, 0, float(w), float(h)), r, r), g.kit.brush.Get());
         });
         glyphs.pillWidth = drawn ? w : 0;
         if (!drawn) return {};
@@ -589,15 +688,15 @@ SIZE DrawTimeLabel(IDCompositionDevice* dcomp, IDCompositionVisual* visual, floa
 int DrawPreviewShadow(IDCompositionDevice* dcomp, IDCompositionVisual* visual, float scale, SIZE frame, float radius) {
     // The rect's shape, for the shadow effect to blur.
     ComPtr<ID2D1CommandList> shape;
-    bool recorded = frame.cx > 0 && frame.cy > 0 && Init() && SUCCEEDED(g.context->CreateCommandList(&shape));
+    bool recorded = frame.cx > 0 && frame.cy > 0 && Init() && SUCCEEDED(g.kit.context->CreateCommandList(&shape));
     if (recorded) {
-        ID2D1DeviceContext* context = g.context.Get();
+        ID2D1DeviceContext* context = g.kit.context.Get();
         context->SetTarget(shape.Get());
         context->BeginDraw();
         context->SetTransform(D2D1::Matrix3x2F::Identity());
-        g.brush->SetColor(D2D1::ColorF(0, 0, 0, 1));
+        g.kit.brush->SetColor(D2D1::ColorF(0, 0, 0, 1));
         context->FillRoundedRectangle(
-            D2D1::RoundedRect(D2D1::RectF(0, 0, float(frame.cx), float(frame.cy)), radius, radius), g.brush.Get());
+            D2D1::RoundedRect(D2D1::RectF(0, 0, float(frame.cx), float(frame.cy)), radius, radius), g.kit.brush.Get());
         recorded = SUCCEEDED(context->EndDraw()) && SUCCEEDED(shape->Close());
         context->SetTarget(nullptr);
     }
@@ -611,12 +710,12 @@ int DrawPreviewShadow(IDCompositionDevice* dcomp, IDCompositionVisual* visual, f
     const bool drawn = Paint(dcomp, visual, UINT(frame.cx + 2 * pad), UINT(frame.cy + 2 * pad),
                              [&](ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F& base) {
                                  dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-                                 g.shadow->SetInput(0, shape.Get());
-                                 g.shadow->SetValue(D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION, blur);
-                                 g.shadow->SetValue(D2D1_SHADOW_PROP_COLOR, D2D1::Vector4F(0, 0, 0, 0.5f));
+                                 g.kit.shadow->SetInput(0, shape.Get());
+                                 g.kit.shadow->SetValue(D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION, blur);
+                                 g.kit.shadow->SetValue(D2D1_SHADOW_PROP_COLOR, D2D1::Vector4F(0, 0, 0, 0.5f));
                                  dc->SetTransform(D2D1::Matrix3x2F::Translation(float(pad), pad + drop) * base);
-                                 dc->DrawImage(g.shadow.Get());
-                                 g.shadow->SetInput(0, nullptr);
+                                 dc->DrawImage(g.kit.shadow.Get());
+                                 g.kit.shadow->SetInput(0, nullptr);
                              });
     return drawn ? pad : -1;
 }
@@ -632,28 +731,28 @@ void DrawTrackPanel(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UIN
     Paint(dcomp, visual, width, height, [&](ID2D1DeviceContext* dc, const D2D1_MATRIX_3X2_F&) {
         dc->Clear(D2D1::ColorF(0, 0, 0, 0));
         dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-        g.brush->SetColor(D2D1::ColorF(kPanelColor));
+        g.kit.brush->SetColor(D2D1::ColorF(kPanelColor));
         // Rounded like the menus, whose corners Windows rounds by 8 pixels.
         const float radius = 8 * scale;
         dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(0, 0, float(width), float(height)), radius, radius),
-                                 g.brush.Get());
+                                 g.kit.brush.Get());
         for (const TrackColumn& c : columns) {
             const D2D1_RECT_F rows = RectF(c.rows);
             D2D1_RECT_F header = RectF(c.header);
             header.left += check;
-            g.brush->SetColor(D2D1::ColorF(0xffffff));
-            dc->DrawText(c.title.data(), UINT32(c.title.size()), g.header.Get(), header, g.brush.Get(),
+            g.kit.brush->SetColor(D2D1::ColorF(0xffffff));
+            dc->DrawText(c.title.data(), UINT32(c.title.size()), g.header.Get(), header, g.kit.brush.Get(),
                          D2D1_DRAW_TEXT_OPTIONS_CLIP);
             dc->PushAxisAlignedClip(rows, D2D1_ANTIALIAS_MODE_ALIASED);
             for (const BarItem& item : c.items) {
                 const D2D1_RECT_F r = RectF(item.rect);
-                g.brush->SetColor(D2D1::ColorF(item.checked || item.hot ? 0xffffff : 0xb3b3b3));
+                g.kit.brush->SetColor(D2D1::ColorF(item.checked || item.hot ? 0xffffff : 0xb3b3b3));
                 if (item.checked) {
                     dc->DrawText(L"\xE73E", 1, g.check.Get(), D2D1::RectF(r.left, r.top, r.left + check, r.bottom),
-                                 g.brush.Get());
+                                 g.kit.brush.Get());
                 }
                 dc->DrawText(item.text.data(), UINT32(item.text.size()), g.row.Get(),
-                             D2D1::RectF(r.left + check, r.top, r.right - 8 * scale, r.bottom), g.brush.Get(),
+                             D2D1::RectF(r.left + check, r.top, r.right - 8 * scale, r.bottom), g.kit.brush.Get(),
                              D2D1_DRAW_TEXT_OPTIONS_CLIP);
             }
             if (c.more) {  // the rows below fade into the box
@@ -663,8 +762,8 @@ void DrawTrackPanel(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UIN
             }
             dc->PopAxisAlignedClip();
             if (c.thumb.bottom > c.thumb.top) {
-                g.brush->SetColor(D2D1::ColorF(0x414141));
-                dc->FillRectangle(RectF(c.thumb), g.brush.Get());
+                g.kit.brush->SetColor(D2D1::ColorF(0x414141));
+                dc->FillRectangle(RectF(c.thumb), g.kit.brush.Get());
             }
         }
     });

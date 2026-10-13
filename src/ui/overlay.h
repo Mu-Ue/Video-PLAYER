@@ -4,6 +4,7 @@
 #include <d3d11.h>  // also compares RECTs
 #include <dcomp.h>
 
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -18,6 +19,23 @@ void SetOverlayDevice(ID3D11Device* device);
 // left-aligned. Direct2D and DirectWrite load on the first call that draws.
 SIZE DrawOutlinedText(IDCompositionDevice* dcomp, IDCompositionVisual* visual, std::wstring_view text,
                       const std::vector<StyleSpan>& spans, float fontSize, float maxWidth, bool center);
+
+// Outlined text as DrawOutlinedText draws it, but into images drawn onto video frames, with a Direct2D device of its
+// own for the thread that presents them.
+class FramePainter {
+  public:
+    FramePainter();
+    ~FramePainter();
+    bool Open(ID3D11Device* device);  // false if Direct2D can't draw on it
+    // Draws centered text into the image of slot 0 or 1 and returns its size in pixels; empty text clears it.
+    SIZE Prepare(int slot, std::wstring_view text, const std::vector<StyleSpan>& spans, float fontSize, float maxWidth);
+    // Blends the images onto the target texture with their top left corners at at[slot].
+    bool Draw(ID3D11Texture2D* target, const POINT at[2]);
+
+  private:
+    struct Kit;
+    std::unique_ptr<Kit> kit_;
+};
 
 // A button: text on the menu bar, an icon glyph on the controls, or a row of the track panel.
 struct BarItem {
