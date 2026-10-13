@@ -115,7 +115,8 @@ struct {
     ComPtr<IMFTimedText> timedText;  // null if unsupported
     std::vector<DWORD> audioStreams;  // the engine's stream index of each audio track
     // The seek bar preview: a thread that decodes just the key frame the window wants. The window hands it a file
-    // to open or a key frame to decode under previewLock, then sets previewWake; it hands back the picture there.
+    // to open or a key frame to decode under previewLock, then sets previewWake; it hands back the picture, and the
+    // pictures' size, there.
     std::thread previewer;
     HANDLE previewWake = nullptr;
     // Signals previewDone when the previewer's GPU work is done; null if the device has no fences.
@@ -124,6 +125,7 @@ struct {
     UINT64 previewFenceValue = 0;
     SRWLOCK previewLock = SRWLOCK_INIT;
     std::wstring previewPath;
+    UINT previewWidth = 0, previewHeight = 0;
     LONGLONG previewWanted = -1;  // the key frame to decode, in 100 ns units, or -1
     LONGLONG readyTime = -1;      // a decoded picture waiting for the window, and its key frame
     ComPtr<ID3D11Texture2D> ready;
@@ -134,11 +136,10 @@ struct {
     ComPtr<IMFMediaSource> keySource;
     ComPtr<IMFSeekInfo> keyFrames;
     bool started = false;  // MFStartup succeeded
-    // The swap chain, guarded by lock: the render thread presents into it and the window thread sizes it. The
-    // previewer sets the preview's size under it too.
+    // The swap chain, guarded by lock: the render thread presents into it and the window thread sizes it.
     SRWLOCK lock = SRWLOCK_INIT;
     ComPtr<IDXGISwapChain1> chain;
-    UINT width = 0, height = 0, previewWidth = 0, previewHeight = 0;
+    UINT width = 0, height = 0;
     std::atomic<bool> redraw = false;  // present the current frame even if it isn't new; set with Redraw
     std::atomic<bool> frameWanted = false;  // post WM_APP_FRAME before the next frame; set with RequestFrame
     HANDLE stop = nullptr;             // tells the render thread and the previewer to exit
@@ -525,10 +526,10 @@ void PreviewLoop() {
             UINT w = 0, h = 0;
             reader = OpenPreviewReader(path, w, h);
             done = -1;
-            AcquireSRWLockExclusive(&g.lock);
+            AcquireSRWLockExclusive(&g.previewLock);
             g.previewWidth = reader ? w : 0;  // audio only, or a format it can't shrink: no previews
             g.previewHeight = reader ? h : 0;
-            ReleaseSRWLockExclusive(&g.lock);
+            ReleaseSRWLockExclusive(&g.previewLock);
         }
         if (!reader || time < 0 || time == done) {
             if (WaitForMultipleObjects(2, events, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) break;
@@ -645,9 +646,9 @@ HANDLE TakePreviewPicture(LONGLONG& time) {
 }
 
 SIZE PreviewSize() {
-    AcquireSRWLockShared(&g.lock);
+    AcquireSRWLockShared(&g.previewLock);
     const SIZE size{LONG(g.previewWidth), LONG(g.previewHeight)};
-    ReleaseSRWLockShared(&g.lock);
+    ReleaseSRWLockShared(&g.previewLock);
     return size;
 }
 
