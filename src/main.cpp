@@ -71,12 +71,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int showCmd) {
     HardenProcess();
     if (wcsncmp(cmdLine, L"--dialog ", 9) == 0) return DialogMain();
     HardenPlayer();
-    if (wcscmp(cmdLine, L"--register") == 0) {
+    // Parsed, as shells can add spaces around the flags.
+    const std::vector<std::wstring> args = ParseArgs(cmdLine);
+    if (args.size() == 1 && args[0] == L"--register") {
         if (RegisterApp()) return 0;
         MessageBoxW(nullptr, L"Could not register the player with Windows.", kAppName, MB_ICONERROR);
         return 1;
     }
-    if (wcscmp(cmdLine, L"--unregister") == 0) {
+    if (args.size() == 1 && args[0] == L"--unregister") {
         UnregisterApp();
         return 0;
     }
@@ -87,7 +89,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int showCmd) {
     // Media Foundation objects are free-threaded; a multithreaded apartment calls them directly.
     if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return 1;
 
-    if (!StartPlayer(instance, ParseArgs(cmdLine), showCmd)) return 1;
+    if (!StartPlayer(instance, args, showCmd)) return 1;
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
