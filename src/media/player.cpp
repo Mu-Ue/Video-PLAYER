@@ -586,22 +586,40 @@ constexpr DWORD kVideoStream = DWORD(MF_SOURCE_READER_FIRST_VIDEO_STREAM);
 constexpr double kPreviewCount = 200;   // preview pictures across the whole seek bar
 constexpr double kMinPreviewSpan = 1;  // seconds of video each preview picture stands for, at least
 
-// A reader of the file's video alone, and w x h, its display size fitted to 320 px, about the largest the preview
-// shows; null if it has no video. It hands out frames as stored until SetPreviewType.
-ComPtr<IMFSourceReader> OpenPreviewReader(const std::wstring& path, UINT& w, UINT& h) {
+// A parser of the file of its own, for the previews' readers; null if it can't be made.
+ComPtr<IMFMediaSource> OpenPreviewSource(const std::wstring& path) {
     ComPtr<IMFByteStream> stream;
+    ComPtr<IMFSourceResolver> resolver;
+    ComPtr<IUnknown> object;
+    ComPtr<IMFMediaSource> source;
+    MF_OBJECT_TYPE type;
+    HRESULT hr = MFCreateFile(MF_ACCESSMODE_READ, MF_OPENMODE_FAIL_IF_NOT_EXIST, MF_FILEFLAGS_NONE, path.c_str(),
+                              &stream);
+    if (SUCCEEDED(hr)) hr = MFCreateSourceResolver(&resolver);
+    if (SUCCEEDED(hr)) {
+        hr = resolver->CreateObjectFromByteStream(stream.Get(), path.c_str(),
+                                                  MF_RESOLUTION_MEDIASOURCE | MF_RESOLUTION_READ, nullptr, &type,
+                                                  &object);
+    }
+    if (SUCCEEDED(hr)) hr = object.As(&source);
+    return SUCCEEDED(hr) ? source : nullptr;
+}
+
+// A reader of the source's video alone, and w x h, its display size fitted to 320 px, about the largest the preview
+// shows; null if it has no video. It hands out frames as stored until SetPreviewType, and leaves the source running
+// once let go, for the next reader.
+ComPtr<IMFSourceReader> OpenPreviewReader(IMFMediaSource* source, UINT& w, UINT& h) {
     ComPtr<IMFAttributes> attributes;
     ComPtr<IMFSourceReader> reader;
     ComPtr<IMFMediaType> native;
-    HRESULT hr = MFCreateFile(MF_ACCESSMODE_READ, MF_OPENMODE_FAIL_IF_NOT_EXIST, MF_FILEFLAGS_NONE, path.c_str(),
-                              &stream);
-    if (SUCCEEDED(hr)) hr = MFCreateAttributes(&attributes, 4);
+    HRESULT hr = MFCreateAttributes(&attributes, 5);
+    if (SUCCEEDED(hr)) hr = attributes->SetUINT32(MF_SOURCE_READER_DISCONNECT_MEDIASOURCE_ON_SHUTDOWN, TRUE);
     if (SUCCEEDED(hr)) hr = attributes->SetUnknown(MF_SOURCE_READER_D3D_MANAGER, g.manager.Get());
     if (SUCCEEDED(hr)) hr = attributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
     if (SUCCEEDED(hr)) hr = attributes->SetUINT32(MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, TRUE);
     // The decoder hands out a key frame as soon as it has it, rather than holding it to reorder later frames.
     if (SUCCEEDED(hr)) hr = attributes->SetUINT32(MF_LOW_LATENCY, TRUE);
-    if (SUCCEEDED(hr)) hr = MFCreateSourceReaderFromByteStream(stream.Get(), attributes.Get(), &reader);
+    if (SUCCEEDED(hr)) hr = MFCreateSourceReaderFromMediaSource(source, attributes.Get(), &reader);
     if (SUCCEEDED(hr)) hr = reader->SetStreamSelection(DWORD(MF_SOURCE_READER_ALL_STREAMS), FALSE);
     if (SUCCEEDED(hr)) hr = reader->SetStreamSelection(kVideoStream, TRUE);
     if (SUCCEEDED(hr)) hr = reader->GetNativeMediaType(kVideoStream, 0, &native);
@@ -692,10 +710,14 @@ ComPtr<ID3D11Texture2D> KeepKeyFrame(IMFSample* sample) {
 // Opens the files, which also tells where their key frames are, and decodes the key frames the window wants, one at
 // a time, always the latest. Nothing queues: each wake reads what is wanted now, and it decodes back to back while
 // that changes. Each picture is handed to the window, which keeps it, even if the mouse moved on while it decoded.
+// The decoder, which holds frames of the video's full size, is let go once none was wanted for kPreviewIdleMs.
 void PreviewLoop() {
+    constexpr DWORD kPreviewIdleMs = 15000;
     const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
-    ComPtr<IMFSourceReader> reader;
-    bool decodes = false;  // the reader shrinks frames for the previews
+    ComPtr<IMFMediaSource> source;
+    ComPtr<IMFSourceReader> reader;  // null while idle
+    UINT w = 0, h = 0;
+    bool decodes = false;  // a reader shrinks frames for the previews
     LONGLONG done = -1;  // the key frame last decoded, or tried, in 100 ns units
     const HANDLE events[] = {g.stop, g.previewWake};
     for (;;) {
@@ -704,15 +726,17 @@ void PreviewLoop() {
         const LONGLONG time = g.previewWanted;
         ReleaseSRWLockExclusive(&g.previewLock);
         if (!path.empty()) {
-            UINT w = 0, h = 0;
-            reader = OpenPreviewReader(path, w, h);
+            reader.Reset();
+            if (source) source->Shutdown();
+            source = OpenPreviewSource(path);
+            reader = source ? OpenPreviewReader(source.Get(), w, h) : nullptr;
             decodes = reader && SetPreviewType(reader.Get(), w, h);
             done = -1;
-            // The parser the reader opened knows where the key frames are, if the format says.
+            // The parser knows where the key frames are, if the format says.
+            ComPtr<IMFGetService> service;
             ComPtr<IMFSeekInfo> keyFrames;
-            if (reader) {
-                reader->GetServiceForStream(DWORD(MF_SOURCE_READER_MEDIASOURCE), MF_SCRUBBING_SERVICE,
-                                            IID_PPV_ARGS(&keyFrames));
+            if (source && SUCCEEDED(source.As(&service))) {
+                service->GetService(MF_SCRUBBING_SERVICE, IID_PPV_ARGS(&keyFrames));
             }
             AcquireSRWLockExclusive(&g.previewLock);
             if (g.previewPath.empty()) g.openedKeyFrames = std::move(keyFrames);  // else another file is waiting
@@ -721,8 +745,21 @@ void PreviewLoop() {
             ReleaseSRWLockExclusive(&g.previewLock);
         }
         if (!decodes || time < 0 || time == done) {
-            if (WaitForMultipleObjects(2, events, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) break;
+            const DWORD r = WaitForMultipleObjects(2, events, FALSE, reader ? kPreviewIdleMs : INFINITE);
+            if (r == WAIT_TIMEOUT) {
+                reader.Reset();
+                // Destroyed once the device's queue goes to the GPU.
+                ComPtr<ID3D11DeviceContext> context;
+                g.device->GetImmediateContext(&context);
+                context->Flush();
+            }
+            if (r != WAIT_OBJECT_0 + 1 && r != WAIT_TIMEOUT) break;
             continue;
+        }
+        if (!reader) {
+            reader = OpenPreviewReader(source.Get(), w, h);
+            decodes = reader && SetPreviewType(reader.Get(), w, h);
+            if (!decodes) continue;
         }
         done = time;  // a key frame it can't decode isn't tried again and again
         const ComPtr<ID3D11Texture2D> picture = KeepKeyFrame(ReadKeyFrame(reader.Get(), time).Get());
@@ -737,6 +774,7 @@ void PreviewLoop() {
         if (!reopened) PostMessageW(g.notify.hwnd, WM_APP_PREVIEW, 0, 0);
     }
     reader.Reset();
+    if (source) source->Shutdown();
     if (com) CoUninitialize();
 }
 
