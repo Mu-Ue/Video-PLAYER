@@ -122,7 +122,6 @@ struct Reader {
     UINT64 timeCluster = kUnknown, timeData = 0, time = 0;  // the last cluster ClusterTime found
     const TextTrack* lastTrack = nullptr;  // of the last cue AddBlock read, and its end
     double lastEnd = 0;
-    size_t clusterHead = 0;  // the length of the last cluster header read, the same throughout most files
     // The bytes read last: chunk of them from a page boundary, so headers, timestamps and blocks near each other
     // come from one read. A page for the blocks the index points to, more when walking clusters.
     std::vector<BYTE> buffer;
@@ -382,19 +381,20 @@ struct Reader {
         const bool timed = std::all_of(blocks.begin(), blocks.end(), [](const Entry& b) {
             return b.duration != kUnknown && b.duration <= kUnknown - b.time;
         });
+        Element cluster{0, kUnknown};  // the last cluster header read, which the next block is often in too
         const auto read = [&](size_t i) {
             if (done[i]) return;
             done[i] = true;
             --left;
             lastTrack = nullptr;
             const Entry& entry = blocks[i];
-            Element e, cluster;
-            // The block is at its relative position in the cluster's data. That starts after the cluster's header,
-            // tried at the last one's length first, which saves reading it. The time is the block's own.
+            Element e;
+            // The block is at its relative position in the cluster's data, which starts after the cluster's header.
+            // Its length varies, and a guess that lands a little off can look like a block. The time is the block's
+            // own.
             if (entry.relative != kUnknown &&
-                ((clusterHead && Header(entry.cluster + clusterHead + entry.relative, e) && IsText(e)) ||
-                 (Header(entry.cluster, cluster) && cluster.id == kCluster &&
-                  (clusterHead = size_t(cluster.data - entry.cluster), Header(cluster.data + entry.relative, e))))) {
+                (cluster.at == entry.cluster || Header(entry.cluster, cluster)) && cluster.id == kCluster &&
+                Header(cluster.data + entry.relative, e) && IsText(e)) {
                 Block(e, entry.time, true);
             } else if (seen.insert(entry.cluster).second) {
                 chunk = kScanBytes;
