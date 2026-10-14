@@ -398,7 +398,13 @@ void RenderLoop() {
         // An event that came while awake restarts the grace.
         idle = WaitForSingleObject(g.renderWake, 0) == WAIT_OBJECT_0 ? 0 : idle + 1;
         LONGLONG pts;
-        const bool fresh = g.engine->OnVideoStreamTick(&pts) == S_OK;
+        bool fresh = g.engine->OnVideoStreamTick(&pts) == S_OK;
+        // While playing, a frame not due yet is looked for again just before the next compositor frame, so it makes
+        // that frame rather than racing the compositor at the following tick.
+        if (!fresh && waitClock && !g.engine->IsPaused()) {
+            if (!WaitBeforeNextFrame(clock.Get(), timer, tick.QuadPart)) break;
+            fresh = g.engine->OnVideoStreamTick(&pts) == S_OK;
+        }
         if (fresh) frameTime = pts;
         if (g.hold) {
             if (fresh) {
