@@ -166,11 +166,8 @@ struct Sample {
 
 class Capture {
   public:
-    // Duplicates the output showing the window's client area and finds the video in it, whose aspect is aspect.
-    bool Open(HWND hwnd, double aspect) {
-        hwnd_ = hwnd;
-        aspect_ = aspect;
-        const HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    // Duplicates the monitor's output, before the player starts, so its first frame is caught.
+    bool Open(HMONITOR monitor) {
         ComPtr<IDXGIFactory1> factory;
         if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
         ComPtr<IDXGIAdapter1> adapter;
@@ -219,6 +216,12 @@ class Capture {
             }
             dup_->ReleaseFrame();
         }
+    }
+
+    // Has the video found in the window's client area, whose aspect is aspect, from now on.
+    void SetWindow(HWND hwnd, double aspect) {
+        aspect_ = aspect;
+        hwnd_ = hwnd;
     }
 
     LONGLONG snapAt = 0;  // QPC time of the composition --snap saves, or 0
@@ -294,7 +297,7 @@ class Capture {
     }
 
     bool Read(ID3D11Texture2D* desktop, Sample& s) {
-        if (!Locate()) return false;
+        if (!hwnd_ || !Locate()) return false;
         const int vw = video_.right - video_.left, vh = video_.bottom - video_.top;
         // The bit rows at the middle of their bands: 17.5% and 22.5% of the height.
         const int rows[2] = {video_.top + int(vh * 0.175), video_.top + int(vh * 0.225)};
@@ -337,7 +340,7 @@ class Capture {
         return true;
     }
 
-    HWND hwnd_ = nullptr;
+    std::atomic<HWND> hwnd_ = nullptr;  // set once the window shows
     double aspect_ = 16.0 / 9;
     POINT origin_{};
     RECT client_{}, video_{};
@@ -575,8 +578,26 @@ int wmain(int argc, wchar_t** argv) {
     }
     if (cores > 0) SetProcessAffinityMask(pi.hProcess, (DWORD_PTR(1) << cores) - 1);
     std::thread audio(RecordClicks, pi.dwProcessId, std::cref(stop), std::ref(clicks), std::ref(audioReady));
+    // The player opens on the monitor with the cursor.
+    Capture capture;
+    if (!capture.Open(MonitorFromPoint({mi.rcWork.right - 2, 0}, MONITOR_DEFAULTTOPRIMARY))) {
+        Fail("can't duplicate the output");
+    }
+    std::vector<Sample> samples;
+    std::mutex samplesLock;
+    std::thread recorder([&] {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+        capture.Run(stop, [&](const Sample& s) {
+            std::lock_guard l(samplesLock);
+            samples.push_back(s);
+        });
+    });
     while (!audioReady) Sleep(1);
     const LONGLONG launched = Now();  // after the audio capture attaches, which mustn't count
+    if (snapMs > 0) {
+        capture.snapPath = snapPath;
+        capture.snapAt = launched + LONGLONG(snapMs / 1000 * Freq());
+    }
     ResumeThread(pi.hThread);
     CloseHandle(pi.hThread);
 
@@ -593,21 +614,7 @@ int wmain(int argc, wchar_t** argv) {
     }
     if (GetForegroundWindow() != hwnd) fprintf(stderr, "bench: the player isn't in front; captures may be of other windows\n");
 
-    Capture capture;
-    if (!capture.Open(hwnd, double(clip.width) / clip.height)) Fail("can't duplicate the window's output");
-    if (snapMs > 0) {
-        capture.snapPath = snapPath;
-        capture.snapAt = launched + LONGLONG(snapMs / 1000 * Freq());
-    }
-    std::vector<Sample> samples;
-    std::mutex samplesLock;
-    std::thread recorder([&] {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-        capture.Run(stop, [&](const Sample& s) {
-            std::lock_guard l(samplesLock);
-            samples.push_back(s);
-        });
-    });
+    capture.SetWindow(hwnd, double(clip.width) / clip.height);
 
     // Subtitles on once the window shows; seeks spread over the run's second half, after the start settles.
     Sleep(500);
