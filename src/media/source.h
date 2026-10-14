@@ -12,6 +12,7 @@
 // - Uncompressed audio, cut exactly where playback starts.
 // Lives for the whole process.
 IMFMediaEngineExtension* SourceExtension();
-// Starts finding, on a thread of its own, what the first file needs from the audio output, so its opening doesn't
-// wait on that. Call once, before the first file.
-void PrepareSourceExtension();
+// Starts finding what the first file needs from the audio output, and making that file's source, on threads of
+// their own, so its opening doesn't wait on that. path may be null for none; it is opened as a local file. Call once,
+// before the first file.
+void PrepareSourceExtension(const wchar_t* path);

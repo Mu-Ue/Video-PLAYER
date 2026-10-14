@@ -22,6 +22,9 @@ constexpr UINT WM_APP_FRAME = WM_APP + 4;
 // Posted when a seek bar preview picture DecodePreview asked for is ready for TakePreviewPicture.
 constexpr UINT WM_APP_PREVIEW = WM_APP + 5;
 
+// Starts what opening the first video, if not empty, needs that can be done before InitPlayer, on threads of its
+// own. Call once, first.
+void PrepareVideo(const std::wstring& path);
 // Creates a GPU device of its own, Media Foundation's media engine, which decodes on the GPU, and a thread that
 // presents each new frame into a swap chain for DirectComposition, once per compositor frame. The engine's events
 // are posted to hwnd.

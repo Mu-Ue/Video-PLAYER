@@ -718,9 +718,12 @@ void PreviewLoop() {
 
 }  // namespace
 
+void PrepareVideo(const std::wstring& path) {
+    PrepareSourceExtension(path.empty() || IsDevicePath(path) ? nullptr : path.c_str());
+}
+
 bool InitPlayer(HWND hwnd) {
     g.notify.hwnd = g.textNotify.hwnd = hwnd;
-    PrepareSourceExtension();
     if (FAILED(CreateDevice())) return false;
     g.started = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
     if (!g.started || FAILED(CreateEngines())) return false;

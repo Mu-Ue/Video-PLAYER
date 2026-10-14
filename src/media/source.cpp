@@ -117,18 +117,57 @@ LONGLONG AudioLead() {
     return std::clamp<LONGLONG>(lead, 0, 1'000'000);  // 100 ms at most
 }
 
-// The lead found ahead of the first file by PrepareSourceExtension, which loads the audio stack.
-std::atomic<PTP_WORK> leadWork = nullptr;
-LONGLONG preparedLead = 0;
+// What PrepareSourceExtension finds ahead of the first file, each on a thread of its own: the lead, which loads the
+// audio stack, and the file's source and shifts.
+struct Prepared {
+    LONGLONG lead = 0;
+    std::wstring path;
+    ComPtr<IMFMediaSource> source;  // null if it can't be made
+    Shifts shifts;
+    bool started = false;  // Media Foundation, for the source
+};
+Prepared prepared;
+std::atomic<PTP_WORK> leadWork = nullptr, sourceWork = nullptr;
+
+// Waits for a work item PrepareSourceExtension started, if it did; returns whether it did.
+bool Finish(std::atomic<PTP_WORK>& work) {
+    const PTP_WORK w = work.exchange(nullptr);
+    if (!w) return false;
+    WaitForThreadpoolWorkCallbacks(w, FALSE);
+    CloseThreadpoolWork(w);
+    return true;
+}
 
 // The lead found ahead if there is one, else now, so a change of output shows on the next file.
-LONGLONG TakeAudioLead() {
-    if (const PTP_WORK work = leadWork.exchange(nullptr)) {
-        WaitForThreadpoolWorkCallbacks(work, FALSE);
-        CloseThreadpoolWork(work);
-        return preparedLead;
+LONGLONG TakeAudioLead() { return Finish(leadWork) ? prepared.lead : AudioLead(); }
+
+// The source made ahead and its shifts, if it is of the file at url; false if none is.
+bool TakePreparedSource(const wchar_t* url, ComPtr<IMFMediaSource>& source, Shifts& shifts) {
+    if (!Finish(sourceWork)) return false;
+    const bool mine = prepared.source && CompareStringOrdinal(url, -1, prepared.path.c_str(), -1, TRUE) == CSTR_EQUAL;
+    if (mine) {
+        source = std::move(prepared.source);
+        shifts = std::move(prepared.shifts);
+    } else if (prepared.source) {
+        prepared.source->Shutdown();
+        prepared.source.Reset();
     }
-    return AudioLead();
+    if (prepared.started) MFShutdown();  // the engine's own start keeps it running
+    return mine;
+}
+
+// Creates Media Foundation's source for a file from its byte stream.
+HRESULT CreateSource(const wchar_t* url, IMFByteStream* stream, ComPtr<IMFMediaSource>& source) {
+    ComPtr<IMFSourceResolver> resolver;
+    ComPtr<IUnknown> object;
+    MF_OBJECT_TYPE created;
+    HRESULT hr = MFCreateSourceResolver(&resolver);
+    if (SUCCEEDED(hr)) {
+        hr = resolver->CreateObjectFromByteStream(stream, url, MF_RESOLUTION_MEDIASOURCE | MF_RESOLUTION_READ, nullptr,
+                                                  &created, &object);
+    }
+    if (SUCCEEDED(hr)) hr = object.As(&source);
+    return hr;
 }
 
 // Each track's shift from its edit list: 0 if the edit doesn't start it later, delays it instead or plays it at
@@ -503,12 +542,13 @@ bool HasExtension(const wchar_t* name, std::initializer_list<const wchar_t*> ext
     return dot && std::any_of(extensions.begin(), extensions.end(), [&](const wchar_t* e) { return !_wcsicmp(dot, e); });
 }
 
-// The file's shifts: from its edit lists or CodecDelays if it is MPEG-4 or Matroska, and the audio's lead.
-Shifts ReadShifts(BSTR url, IMFByteStream* stream) {
+// The file's shifts from its edit lists or CodecDelays, if it is MPEG-4 or Matroska, but for the lead. Leaves the
+// stream at its start.
+Shifts ReadShifts(const wchar_t* url, IMFByteStream* stream) {
     Shifts shifts;
     if (HasExtension(url, {L".mp4", L".m4v", L".mov"})) shifts = ReadMp4Shifts(stream);
     if (HasExtension(url, {L".mkv", L".webm"})) shifts.audio = MkvAudioDelays(url);
-    shifts.lead = TakeAudioLead();
+    stream->SetCurrentPosition(0);
     return shifts;
 }
 
@@ -534,21 +574,17 @@ class Extension final : public IMFMediaEngineExtension {
                                    IMFAsyncCallback* callback, IUnknown* state) override {
         if (cancel) *cancel = nullptr;
         if (type != MF_OBJECT_MEDIASOURCE || !stream || !url) return MF_E_UNSUPPORTED_BYTESTREAM_TYPE;
-        const Shifts shifts = ReadShifts(url, stream);
-        HRESULT hr = stream->SetCurrentPosition(0);
-        if (FAILED(hr)) return hr;
-        if (!shifts.Any()) return MF_E_UNSUPPORTED_BYTESTREAM_TYPE;
-        ComPtr<IMFSourceResolver> resolver;
-        ComPtr<IUnknown> object;
         ComPtr<IMFMediaSource> inner;
-        MF_OBJECT_TYPE created;
-        hr = MFCreateSourceResolver(&resolver);
-        if (SUCCEEDED(hr)) {
-            hr = resolver->CreateObjectFromByteStream(stream, url, MF_RESOLUTION_MEDIASOURCE | MF_RESOLUTION_READ,
-                                                      nullptr, &created, &object);
+        Shifts shifts;
+        const bool ready = TakePreparedSource(url, inner, shifts);
+        if (!ready) shifts = ReadShifts(url, stream);
+        shifts.lead = TakeAudioLead();
+        HRESULT hr = S_OK;
+        if (!ready) {
+            if (!shifts.Any()) return MF_E_UNSUPPORTED_BYTESTREAM_TYPE;
+            hr = CreateSource(url, stream, inner);
+            if (FAILED(hr)) return hr;
         }
-        if (SUCCEEDED(hr)) hr = object.As(&inner);
-        if (FAILED(hr)) return hr;
         ComPtr<ShiftedSource> source;
         source.Attach(new (std::nothrow) ShiftedSource(inner.Get(), shifts));
         hr = source ? source->Start() : E_OUTOFMEMORY;
@@ -574,15 +610,29 @@ Extension extension;
 
 IMFMediaEngineExtension* SourceExtension() { return &extension; }
 
-void PrepareSourceExtension() {
-    const PTP_WORK work = CreateThreadpoolWork(
-        [](PTP_CALLBACK_INSTANCE, void*, PTP_WORK) {
-            const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
-            preparedLead = AudioLead();
-            if (com) CoUninitialize();
-        },
-        nullptr, nullptr);
-    if (!work) return;
-    SubmitThreadpoolWork(work);
-    leadWork = work;
+void PrepareSourceExtension(const wchar_t* path) {
+    const auto start = [](std::atomic<PTP_WORK>& slot, PTP_WORK_CALLBACK callback) {
+        if (const PTP_WORK work = CreateThreadpoolWork(callback, nullptr, nullptr)) {
+            SubmitThreadpoolWork(work);
+            slot = work;
+        }
+    };
+    start(leadWork, [](PTP_CALLBACK_INSTANCE, void*, PTP_WORK) {
+        const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+        prepared.lead = AudioLead();
+        if (com) CoUninitialize();
+    });
+    if (!path || !*path) return;
+    prepared.path = path;
+    start(sourceWork, [](PTP_CALLBACK_INSTANCE, void*, PTP_WORK) {
+        const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+        prepared.started = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
+        ComPtr<IMFByteStream> stream;
+        if (prepared.started && SUCCEEDED(MFCreateFile(MF_ACCESSMODE_READ, MF_OPENMODE_FAIL_IF_NOT_EXIST,
+                                                       MF_FILEFLAGS_NONE, prepared.path.c_str(), &stream))) {
+            prepared.shifts = ReadShifts(prepared.path.c_str(), stream.Get());
+            CreateSource(prepared.path.c_str(), stream.Get(), prepared.source);
+        }
+        if (com) CoUninitialize();
+    });
 }

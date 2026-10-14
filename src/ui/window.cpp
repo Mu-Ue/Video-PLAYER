@@ -1720,12 +1720,13 @@ HWND CreateMainWindow(HINSTANCE instance) {
 
 bool StartPlayer(HINSTANCE instance, const std::vector<std::wstring>& files, int showCmd) {
     g.showCmd = showCmd;
+    const auto video = std::find_if_not(files.begin(), files.end(), IsSubtitleFile);
+    PrepareVideo(video != files.end() ? *video : std::wstring());
     g.hwnd = CreateMainWindow(instance);
     if (!g.hwnd) return false;
     // On failure, destroying the window stops the player's threads, which must not outlive it.
     const bool player = InitPlayer(g.hwnd);
     // The engine loads the video while the window's composition is set up.
-    const auto video = std::find_if_not(files.begin(), files.end(), IsSubtitleFile);
     const bool started = player && video != files.end() && SUCCEEDED(OpenVideo(*video));
     if (!player || !InitComposition()) {
         MessageBoxW(nullptr, L"Can't start: Direct3D 11 or Media Foundation isn't available.", kAppName,
