@@ -127,7 +127,8 @@ HWND PlayerWindow(DWORD pid) {
             DWORD owner = 0;
             wchar_t cls[32];
             GetWindowThreadProcessId(h, &owner);
-            if (owner == f.pid && IsWindowVisible(h) && GetClassNameW(h, cls, 32) && wcscmp(cls, L"VideoPLAYER") == 0) {
+            if (owner == f.pid && IsWindowVisible(h) && GetClassNameW(h, cls, 32) &&
+                (wcscmp(cls, L"VideoPLAYER") == 0 || wcscmp(cls, L"SDL_app") == 0)) {  // or ffplay, as a reference
                 f.hwnd = h;
                 return FALSE;
             }
@@ -261,12 +262,15 @@ class Capture {
         const RECT now{tl.x, tl.y, tl.x + client.right, tl.y + client.bottom};
         if (EqualRect(&now, &client_) && staging_) return true;
         client_ = now;
-        // The menu bar is 26 px at 96 DPI; none in fullscreen, where the client covers the monitor.
+        // The menu bar is 26 px at 96 DPI; none in fullscreen, where the client covers the monitor, or in a
+        // reference player.
         const UINT dpi = GetDpiForWindow(hwnd_);
+        wchar_t cls[32];
+        const bool ours = GetClassNameW(hwnd_, cls, 32) && wcscmp(cls, L"VideoPLAYER") == 0;
         MONITORINFO mi{sizeof(mi)};
         GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi);
         const bool full = EqualRect(&mi.rcMonitor, &now);
-        const int bar = full ? 0 : MulDiv(26, int(dpi), 96);
+        const int bar = full || !ours ? 0 : MulDiv(26, int(dpi), 96);
         const int cw = client.right, ah = client.bottom - bar;
         if (cw <= 0 || ah <= 0) return false;
         const double scale = std::min(cw / aspect_, double(ah)) ;
@@ -526,12 +530,12 @@ double Max(const std::vector<double>& v) { return v.empty() ? NAN : *std::max_el
 
 int wmain(int argc, wchar_t** argv) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    if (argc < 3) Fail("usage: bench <player.exe> <clip> [--seconds N] [--seeks N] [--subs] [--cores N] [--label text] [--csv file] [--dump file]");
+    if (argc < 3) Fail("usage: bench <player.exe> <clip> [--seconds N] [--seeks N] [--subs] [--cores N] [--label text] [--csv file] [--dump file] [--args text]");
     const std::wstring player = argv[1], clipPath = argv[2];
     double seconds = 20;
     int seeks = 0, cores = 0;
     bool subs = false;
-    std::wstring label = L"run", csv = L"bench.csv", dump, snapPath;
+    std::wstring label = L"run", csv = L"bench.csv", dump, snapPath, extra;
     double snapMs = 0;
     for (int i = 3; i < argc; ++i) {
         const std::wstring a = argv[i];
@@ -547,6 +551,7 @@ int wmain(int argc, wchar_t** argv) {
             snapPath = argv[++i];
         }
         else if (a == L"--subs") subs = true;
+        else if (a == L"--args" && more) extra = argv[++i];  // more arguments for the player, such as a reference's
         else Fail("unknown argument");
     }
     const Clip clip = LoadClip(clipPath);
@@ -560,7 +565,7 @@ int wmain(int argc, wchar_t** argv) {
     std::atomic<bool> stop = false, audioReady = false;
     std::vector<LONGLONG> clicks;
 
-    std::wstring command = L"\"" + player + L"\" \"" + clipPath + L"\"";
+    std::wstring command = L"\"" + player + L"\" \"" + clipPath + L"\"" + (extra.empty() ? L"" : L" " + extra);
     STARTUPINFOW si{sizeof(si)};
     PROCESS_INFORMATION pi;
 
