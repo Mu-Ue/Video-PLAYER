@@ -29,10 +29,10 @@ target_compile_options(VideoPLAYER PRIVATE /W4 /permissive- /utf-8 /sdl /guard:c
 set(CMAKE_CXX_STANDARD_LIBRARIES "")
 target_link_libraries(VideoPLAYER PRIVATE delayimp kernel32 user32 gdi32 imm32 dwmapi advapi32 shell32 comdlg32
                       oleaut32 uuid mfplat mfreadwrite mfuuid avrt d3d11 dxgi dcomp d2d1 dwrite dxguid onecore_apiset)
-# The file picker and dropped files load their DLLs on first use, and text drawing once the window lays out.
-# The registry is only touched by --register / --unregister.
+# The file picker and dropped files load their DLLs on first use, text drawing once the window lays out, and the
+# seek bar previews' reader once the first frame shows. The registry is only touched by --register / --unregister.
 target_link_options(VideoPLAYER PRIVATE /DELAYLOAD:comdlg32.dll /DELAYLOAD:shell32.dll /DELAYLOAD:d2d1.dll
-                    /DELAYLOAD:dwrite.dll /DELAYLOAD:advapi32.dll)
+                    /DELAYLOAD:dwrite.dll /DELAYLOAD:advapi32.dll /DELAYLOAD:mfreadwrite.dll)
 # Control-flow guard, shadow stack with checked exception continuations, and DLL imports from System32 only
 # (no planted DLLs next to the exe).
 target_link_options(VideoPLAYER PRIVATE /GUARD:CF /GUARD:EHCONT /CETCOMPAT /DEPENDENTLOADFLAG:0x800)
