@@ -1,1 +1,4 @@
 build/
+tools/bench/clips/
+tools/bench/out/
+tools/bench/*.csv
