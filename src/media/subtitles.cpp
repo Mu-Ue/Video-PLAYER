@@ -214,7 +214,7 @@ bool AddCue(Subtitles& subs, Cue cue) {
                                      [](double time, const Cue& c) { return time < c.start; });
     for (auto it = at; it != cues.begin() && (it - 1)->start == cue.start;) {
         --it;
-        if (it->end == cue.end && it->text == cue.text) return false;
+        if (it->end == cue.end && it->top == cue.top && it->text == cue.text) return false;
     }
     const size_t i = size_t(cues.insert(at, std::move(cue)) - cues.begin());
     subs.reach.resize(cues.size());
