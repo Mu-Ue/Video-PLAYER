@@ -85,6 +85,9 @@ struct Window {
     // decodes nothing. There are at most 200 of 320 px.
     std::unordered_map<LONGLONG, ComPtr<IDCompositionSurface>> previewPictures;
     LONGLONG previewWanted = -1, previewOnScreen = -1;  // key frames
+    LONGLONG previewAsked = -1;  // the key frame last asked of the previewer, until its picture comes
+    double previewSeconds = 0;   // the time under the mouse
+    int previewDirection = 1;    // the way the mouse last moved along the bar
     int previewShadowPad = -1;  // how far the shadow reaches past the frame, or -1 if not drawn
     ComPtr<IDCompositionEffectGroup> controlsFade, flashFade, osdFade;
     ComPtr<IDCompositionScaleTransform> flashScale;  // about the icon's center, then
@@ -688,6 +691,29 @@ SIZE Fit(SIZE v, int w, int h) {
     return {std::max(1L, LONG(std::lround(v.cx * scale))), std::max(1L, LONG(std::lround(v.cy * scale)))};
 }
 
+
+// Has the previewer decode the picture of a key frame; WM_APP_PREVIEW brings it.
+void AskPreviewPicture(LONGLONG time) {
+    g.previewAsked = time;
+    DecodePreview(time);
+}
+
+// While the preview shows and the previewer has nothing else to do, has it decode the pictures of the spans around
+// the mouse, nearest first and ahead of the mouse first, so a sweep finds them kept.
+void PrefetchPreviewPictures() {
+    constexpr int kSpans = 8;  // on either side
+    if (!g.previewShown || g.previewAsked >= 0) return;
+    for (int k = 1; k <= kSpans; ++k) {
+        for (const int side : {g.previewDirection, -g.previewDirection}) {
+            const LONGLONG time = PreviewKeyFrameNear(g.previewSeconds, g.duration, side * k);
+            if (time >= 0 && !g.previewPictures.contains(time)) {
+                AskPreviewPicture(time);
+                return;
+            }
+        }
+    }
+}
+
 // Shows the picture of a key frame if it is kept, else has it decoded; WM_APP_PREVIEW brings it.
 void WantPreviewPicture(LONGLONG time) {
     if (time == g.previewWanted) return;
@@ -695,8 +721,9 @@ void WantPreviewPicture(LONGLONG time) {
     if (const auto it = g.previewPictures.find(time); it != g.previewPictures.end()) {
         g.previewImage->SetContent(it->second.Get());
         g.previewOnScreen = time;
+        PrefetchPreviewPictures();
     } else {
-        DecodePreview(time);
+        AskPreviewPicture(time);
     }
 }
 
@@ -735,6 +762,8 @@ void OnPreviewPicture() {
     const ComPtr<IDCompositionSurface> surface = CopyPreviewPicture(handle);
     if (!surface) return;
     g.previewPictures.emplace(time, surface);
+    if (time == g.previewAsked) g.previewAsked = -1;
+    PrefetchPreviewPictures();
     if (g.previewOnScreen == g.previewWanted) return;
     g.previewImage->SetContent(surface.Get());
     g.previewOnScreen = time;
@@ -769,8 +798,10 @@ void UpdatePreview(POINT pt) {
         return;
     }
     if (x != g.previewX) {
+        if (g.previewX != INT_MIN) g.previewDirection = x > g.previewX ? 1 : -1;
         g.previewX = x;
         const double seconds = double(x - left) / std::max(1, right - left) * g.duration;
+        g.previewSeconds = seconds;
         WantPreviewPicture(PreviewKeyFrame(seconds, g.duration));
         if (std::wstring text = FormatTime(seconds); text != g.previewText) {
             g.previewText = std::move(text);
@@ -1031,7 +1062,7 @@ bool OpenVideoFile(const std::wstring& path, bool started) {
     g.title = g.title.substr(0, g.title.find_last_of(L'.'));
     UpdateControls();
     g.previewPictures.clear();
-    g.previewWanted = g.previewOnScreen = -1;
+    g.previewWanted = g.previewOnScreen = g.previewAsked = -1;
     g.previewImage->SetContent(nullptr);
     g.previewX = INT_MIN;
     UpdatePreview({});  // hides it until the duration is known

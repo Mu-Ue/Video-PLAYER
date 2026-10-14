@@ -81,6 +81,8 @@ void SetSubtitleLayout(const SubtitleLayout& layout);
 // The seek bar preview shows one picture for each 1/200 of the video (1 second at least): the key frame nearest
 // the span's middle, which needs no decoding up to it. Returns that key frame for a time, in 100 ns units.
 LONGLONG PreviewKeyFrame(double seconds, double duration);
+// The same for the span spans away from the one at the time; -1 past either end of the video.
+LONGLONG PreviewKeyFrameNear(double seconds, double duration, int spans);
 // Has a thread of its own decode a key frame from PreviewKeyFrame, alone and shrunk to PreviewSize, then post
 // WM_APP_PREVIEW. If it is still busy, only the latest asked is decoded next.
 void DecodePreview(LONGLONG time);

@@ -874,6 +874,13 @@ LONGLONG PreviewKeyFrame(double seconds, double duration) {
     return g.previewKey;
 }
 
+LONGLONG PreviewKeyFrameNear(double seconds, double duration, int spans) {
+    const double span = std::max(kMinPreviewSpan, duration / kPreviewCount);
+    const double bucket = std::floor(seconds / span) + spans;
+    if (bucket < 0 || bucket * span >= duration) return -1;
+    return std::llround(NearestKeyFrame(KeyFrames(), (bucket + 0.5) * span) * 1e7);
+}
+
 void DecodePreview(LONGLONG time) {
     AcquireSRWLockExclusive(&g.previewLock);
     g.previewWanted = time;
