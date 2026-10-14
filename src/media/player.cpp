@@ -148,6 +148,7 @@ struct {
     ComPtr<IDXGISwapChain2> chain2;  // null before Windows 8.1: then the whole swap chain is drawn
     UINT width = 0, height = 0;
     UINT drawWidth = 0, drawHeight = 0;  // the part drawn: the video's size on screen, at most the swap chain's
+    FramePainter* painter = nullptr;     // the render thread's, which keeps a buffer until told to let go
     // The subtitles drawn into the frames, which the window sets under subsLock, counting each change in subsVersion.
     SRWLOCK subsLock = SRWLOCK_INIT;
     std::shared_ptr<const Subtitles> subs;
@@ -379,6 +380,9 @@ void RenderLoop() {
     int idle = 0, latchGrace = 0;
     FrameSubtitles subtitles;
     subtitles.painter.Open(g.device.Get());
+    AcquireSRWLockExclusive(&g.lock);
+    g.painter = &subtitles.painter;
+    ReleaseSRWLockExclusive(&g.lock);
     LONGLONG frameTime = -1;  // of the frame on screen
     for (;;) {
         if (idle >= kIdleTicks && (!g.engine->HasVideo() || (g.engine->IsPaused() && !g.redraw))) {
@@ -432,6 +436,9 @@ void RenderLoop() {
             }
         }
     }
+    AcquireSRWLockExclusive(&g.lock);
+    g.painter = nullptr;
+    ReleaseSRWLockExclusive(&g.lock);
     if (timer) CloseHandle(timer);
     if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
 }
@@ -839,6 +846,7 @@ SIZE VideoSize() { return DisplaySize(g.engine.Get()); }
 
 void SetVideoSize(int width, int height) {
     AcquireSRWLockExclusive(&g.lock);
+    if (g.painter) g.painter->DropTarget();  // resizing needs the buffers let go
     const HRESULT hr = SizeChain(g.chain, UINT(width), UINT(height));
     if (SUCCEEDED(hr)) {
         if (!g.chain2) g.chain.As(&g.chain2);

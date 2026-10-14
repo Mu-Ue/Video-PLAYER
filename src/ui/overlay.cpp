@@ -122,11 +122,13 @@ class OutlineCollector final : public IDWriteTextRenderer {
     }
 } collector;
 
-// Opens Direct2D on the device for the kit's thread. Returns false, with the kit's context null, if it can't.
-bool InitKit(TextKit& kit, ID3D11Device* device) {
+// Opens Direct2D on the device for the kit's thread, or for any thread if multithreaded. Returns false, with the
+// kit's context null, if it can't.
+bool InitKit(TextKit& kit, ID3D11Device* device, bool multithreaded = false) {
     ComPtr<IDXGIDevice> dxgi;
     ComPtr<ID2D1Device> d2d;
-    HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, kit.factory.GetAddressOf());
+    HRESULT hr = D2D1CreateFactory(multithreaded ? D2D1_FACTORY_TYPE_MULTI_THREADED : D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                                   kit.factory.GetAddressOf());
     if (SUCCEEDED(hr)) hr = device->QueryInterface(IID_PPV_ARGS(&dxgi));
     if (SUCCEEDED(hr)) hr = kit.factory->CreateDevice(dxgi.Get(), &d2d);
     if (SUCCEEDED(hr)) hr = d2d->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &kit.context);
@@ -477,6 +479,8 @@ SIZE DrawOutlinedText(IDCompositionDevice* dcomp, IDCompositionVisual* visual, s
 struct FramePainter::Kit : TextKit {
     ComPtr<ID2D1Bitmap1> images[2];
     SIZE sizes[2]{};
+    ComPtr<ID2D1Bitmap1> target;  // drawing into texture, kept for the next frame
+    ID3D11Texture2D* texture = nullptr;
 };
 
 FramePainter::FramePainter() = default;
@@ -484,7 +488,8 @@ FramePainter::~FramePainter() = default;
 
 bool FramePainter::Open(ID3D11Device* device) {
     kit_ = std::make_unique<Kit>();
-    if (!InitKit(*kit_, device)) kit_.reset();
+    // Multithreaded, as the window thread lets go of the target.
+    if (!InitKit(*kit_, device, true)) kit_.reset();
     return kit_ != nullptr;
 }
 
@@ -512,16 +517,19 @@ SIZE FramePainter::Prepare(int slot, std::wstring_view text, const std::vector<S
 bool FramePainter::Draw(ID3D11Texture2D* target, const POINT at[2]) {
     if (!kit_ || (!kit_->images[0] && !kit_->images[1])) return true;
     Kit& kit = *kit_;
-    ComPtr<IDXGISurface> surface;
-    ComPtr<ID2D1Bitmap1> bitmap;
-    const D2D1_BITMAP_PROPERTIES1 props =
-        D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
-    if (FAILED(target->QueryInterface(IID_PPV_ARGS(&surface))) ||
-        FAILED(kit.context->CreateBitmapFromDxgiSurface(surface.Get(), &props, &bitmap))) {
-        return false;
+    if (target != kit.texture) {
+        DropTarget();
+        ComPtr<IDXGISurface> surface;
+        const D2D1_BITMAP_PROPERTIES1 props =
+            D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                                    D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
+        if (FAILED(target->QueryInterface(IID_PPV_ARGS(&surface))) ||
+            FAILED(kit.context->CreateBitmapFromDxgiSurface(surface.Get(), &props, &kit.target))) {
+            return false;
+        }
+        kit.texture = target;
     }
-    kit.context->SetTarget(bitmap.Get());
+    kit.context->SetTarget(kit.target.Get());
     kit.context->BeginDraw();
     kit.context->SetTransform(D2D1::Matrix3x2F::Identity());
     for (int i = 0; i < 2; ++i) {
@@ -534,6 +542,12 @@ bool FramePainter::Draw(ID3D11Texture2D* target, const POINT at[2]) {
     const bool drawn = SUCCEEDED(kit.context->EndDraw());
     kit.context->SetTarget(nullptr);
     return drawn;
+}
+
+void FramePainter::DropTarget() {
+    if (!kit_) return;
+    kit_->target.Reset();
+    kit_->texture = nullptr;
 }
 
 void DrawBar(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT width, UINT height, float scale,

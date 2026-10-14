@@ -29,8 +29,11 @@ class FramePainter {
     bool Open(ID3D11Device* device);  // false if Direct2D can't draw on it
     // Draws centered text into the image of slot 0 or 1 and returns its size in pixels; empty text clears it.
     SIZE Prepare(int slot, std::wstring_view text, const std::vector<StyleSpan>& spans, float fontSize, float maxWidth);
-    // Blends the images onto the target texture with their top left corners at at[slot].
+    // Blends the images onto the target texture with their top left corners at at[slot]. Holds on to the texture
+    // until DropTarget, for the next call with it.
     bool Draw(ID3D11Texture2D* target, const POINT at[2]);
+    // Lets go of the texture, as resizing it needs; from any thread, but never during Draw.
+    void DropTarget();
 
   private:
     struct Kit;
