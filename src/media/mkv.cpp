@@ -152,7 +152,12 @@ struct Reader {
         o.Offset = DWORD(at);
         o.OffsetHigh = DWORD(at >> 32);
         DWORD read = 0;
-        return ReadFile(file, out, DWORD(size), &read, &o) && read == size;
+        // A seek cancels a read that waits behind playback's at background priority, and has it redone without.
+        for (;;) {
+            if (seekTarget >= 0) SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+            if (ReadFile(file, out, DWORD(size), &read, &o)) return read == size;
+            if (GetLastError() != ERROR_OPERATION_ABORTED || seekTarget < 0) return false;
+        }
     }
 
     // The n bytes at `at`, fewer at the end of the file, from the buffer, which is read anew unless it holds them.
@@ -737,6 +742,7 @@ bool SeekMkvSubtitles(double seconds, UINT number) {
     seekNumber = number;
     const bool answered = answering;
     ReleaseSRWLockExclusive(&seekLock);
+    if (reader.joinable()) CancelSynchronousIo(reader.native_handle());
     return answered;
 }
 
@@ -744,6 +750,7 @@ void StopMkvSubtitles() {
     seekTarget = -1;
     if (!reader.joinable()) return;
     stopReader = true;
+    CancelSynchronousIo(reader.native_handle());
     reader.join();
     stopReader = false;
     answering = false;  // the reader is gone
