@@ -705,7 +705,7 @@ ComPtr<IDCompositionSurface> CopyPreviewPicture(HANDLE handle) {
     ComPtr<ID3D11Texture2D> shared, target;
     ComPtr<IDXGIKeyedMutex> mutex;
     if (FAILED(g.device->OpenSharedResource(handle, IID_PPV_ARGS(&shared))) || FAILED(shared.As(&mutex)) ||
-        mutex->AcquireSync(1, 1000) != S_OK) {
+        mutex->AcquireSync(1, INFINITE) != S_OK) {  // the previewer let it go before handing it over
         return nullptr;
     }
     D3D11_TEXTURE2D_DESC desc;
