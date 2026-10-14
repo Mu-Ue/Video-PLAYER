@@ -1,4 +1,4 @@
-#include "media/mp4.h"
+#include "media/source.h"
 
 #include <mfapi.h>
 #include <mferror.h>
@@ -422,4 +422,4 @@ Extension extension;
 
 }  // namespace
 
-IMFMediaEngineExtension* Mp4Extension() { return &extension; }
+IMFMediaEngineExtension* SourceExtension() { return &extension; }

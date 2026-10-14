@@ -22,7 +22,7 @@
 #include <utility>
 
 #include "config.h"
-#include "media/mp4.h"
+#include "media/source.h"
 #include "media/subtitles.h"
 #include "ui/overlay.h"
 
@@ -186,7 +186,7 @@ HRESULT CreateEngine(IMFMediaEngineNotify* notify, ComPtr<IMFMediaEngineEx>& out
     if (SUCCEEDED(hr)) hr = attributes->SetUnknown(MF_MEDIA_ENGINE_DXGI_MANAGER, g.manager.Get());
     if (SUCCEEDED(hr)) hr = attributes->SetUINT32(MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM);
     if (SUCCEEDED(hr)) hr = attributes->SetUINT32(MF_MEDIA_ENGINE_AUDIO_CATEGORY, AudioCategory_Movie);
-    if (SUCCEEDED(hr)) hr = attributes->SetUnknown(MF_MEDIA_ENGINE_EXTENSION, Mp4Extension());
+    if (SUCCEEDED(hr)) hr = attributes->SetUnknown(MF_MEDIA_ENGINE_EXTENSION, SourceExtension());
     ComPtr<IMFMediaEngineClassFactory> factory;
     if (SUCCEEDED(hr)) {
         hr = CoCreateInstance(CLSID_MFMediaEngineClassFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
