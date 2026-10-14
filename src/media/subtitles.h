@@ -31,8 +31,8 @@ bool LoadSubtitles(const std::wstring& path, Subtitles& subs);
 // other tags.
 void SetCueText(std::wstring_view raw, Cue& cue);
 
-// Adds a cue in start order, unless the same one is already there; returns true if added.
-bool AddCue(Subtitles& subs, Cue cue);
+// Adds cues in start order, after those with the same start, except ones already there; returns true if any were.
+bool AddCues(Subtitles& subs, std::vector<Cue> added);
 
 // Sets active to the indices of the cues showing at time t, in start order, and returns the next time this
 // changes (+infinity if never).

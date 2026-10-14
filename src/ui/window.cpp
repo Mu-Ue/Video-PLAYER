@@ -1081,7 +1081,7 @@ void OnSubtitleCue(WPARAM track, LPARAM cue) {
     const std::unique_ptr<Cue> owned(reinterpret_cast<Cue*>(cue));
     const auto it = std::find_if(g.tracks.begin(), g.tracks.end(),
                                  [&](const SubtitleTrack& t) { return t.path.empty() && !t.read && t.id == DWORD(track); });
-    if (it != g.tracks.end() && AddCue(it->subs, std::move(*owned)) && it - g.tracks.begin() == g.subtitle) {
+    if (it != g.tracks.end() && AddCues(it->subs, {std::move(*owned)}) && it - g.tracks.begin() == g.subtitle) {
         ShowSubtitles();
     }
 }
@@ -1091,9 +1091,7 @@ void OnSubtitleCues(WPARAM track, LPARAM cues) {
     const auto it = std::find_if(g.tracks.begin(), g.tracks.end(),
                                  [&](const SubtitleTrack& t) { return t.read && t.id == DWORD(track); });
     if (it == g.tracks.end()) return;
-    bool added = false;
-    for (Cue& cue : *owned) added |= AddCue(it->subs, std::move(cue));
-    if (added && it - g.tracks.begin() == g.subtitle) ShowSubtitles();
+    if (AddCues(it->subs, std::move(*owned)) && it - g.tracks.begin() == g.subtitle) ShowSubtitles();
 }
 
 // Plays the audio track or shows the subtitle track (0 for off) in the panel's column and row.

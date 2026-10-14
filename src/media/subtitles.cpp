@@ -208,17 +208,28 @@ bool LoadSubtitles(const std::wstring& path, Subtitles& subs) {
     return true;
 }
 
-bool AddCue(Subtitles& subs, Cue cue) {
+bool AddCues(Subtitles& subs, std::vector<Cue> added) {
     auto& cues = subs.cues;
-    const auto at = std::upper_bound(cues.begin(), cues.end(), cue.start,
-                                     [](double time, const Cue& c) { return time < c.start; });
-    for (auto it = at; it != cues.begin() && (it - 1)->start == cue.start;) {
-        --it;
-        if (it->end == cue.end && it->top == cue.top && it->text == cue.text) return false;
+    const auto byStart = [](const Cue& a, const Cue& b) { return a.start < b.start; };
+    std::stable_sort(added.begin(), added.end(), byStart);
+    // They are appended, then merged in at once, as inserting each would move all after it.
+    const size_t old = cues.size();
+    size_t from = old;  // where the first one goes, from which on reach changes
+    for (Cue& cue : added) {
+        const auto same = [&](const Cue& c) { return c.end == cue.end && c.top == cue.top && c.text == cue.text; };
+        const auto at = std::upper_bound(cues.begin(), cues.begin() + old, cue.start,
+                                         [](double time, const Cue& c) { return time < c.start; });
+        bool there = false;
+        for (auto it = at; !there && it != cues.begin() && (it - 1)->start == cue.start;) there = same(*--it);
+        for (size_t k = cues.size(); !there && k > old && cues[k - 1].start == cue.start;) there = same(cues[--k]);
+        if (there) continue;
+        from = std::min(from, size_t(at - cues.begin()));
+        cues.push_back(std::move(cue));
     }
-    const size_t i = size_t(cues.insert(at, std::move(cue)) - cues.begin());
+    if (cues.size() == old) return false;
+    std::inplace_merge(cues.begin(), cues.begin() + old, cues.end(), byStart);
     subs.reach.resize(cues.size());
-    for (size_t k = i; k < cues.size(); ++k) subs.reach[k] = std::max(k ? subs.reach[k - 1] : 0.0, cues[k].end);
+    for (size_t k = from; k < cues.size(); ++k) subs.reach[k] = std::max(k ? subs.reach[k - 1] : 0.0, cues[k].end);
     return true;
 }
 
