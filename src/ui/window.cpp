@@ -129,6 +129,9 @@ struct Window {
     bool seekBusy = false, seekQueued = false, seekFast = false;
     double seekTarget = 0;  // of the latest seek
     UINT subtitleSeek = 0;  // the number of the last seek the subtitle reader was told of
+    // The seek in flight waits for the reader to have that seek's cues, then lands here.
+    bool seekWaits = false, landingFast = false;
+    double landing = 0;
     // A key frame seek by a step, from seekFrom: redone exactly if it lands on the wrong side of seekFrom.
     bool seekCheck = false;
     double seekFrom = 0;
@@ -1002,7 +1005,7 @@ bool OpenVideoFile(const std::wstring& path) {
     }
     // Seeks and tracks belong to the video they were for.
     g.duration = NAN;
-    g.seekBusy = g.seekQueued = g.seekCheck = false;
+    g.seekBusy = g.seekQueued = g.seekCheck = g.seekWaits = false;
     SetPanelOpen(false);
     g.tracks.clear();
     g.subtitle = g.lastSubtitle = g.audioTrack = -1;
@@ -1010,7 +1013,6 @@ bool OpenVideoFile(const std::wstring& path) {
     g.audio.clear();
     // Stop reading the previous video's subtitles and drop any of its cues still queued.
     StopMkvSubtitles();
-    HoldFrames(false);
     for (MSG msg; PeekMessageW(&msg, g.hwnd, WM_APP_SUBTITLE_CUE, WM_APP_SUBTITLE_CUE, PM_REMOVE);) {
         delete reinterpret_cast<Cue*>(msg.lParam);
     }
@@ -1136,12 +1138,19 @@ void ShowMenu(Control which) {
     }
 }
 
-// Starts the engine's seek, and has the subtitle reader go on from where it lands. While the track shown is one the
-// reader reads, frames wait for the cues there, so the first one never shows without them.
+// Has the subtitle reader go on from where the seek lands, and starts the engine's seek. While the track shown is
+// one the reader reads, the engine's seek waits until the cues there are read, so its first frame never shows
+// without them; the reader answers each seek it is told of, so it always comes.
 void StartSeek(double seconds, bool fast) {
-    const double landing = SeekTo(seconds, fast);
+    const double landing = SeekLanding(seconds, fast);
     const bool read = g.subtitle >= 0 && g.tracks[size_t(g.subtitle)].read;
-    HoldFrames(SeekMkvSubtitles(landing, ++g.subtitleSeek) && read);
+    g.seekWaits = SeekMkvSubtitles(landing, ++g.subtitleSeek) && read;
+    if (g.seekWaits) {
+        g.landing = landing;
+        g.landingFast = fast;
+    } else {
+        SeekTo(landing, fast);
+    }
 }
 
 // Seeks to a time within the video and returns it; the caller shows it. While a seek is in flight the new one waits, replacing any
@@ -1329,7 +1338,7 @@ void OnMediaEvent(WPARAM event, LPARAM param) {
             UpdateControls();
             break;
         case MF_MEDIA_ENGINE_EVENT_ERROR: {
-            g.playing = g.seekBusy = g.seekQueued = g.seekCheck = false;
+            g.playing = g.seekBusy = g.seekQueued = g.seekCheck = g.seekWaits = false;
             SetThreadExecutionState(ES_CONTINUOUS);
             // The video given on the command line failed before the window showed: like a failed start, close.
             const bool starting = !IsWindowVisible(g.hwnd);
@@ -1419,7 +1428,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             OnSubtitleCues(wp, lp);
             return 0;
         case WM_APP_SUBTITLES_READY:
-            if (UINT(wp) == g.subtitleSeek) HoldFrames(false);  // its cues came before it
+            if (g.seekWaits && UINT(wp) == g.subtitleSeek) {  // its cues are read
+                g.seekWaits = false;
+                SeekTo(g.landing, g.landingFast);
+            }
             return 0;
         case WM_APP_FRAME:
             OnFrame();
