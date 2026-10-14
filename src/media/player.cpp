@@ -127,6 +127,7 @@ struct {
     UINT64 previewFenceValue = 0;
     SRWLOCK previewLock = SRWLOCK_INIT;
     std::wstring previewPath;
+    bool previewOpen = false;  // whether to open previewPath yet
     UINT previewWidth = 0, previewHeight = 0;
     LONGLONG previewWanted = -1;  // the key frame to decode, in 100 ns units, or -1
     LONGLONG readyTime = -1;      // a decoded picture waiting for the window, and its key frame
@@ -134,7 +135,9 @@ struct {
     ComPtr<ID3D11Texture2D> taken;  // the last one the window took, alive while it opens it
     double previewBucket = -1;      // the window's last span
     LONGLONG previewKey = -1;       // and its key frame
-    // A second parser of the open file, which knows where its key frames are; null if the format doesn't say.
+    // A second parser of the open file, which knows where its key frames are; null if the format doesn't say, or
+    // until OpenSeekHelpers opens keyPath.
+    std::wstring keyPath;
     ComPtr<IMFMediaSource> keySource;
     ComPtr<IMFSeekInfo> keyFrames;
     bool started = false;  // MFStartup succeeded
@@ -641,7 +644,7 @@ void PreviewLoop() {
     const HANDLE events[] = {g.stop, g.previewWake};
     for (;;) {
         AcquireSRWLockExclusive(&g.previewLock);
-        const std::wstring path = std::exchange(g.previewPath, {});
+        const std::wstring path = g.previewOpen ? std::exchange(g.previewPath, {}) : std::wstring();
         const LONGLONG time = g.previewWanted;
         ReleaseSRWLockExclusive(&g.previewLock);
         if (!path.empty()) {
@@ -727,17 +730,30 @@ HRESULT OpenVideo(const std::wstring& path) {
     Redraw();  // the first frame, even if it never plays
     if (SUCCEEDED(hr)) hr = g.engine->Play();
     if (FAILED(hr)) return hr;
-    OpenKeyFrames(path);
-    // The previewer reads the file on its own; if it can't, there are just no previews.
+    // The last file's key frames and previews are done with; OpenSeekHelpers opens this one's.
+    CloseKeyFrames();
+    g.keyPath = path;
     AcquireSRWLockExclusive(&g.previewLock);
     g.previewPath = path;
+    g.previewOpen = false;
     g.previewWanted = -1;
     g.ready.Reset();
     ReleaseSRWLockExclusive(&g.previewLock);
     g.previewBucket = -1;
     g.previewKey = -1;
-    SetEvent(g.previewWake);
     return hr;
+}
+
+void OpenSeekHelpers() {
+    const std::wstring path = std::exchange(g.keyPath, {});
+    if (path.empty()) return;
+    OpenKeyFrames(path);
+    g.previewBucket = -1;  // a span looked up before has its key frame now
+    // The previewer reads the file on its own; if it can't, there are just no previews.
+    AcquireSRWLockExclusive(&g.previewLock);
+    g.previewOpen = true;
+    ReleaseSRWLockExclusive(&g.previewLock);
+    SetEvent(g.previewWake);
 }
 
 LONGLONG PreviewKeyFrame(double seconds, double duration) {

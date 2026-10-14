@@ -1296,6 +1296,7 @@ void OnMediaEvent(WPARAM event, LPARAM param) {
             Layout();
             break;
         case MF_MEDIA_ENGINE_EVENT_FIRSTFRAMEREADY:
+            OpenSeekHelpers();
             Layout();
             break;
         case MF_MEDIA_ENGINE_EVENT_PLAYING:
