@@ -373,25 +373,60 @@ void RequestFrame() {
 
 namespace {
 
+// Tells how often the compositor composes: through the frame statistics of Windows 11, or before that through a
+// device of its own.
+class CompositorClock {
+  public:
+    explicit CompositorClock(ID3D11Device* device) {
+        const HMODULE dcomp = GetModuleHandleW(L"dcomp.dll");
+        getFrameId_ = reinterpret_cast<GetFrameIdFn>(GetProcAddress(dcomp, "DCompositionGetFrameId"));
+        getStatistics_ = reinterpret_cast<GetStatisticsFn>(GetProcAddress(dcomp, "DCompositionGetStatistics"));
+        if (!getFrameId_ || !getStatistics_) {
+            if (ComPtr<IDXGIDevice> dxgi; SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dxgi)))) {
+                DCompositionCreateDevice(dxgi.Get(), IID_PPV_ARGS(&device_));
+            }
+        }
+        QueryPerformanceFrequency(&frequency_);
+    }
+
+    // The time between compositor frames, in performance counter ticks; 0 if unknown.
+    LONGLONG Period() const {
+        if (getFrameId_ && getStatistics_) {
+            COMPOSITION_FRAME_ID id;
+            COMPOSITION_FRAME_STATS stats;
+            return SUCCEEDED(getFrameId_(COMPOSITION_FRAME_ID_CREATED, &id)) &&
+                           SUCCEEDED(getStatistics_(id, &stats, 0, nullptr, nullptr))
+                       ? LONGLONG(stats.framePeriod)
+                       : 0;
+        }
+        DCOMPOSITION_FRAME_STATISTICS stats;
+        if (!device_ || FAILED(device_->GetFrameStatistics(&stats)) || !stats.currentCompositionRate.Numerator) return 0;
+        return frequency_.QuadPart * stats.currentCompositionRate.Denominator / stats.currentCompositionRate.Numerator;
+    }
+    LONGLONG Frequency() const { return frequency_.QuadPart; }
+
+  private:
+    using GetFrameIdFn = HRESULT(WINAPI*)(COMPOSITION_FRAME_ID_TYPE, COMPOSITION_FRAME_ID*);
+    using GetStatisticsFn = HRESULT(WINAPI*)(COMPOSITION_FRAME_ID, COMPOSITION_FRAME_STATS*, UINT,
+                                             COMPOSITION_TARGET_ID*, UINT*);
+    GetFrameIdFn getFrameId_ = nullptr;
+    GetStatisticsFn getStatistics_ = nullptr;
+    ComPtr<IDCompositionDevice> device_;
+    LARGE_INTEGER frequency_;
+};
+
 // The time between compositor frames, in 100 ns units, or 0 if unknown.
-LONGLONG CompositorPeriod(IDCompositionDevice* clock) {
-    DCOMPOSITION_FRAME_STATISTICS stats;
-    if (!clock || FAILED(clock->GetFrameStatistics(&stats)) || !stats.currentCompositionRate.Numerator) return 0;
-    return 10'000'000LL * stats.currentCompositionRate.Denominator / stats.currentCompositionRate.Numerator;
+LONGLONG CompositorPeriod(const CompositorClock& clock) {
+    return clock.Period() * 10'000'000 / clock.Frequency();
 }
 
 // Waits until shortly before the compositor frame after the one at tick, a performance counter time, so the window
 // can update as late as it can and still make that frame; at once if it can't tell when that is. Returns false if
 // told to stop.
-bool WaitBeforeNextFrame(IDCompositionDevice* clock, HANDLE timer, LONGLONG tick) {
-    DCOMPOSITION_FRAME_STATISTICS stats;
-    if (!clock || !timer || FAILED(clock->GetFrameStatistics(&stats)) || stats.timeFrequency.QuadPart <= 0 ||
-        !stats.currentCompositionRate.Numerator) {
-        return true;
-    }
-    const LONGLONG freq = stats.timeFrequency.QuadPart;
-    const LONGLONG next =
-        tick + freq * stats.currentCompositionRate.Denominator / stats.currentCompositionRate.Numerator;
+bool WaitBeforeNextFrame(const CompositorClock& clock, HANDLE timer, LONGLONG tick) {
+    const LONGLONG period = clock.Period(), freq = clock.Frequency();
+    if (!timer || period <= 0) return true;
+    const LONGLONG next = tick + period;
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     // Until 2 ms before it, for the window and the compositor, in 100 ns units.
@@ -422,11 +457,8 @@ void RenderLoop() {
         ComPtr<IDXGIAdapter> adapter;
         if (SUCCEEDED(g.device.As(&dxgi)) && SUCCEEDED(dxgi->GetAdapter(&adapter))) adapter->EnumOutputs(0, &output);
     }
-    // A device just to tell when the next frame is. Without it or a fine timer, WM_APP_FRAME is posted at once.
-    ComPtr<IDCompositionDevice> clock;
-    if (ComPtr<IDXGIDevice> dxgi; SUCCEEDED(g.device.As(&dxgi))) {
-        DCompositionCreateDevice(dxgi.Get(), IID_PPV_ARGS(&clock));
-    }
+    // Without it or a fine timer, WM_APP_FRAME is posted at once.
+    const CompositorClock clock(g.device.Get());
     const HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     constexpr int kLatchTicks = 30;  // frames to keep waiting for WM_APP_FRAME's moment after the last request
     const HANDLE events[] = {g.stop, g.renderWake};
@@ -465,8 +497,8 @@ void RenderLoop() {
         // frames come no faster than the fastest yet.
         if (!fresh && waitClock && !g.engine->IsPaused() &&
             (!fastest || frameTime + fastest - std::llround(g.engine->GetCurrentTime() * 1e7) <=
-                             CompositorPeriod(clock.Get()))) {
-            if (!WaitBeforeNextFrame(clock.Get(), timer, tick.QuadPart)) break;
+                             CompositorPeriod(clock))) {
+            if (!WaitBeforeNextFrame(clock, timer, tick.QuadPart)) break;
             fresh = g.engine->OnVideoStreamTick(&pts) == S_OK;
         }
         if (fresh) {
@@ -499,7 +531,7 @@ void RenderLoop() {
         // Then waits for the next frame's latest moment while frames are wanted, and a little after, as a request
         // that comes just after a frame begins would otherwise wait out the next one.
         if (g.frameWanted || latchGrace > 0) {
-            if (!WaitBeforeNextFrame(clock.Get(), timer, tick.QuadPart)) break;
+            if (!WaitBeforeNextFrame(clock, timer, tick.QuadPart)) break;
             if (g.frameWanted.exchange(false)) {
                 latchGrace = kLatchTicks;
                 PostMessageW(g.notify.hwnd, WM_APP_FRAME, 0, 0);
