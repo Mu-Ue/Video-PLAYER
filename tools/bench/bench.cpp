@@ -68,6 +68,7 @@ struct Clip {
     int flashEvery = 0;  // frames between flashes, as make_clips.ps1 sets it
     std::vector<std::pair<double, double>> cues;  // start, end in seconds
     std::vector<double> pts;  // each frame's, as the container stores it
+    std::vector<bool> kept;   // of a variable rate clip (v60_...), which 60 fps frames it has; empty otherwise
 };
 
 double ParseSrtTime(const std::string& s) {
@@ -81,7 +82,7 @@ Clip LoadClip(const std::wstring& path) {
     if (name.rfind(L"r23976_", 0) == 0) c.fps = 24000.0 / 1001;
     else if (name.rfind(L"r24_", 0) == 0) c.fps = 24;
     else if (name.rfind(L"r30_", 0) == 0) c.fps = 30;
-    else if (name.rfind(L"r60_", 0) == 0) c.fps = 60;
+    else if (name.rfind(L"r60_", 0) == 0 || name.rfind(L"v60_", 0) == 0) c.fps = 60;
     else Fail("clip name must start with its rate, as make_clips.ps1 names it");
     c.width = name.find(L"_2160_") != std::wstring::npos ? 3840 : 1920;
     c.height = c.width * 9 / 16;
@@ -89,6 +90,14 @@ Clip LoadClip(const std::wstring& path) {
     const std::wstring stem = path.substr(0, path.find_last_of(L'.'));
     std::ifstream ptsFile(stem + L".pts");
     for (double t; ptsFile >> t;) c.pts.push_back(t);
+    if (name.rfind(L"v60_", 0) == 0) {  // its frames carry the numbers of the 60 fps frames it kept
+        for (const double t : c.pts) {
+            const size_t n = size_t(std::lround(t * c.fps));
+            if (c.kept.size() <= n) c.kept.resize(n + 1);
+            c.kept[n] = true;
+        }
+        c.pts.clear();
+    }
     std::ifstream srt(stem + L".srt");
     for (std::string line; std::getline(srt, line);) {
         const size_t arrow = line.find(" --> ");
@@ -694,7 +703,9 @@ int wmain(int argc, wchar_t** argv) {
             points.push_back({Ms(changes[i].time - launched) / 1000, changes[i].frame / clip.fps});
             if (i > 0 && !afterSeek[i - 1] && changes[i].frame > changes[i - 1].frame + 1 &&
                 changes[i].frame <= changes[i - 1].frame + clip.fps) {
-                dropped += changes[i].frame - changes[i - 1].frame - 1;
+                for (int n = changes[i - 1].frame + 1; n < changes[i].frame; ++n) {
+                    dropped += clip.kept.empty() || (size_t(n) < clip.kept.size() && clip.kept[size_t(n)]);
+                }
             }
             ++steady;
         }

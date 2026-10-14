@@ -5,7 +5,7 @@
 # middle for exactly one frame, with a 10 ms click on the audio at the same time, for the A/V offset. The rest is
 # gray, so white subtitle text stands out. Cue edges fall at varied phases within frames.
 
-param([int]$Seconds = 60)
+param([int]$Seconds = 60, [string]$Only)  # Only: make just the clip of this name
 $ErrorActionPreference = 'Stop'
 $out = Join-Path $PSScriptRoot 'clips'
 New-Item -ItemType Directory -Force $out | Out-Null
@@ -31,6 +31,7 @@ function Write-Srt([string]$path, [double]$fps) {
 }
 
 function New-Clip([string]$name, [string]$rate, [int]$w, [int]$h, [string]$codec, [string[]]$extra) {
+    if ($Only -and $name -ne $Only) { return }
     $fps = $rates[$rate]
     $f = [double](Invoke-Expression ($fps -replace '/', ' / '))
     # The pattern at a small size, scaled up without smoothing; FPS*2 frames apart is 2 s.
@@ -38,6 +39,11 @@ function New-Clip([string]$name, [string]$rate, [int]$w, [int]$h, [string]$codec
     # The bits sit from 15% to 25% of the height, clear of the player's top-left OSD and the subtitles.
     $geq = "lum='if(between(Y,H*0.15,H*0.2-1),if(mod(floor(N/pow(2,floor(X*16/W))),2),255,0),if(between(Y,H*0.2,H*0.25-1),if(mod(floor(N/pow(2,floor(X*16/W))),2),0,255),if(eq(mod(N,$flashEvery),0)*between(Y,H*0.35,H*0.65)*between(X,W*0.35,W*0.65),255,96)))':cb=128:cr=128"
     $video = "color=c=gray:s=256x144:r=${fps}:d=$Seconds,format=yuv444p,geq=$geq,scale=${w}:${h}:flags=neighbor,format=yuv420p"
+    # Variable rate: every 2 s it keeps every 3rd, every, every 2nd, then every 5th frame, so the rate both
+    # rises and falls. Each segment starts on a flash frame, which is kept.
+    if ($extra -contains 'vfr') {
+        $video += ",select='if(eq(mod(floor(n/$flashEvery),4),0),not(mod(n,3)),if(eq(mod(floor(n/$flashEvery),4),1),1,if(eq(mod(floor(n/$flashEvery),4),2),not(mod(n,2)),not(mod(n,5)))))'"
+    }
     # The click starts with the flash frame: frame k*flashEvery is at k*flashEvery/fps seconds.
     $audio = "aevalsrc='if(lt(t-floor(t*$f/$flashEvery)*$flashEvery/$f,0.01),0.8*sin(2*PI*1000*t),0)':s=48000:d=$Seconds"
     $srt = Join-Path $out "$name.srt"
@@ -51,6 +57,7 @@ function New-Clip([string]$name, [string]$rate, [int]$w, [int]$h, [string]$codec
     $a += $codecArgs + @('-preset', 'veryfast', '-g', [string]$flashEvery, '-c:a', 'aac', '-b:a', '128k')
     if ($ext -eq 'mkv') { $a += '-c:s', 'srt' }
     if ($extra -contains 'live') { $a += '-live', '1' }  # no index
+    if ($extra -contains 'vfr') { $a += '-fps_mode', 'vfr' }
     $file = Join-Path $out "$name.$ext"
     Write-Host "Making $file"
     & ffmpeg @a $file
@@ -70,3 +77,4 @@ New-Clip 'r60_1080_h264' '60' 1920 1080 'h264' @()
 New-Clip 'r23976_1080_h264_subs' '23.976' 1920 1080 'h264' @('mkv')
 New-Clip 'r23976_2160_hevc_subs' '23.976' 3840 2160 'hevc' @('mkv')
 New-Clip 'r23976_1080_h264_noindex' '23.976' 1920 1080 'h264' @('mkv', 'live')
+New-Clip 'v60_1080_h264' '60' 1920 1080 'h264' @('vfr')
