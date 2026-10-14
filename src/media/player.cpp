@@ -385,8 +385,8 @@ bool WaitBeforeNextFrame(IDCompositionDevice* clock, HANDLE timer, LONGLONG tick
         tick + freq * stats.currentCompositionRate.Denominator / stats.currentCompositionRate.Numerator;
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    // Until 2 ms before it, for the window and the compositor, in 100 ns units and at most 50 ms.
-    const LONGLONG wait = std::min((next - now.QuadPart - freq / 500) * 10'000'000 / freq, 500000LL);
+    // Until 2 ms before it, for the window and the compositor, in 100 ns units.
+    const LONGLONG wait = (next - now.QuadPart - freq / 500) * 10'000'000 / freq;
     if (wait <= 0) return true;
     LARGE_INTEGER due;
     due.QuadPart = -wait;  // relative
