@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <map>
 #include <memory>
 #include <string_view>
@@ -612,8 +613,9 @@ struct Reader {
 };
 
 // Reads the file header, Info and Tracks, which come before the first cluster, and finds the index. Also gives each
-// audio track's CodecDelay in nanoseconds, in track order, if asked.
-bool ReadHeaders(Reader& r, std::vector<Track>& out, std::vector<UINT64>* audioDelays = nullptr) {
+// audio track's CodecDelay in nanoseconds, in track order, and the first video track's number, if asked.
+bool ReadHeaders(Reader& r, std::vector<Track>& out, std::vector<UINT64>* audioDelays = nullptr,
+                 UINT64* videoTrack = nullptr) {
     Element e;
     std::vector<BYTE> data;
     if (!r.Header(0, e) || e.id != kEbml || !r.Data(e, data, kMaxHeaderBytes)) return false;
@@ -701,6 +703,7 @@ bool ReadHeaders(Reader& r, std::vector<Track>& out, std::vector<UINT64>* audioD
             }
         });
         if (type == 2 && audioDelays) audioDelays->push_back(delay);
+        if (type == 1 && videoTrack && !*videoTrack) *videoTrack = t.number;
         if (type != 0x11 || !text) return;
         if (encoded || !t.number || t.number > MAXDWORD || r.Find(t.number) || t.prefix.size() > kMaxBlockBytes) {
             readable = false;
@@ -730,6 +733,33 @@ bool OpenFile(Reader& r, const wchar_t* path) {
 }
 
 }  // namespace
+
+std::vector<LONGLONG> MkvKeyFrames(const wchar_t* path) {
+    Reader r;
+    std::vector<Track> tracks;
+    std::vector<BYTE> index;
+    UINT64 video = 0;
+    if (!OpenFile(r, path)) return {};
+    ReadHeaders(r, tracks, nullptr, &video);
+    if (!video || r.cues == kUnknown || !r.ElementAt(r.cues, kCues, index, kMaxSubtitleBytes)) return {};
+    std::vector<LONGLONG> times;
+    Children(index.data(), index.data() + index.size(), [&](UINT32 id, const BYTE* d, size_t s) {
+        if (id != kCuePoint) return;
+        UINT64 cueTime = kUnknown;
+        bool listed = false;
+        Children(d, d + s, [&](UINT32 id2, const BYTE* d2, size_t s2) {
+            if (id2 == kCueTime) cueTime = UInt(d2, s2);
+            if (id2 != kCueTrackPositions) return;
+            Children(d2, d2 + s2, [&](UINT32 field, const BYTE* v, size_t n) {
+                if (field == kCueTrack && UInt(v, n) == video) listed = true;
+            });
+        });
+        if (listed && cueTime != kUnknown) times.push_back(std::llround(double(cueTime) * r.scale * 1e7));
+    });
+    std::sort(times.begin(), times.end());
+    times.erase(std::unique(times.begin(), times.end()), times.end());
+    return times;
+}
 
 std::vector<LONGLONG> MkvAudioDelays(const wchar_t* path) {
     Reader r;

@@ -25,3 +25,6 @@ void StopMkvSubtitles();
 // The CodecDelay of each audio track of a Matroska or WebM file, in track order, in 100 ns units; empty if it isn't
 // one. Media Foundation plays that much encoder delay (such as AAC's priming) at the start of each track.
 std::vector<LONGLONG> MkvAudioDelays(const wchar_t* path);
+// The times of a Matroska or WebM file's video key frames that its index lists, sorted, in 100 ns units; empty if it
+// isn't one or has no index.
+std::vector<LONGLONG> MkvKeyFrames(const wchar_t* path);

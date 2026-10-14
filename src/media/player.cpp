@@ -22,6 +22,7 @@
 #include <utility>
 
 #include "config.h"
+#include "media/mkv.h"
 #include "media/source.h"
 #include "media/subtitles.h"
 #include "ui/overlay.h"
@@ -600,6 +601,40 @@ std::wstring StreamString(DWORD stream, REFGUID key) {
     return s;
 }
 
+// Where the key frames are, from a list of their times, for a file whose parser doesn't say.
+class KeyFrameList final : public IMFSeekInfo {
+  public:
+    explicit KeyFrameList(std::vector<LONGLONG> times) : times_(std::move(times)) {}
+
+    STDMETHODIMP QueryInterface(REFIID riid, void** object) override {
+        if (!object) return E_POINTER;
+        *object = riid == __uuidof(IUnknown) || riid == __uuidof(IMFSeekInfo) ? this : nullptr;
+        if (!*object) return E_NOINTERFACE;
+        AddRef();
+        return S_OK;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return ++refs_; }
+    STDMETHODIMP_(ULONG) Release() override {
+        const ULONG left = --refs_;
+        if (!left) delete this;
+        return left;
+    }
+    // The key frames at or before the time and after it, or the first or last one past either end.
+    STDMETHODIMP GetNearestKeyFrames(const GUID* format, const PROPVARIANT* start, PROPVARIANT* before,
+                                     PROPVARIANT* after) override {
+        if ((format && *format != GUID_NULL) || !start || start->vt != VT_I8 || !before || !after) return E_INVALIDARG;
+        const auto next = std::upper_bound(times_.begin(), times_.end(), start->hVal.QuadPart);
+        before->vt = after->vt = VT_I8;
+        before->hVal.QuadPart = next == times_.begin() ? times_.front() : *(next - 1);
+        after->hVal.QuadPart = next == times_.end() ? times_.back() : *next;
+        return S_OK;
+    }
+
+  private:
+    std::atomic<ULONG> refs_ = 1;
+    const std::vector<LONGLONG> times_;  // not empty
+};
+
 // The key frame nearest to a time, in seconds, or the time itself if unknown.
 double NearestKeyFrame(IMFSeekInfo* keyFrames, double seconds) {
     if (!keyFrames) return seconds;
@@ -769,6 +804,10 @@ void PreviewLoop() {
             ComPtr<IMFSeekInfo> keyFrames;
             if (source && SUCCEEDED(source.As(&service))) {
                 service->GetService(MF_SCRUBBING_SERVICE, IID_PPV_ARGS(&keyFrames));
+            }
+            // Media Foundation's Matroska parser doesn't say, but the file's index lists them.
+            if (std::vector<LONGLONG> times; !keyFrames && !(times = MkvKeyFrames(path.c_str())).empty()) {
+                keyFrames.Attach(new (std::nothrow) KeyFrameList(std::move(times)));
             }
             AcquireSRWLockExclusive(&g.previewLock);
             if (g.previewPath.empty()) g.openedKeyFrames = std::move(keyFrames);  // else another file is waiting
