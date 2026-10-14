@@ -157,6 +157,7 @@ struct {
     std::atomic<bool> redraw = false;  // present the current frame even if it isn't new; set with Redraw
     std::atomic<bool> frameWanted = false;  // post WM_APP_FRAME before the next frame; set with RequestFrame
     std::atomic<LONGLONG> landing = -1;     // of the last seek, in 100 ns units, until its frame shows
+    std::atomic<bool> opened = false;       // a new video was opened, whose frames may come faster
     HANDLE stop = nullptr;             // tells the render thread and the previewer to exit
     HANDLE renderWake = nullptr;       // set on each engine event and redraw, while the render thread sleeps
     std::thread renderer;
@@ -372,6 +373,13 @@ void RequestFrame() {
 
 namespace {
 
+// The time between compositor frames, in 100 ns units, or 0 if unknown.
+LONGLONG CompositorPeriod(IDCompositionDevice* clock) {
+    DCOMPOSITION_FRAME_STATISTICS stats;
+    if (!clock || FAILED(clock->GetFrameStatistics(&stats)) || !stats.currentCompositionRate.Numerator) return 0;
+    return 10'000'000LL * stats.currentCompositionRate.Denominator / stats.currentCompositionRate.Numerator;
+}
+
 // Waits until shortly before the compositor frame after the one at tick, a performance counter time, so the window
 // can update as late as it can and still make that frame; at once if it can't tell when that is. Returns false if
 // told to stop.
@@ -429,7 +437,10 @@ void RenderLoop() {
     g.painter = &subtitles.painter;
     ReleaseSRWLockExclusive(&g.lock);
     LONGLONG frameTime = -1;  // of the frame on screen
+    LONGLONG fastest = 0;     // the shortest time between frames of the video yet, or 0
+    LONGLONG previous = -1;   // the video's last frame, for that
     for (;;) {
+        if (g.opened.exchange(false)) fastest = 0, previous = -1;
         if (idle >= kIdleTicks && (!g.engine->HasVideo() || (g.engine->IsPaused() && !g.redraw))) {
             if (WaitForMultipleObjects(2, events, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) break;
             idle = 0;
@@ -450,8 +461,11 @@ void RenderLoop() {
         LONGLONG pts;
         bool fresh = g.engine->OnVideoStreamTick(&pts) == S_OK;
         // While playing, a frame not due yet is looked for again just before the next compositor frame, so it makes
-        // that frame rather than racing the compositor at the following tick.
-        if (!fresh && waitClock && !g.engine->IsPaused()) {
+        // that frame rather than racing the compositor at the following tick; unless none can be due by then, as
+        // frames come no faster than the fastest yet.
+        if (!fresh && waitClock && !g.engine->IsPaused() &&
+            (!fastest || frameTime + fastest - std::llround(g.engine->GetCurrentTime() * 1e7) <=
+                             CompositorPeriod(clock.Get()))) {
             if (!WaitBeforeNextFrame(clock.Get(), timer, tick.QuadPart)) break;
             fresh = g.engine->OnVideoStreamTick(&pts) == S_OK;
         }
@@ -462,7 +476,8 @@ void RenderLoop() {
             if (landing >= 0 && std::abs(pts - landing) <= 1 && g.landing.compare_exchange_strong(landing, -1)) {
                 pts = LandedFrameTime(pts);
             }
-            frameTime = pts;
+            if (previous >= 0 && pts > previous && (!fastest || pts - previous < fastest)) fastest = pts - previous;
+            frameTime = previous = pts;
         }
         if (fresh || g.redraw) {
             // The subtitles are laid out outside the lock, so the window never waits for that.
@@ -779,6 +794,7 @@ HRESULT OpenVideo(const std::wstring& path) {
     if (FAILED(hr)) return hr;
     BSTR name = SysAllocString(path.c_str());  // the extension helps pick the container parser
     if (!name) return E_OUTOFMEMORY;
+    g.opened = true;
     hr = g.engine->SetSourceFromByteStream(stream.Get(), name);
     SysFreeString(name);
     Redraw();  // the first frame, even if it never plays
