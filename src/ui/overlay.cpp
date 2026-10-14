@@ -477,8 +477,7 @@ SIZE DrawOutlinedText(IDCompositionDevice* dcomp, IDCompositionVisual* visual, s
 
 
 struct FramePainter::Kit : TextKit {
-    ComPtr<ID2D1Bitmap1> images[2];
-    SIZE sizes[2]{};
+    ComPtr<ID2D1Bitmap1> images[4];
     ComPtr<ID2D1Bitmap1> target;  // drawing into texture, kept for the next frame
     ID3D11Texture2D* texture = nullptr;
 };
@@ -498,7 +497,7 @@ SIZE FramePainter::Prepare(int slot, std::wstring_view text, const std::vector<S
     if (!kit_) return {};
     Kit& kit = *kit_;
     kit.images[slot].Reset();
-    kit.sizes[slot] = OutlineText(kit, text, spans, fontSize, maxWidth, true, [&](UINT w, UINT h, const auto& draw) {
+    return OutlineText(kit, text, spans, fontSize, maxWidth, true, [&](UINT w, UINT h, const auto& draw) {
         const D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
             D2D1_BITMAP_OPTIONS_TARGET, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
         ComPtr<ID2D1Bitmap1> image;
@@ -511,7 +510,12 @@ SIZE FramePainter::Prepare(int slot, std::wstring_view text, const std::vector<S
         if (drawn) kit.images[slot] = std::move(image);
         return drawn;
     });
-    return kit.sizes[slot];
+}
+
+void FramePainter::Swap() {
+    if (!kit_) return;
+    kit_->images[0].Swap(kit_->images[2]);
+    kit_->images[1].Swap(kit_->images[3]);
 }
 
 bool FramePainter::Draw(ID3D11Texture2D* target, const POINT at[2]) {

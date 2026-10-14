@@ -10,6 +10,7 @@
 struct StyleSpan {
     UINT32 start, length;
     bool italic, bold;
+    bool operator==(const StyleSpan&) const = default;
 };
 
 struct Cue {

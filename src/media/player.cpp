@@ -211,56 +211,100 @@ HRESULT CreateEngines() {
     return hr;
 }
 
-// The render thread's subtitles: the cues drawn into the frames from time `from` until `next` (100 ns units).
+// What subtitles drawn into frames w wide show.
+struct FrameText {
+    std::wstring text[2];  // bottom, top
+    std::vector<StyleSpan> spans[2];
+    SubtitleLayout layout{};
+    UINT width = 0;
+    bool operator==(const FrameText&) const = default;
+};
+
+// The render thread's subtitles: those drawn into the frames from time `from` until `next` (100 ns units), in the
+// painter's slots 0 and 1, and in slots 2 and 3 those drawn ahead for a time to come.
 struct FrameSubtitles {
     FramePainter painter;
     UINT version = UINT_MAX;
     UINT width = 0;  // of the frames they are laid out for
     LONGLONG from = LLONG_MAX, next = LLONG_MIN;
-    std::vector<size_t> shown;  // indices of the cues
-    POINT at[2]{};              // where the bottom and top ones go
+    FrameText drawn, ahead;
+    POINT at[2]{}, aheadAt[2]{};  // where the bottom and top ones go
+    UINT aheadVersion = UINT_MAX, aheadWidth = 0;
+    LONGLONG aheadTime = LLONG_MIN;  // looked up ahead for
 };
 
-// Draws the cues showing at time t, a frame's (negative before the first), into the painter's images for frames w
-// wide, unless they already are.
-void UpdateFrameSubtitles(FrameSubtitles& f, LONGLONG t, UINT w) {
-    const UINT version = g.subsVersion;
-    if (version == f.version && w == f.width && t >= f.from && t < f.next) return;
+// The cues showing at time t, a frame's (negative before the first), for frames w wide; sets next to when that
+// changes.
+FrameText TextAt(LONGLONG t, UINT w, LONGLONG& next) {
     AcquireSRWLockShared(&g.subsLock);
     const std::shared_ptr<const Subtitles> subs = g.subs;
-    const SubtitleLayout layout = g.subsLayout;
+    FrameText f{.layout = g.subsLayout, .width = w};
     ReleaseSRWLockShared(&g.subsLock);
     std::vector<size_t> active;
-    double next = INFINITY;
+    double change = INFINITY;
     // Half a 100 ns unit past the frame, so a cue time that rounding puts just past it still counts as reached.
-    if (subs && t >= 0) next = ActiveCues(*subs, (double(t) + 0.5) / 1e7, active);
-    f.from = t;
-    f.next = t < 0 ? 0 : next < 1e11 ? LONGLONG(std::ceil(next * 1e7 - 0.5)) : LLONG_MAX;
-    if (version == f.version && w == f.width && active == f.shown) return;
-    f.version = version;
-    f.width = w;
-    f.shown = std::move(active);
-    std::wstring text[2];  // bottom, top
-    std::vector<StyleSpan> spans[2];
-    for (const size_t i : f.shown) {
+    if (subs && t >= 0) change = ActiveCues(*subs, (double(t) + 0.5) / 1e7, active);
+    next = t < 0 ? 0 : change < 1e11 ? LONGLONG(std::ceil(change * 1e7 - 0.5)) : LLONG_MAX;
+    for (const size_t i : active) {
         const Cue& cue = subs->cues[i];
-        std::wstring& s = text[cue.top];
+        std::wstring& s = f.text[cue.top];
         if (!s.empty()) s += L'\n';
         const UINT32 at = UINT32(s.size());
         s += cue.text;
         for (StyleSpan span : cue.spans) {
             span.start += at;
-            spans[cue.top].push_back(span);
+            f.spans[cue.top].push_back(span);
         }
     }
+    return f;
+}
+
+// Draws the text into the painter's slots first and first + 1 and sets where they go.
+void PrepareText(FramePainter& painter, int first, const FrameText& f, POINT at[2]) {
+    const SubtitleLayout& layout = f.layout;
     // Frames are drawn at another size than on screen only before Windows 8.1.
-    const float scale = layout.width > 0 ? float(w) / layout.width : 1;
+    const float w = float(f.width), scale = layout.width > 0 ? w / layout.width : 1;
     for (int top = 0; top < 2; ++top) {
         const SIZE s =
-            f.painter.Prepare(top, text[top], spans[top], layout.fontSize * scale, layout.maxWidth * scale);
-        f.at[top].x = LONG(std::round((float(w) - float(s.cx)) / 2));
-        f.at[top].y = LONG(std::round(top ? layout.top * scale : std::max(0.0f, layout.bottom * scale - float(s.cy))));
+            painter.Prepare(first + top, f.text[top], f.spans[top], layout.fontSize * scale, layout.maxWidth * scale);
+        at[top].x = LONG(std::round((w - float(s.cx)) / 2));
+        at[top].y = LONG(std::round(top ? layout.top * scale : std::max(0.0f, layout.bottom * scale - float(s.cy))));
     }
+}
+
+// Has the painter draw the cues showing at time t into frames w wide, unless it already does. Those drawn ahead
+// are swapped in rather than drawn again.
+void UpdateFrameSubtitles(FrameSubtitles& f, LONGLONG t, UINT w) {
+    const UINT version = g.subsVersion;
+    if (version == f.version && w == f.width && t >= f.from && t < f.next) return;
+    f.version = version;
+    f.width = w;
+    f.from = t;
+    FrameText text = TextAt(t, w, f.next);
+    if (text == f.drawn) return;
+    if (text == f.ahead) {
+        f.painter.Swap();
+        std::swap(f.drawn, f.ahead);
+        std::swap(f.at, f.aheadAt);
+        return;
+    }
+    PrepareText(f.painter, 0, text, f.at);
+    f.drawn = std::move(text);
+}
+
+// Draws the cues that show from f.next ahead into slots 2 and 3, so the frame they start on only swaps them in.
+void PrepareAhead(FrameSubtitles& f) {
+    if (f.next == LLONG_MAX || (f.version == f.aheadVersion && f.width == f.aheadWidth && f.next == f.aheadTime)) {
+        return;
+    }
+    f.aheadVersion = f.version;
+    f.aheadWidth = f.width;
+    f.aheadTime = f.next;
+    LONGLONG next;
+    FrameText text = TextAt(f.next, f.width, next);
+    if (text == f.drawn || text == f.ahead) return;
+    PrepareText(f.painter, 2, text, f.aheadAt);
+    f.ahead = std::move(text);
 }
 
 // Copies the engine's current frame into the top left w x h of the swap chain, draws the subtitles over it and
@@ -422,7 +466,11 @@ void RenderLoop() {
             AcquireSRWLockExclusive(&g.lock);
             g.redraw = !g.chain || !w || !h || !PresentFrame(std::min(w, g.width), std::min(h, g.height), subtitles);
             ReleaseSRWLockExclusive(&g.lock);
-            if (!g.redraw) idle = 0;
+            if (!g.redraw) {
+                idle = 0;
+                // The next frame is furthest off now, so the next subtitles are drawn now rather than just before it.
+                PrepareAhead(subtitles);
+            }
         }
         // Then waits for the next frame's latest moment while frames are wanted, and a little after, as a request
         // that comes just after a frame begins would otherwise wait out the next one.
