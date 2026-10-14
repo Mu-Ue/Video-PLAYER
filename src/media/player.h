@@ -70,7 +70,8 @@ struct SubtitleLayout {
 // time, as if burned into it, so they change with the frame on screen and never apart from it.
 void SetSubtitles(std::shared_ptr<const Subtitles> subs);
 void SetSubtitleLayout(const SubtitleLayout& layout);
-// While held, no new frame is presented; the latest shows once released, so it never shows before its cues.
+// While held, no new frame is presented; the latest shows once released, so it never shows before its cues. If a
+// seek's frame comes while held, playback pauses there until then, so the sound waits with it.
 void HoldFrames(bool hold);
 
 // The seek bar preview shows one picture for each 1/200 of the video (1 second at least): the key frame nearest

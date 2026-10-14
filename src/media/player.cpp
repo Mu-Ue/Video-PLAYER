@@ -151,6 +151,9 @@ struct {
     std::atomic<UINT> subsVersion = 0;
     std::atomic<bool> redraw = false;  // present the current frame even if it isn't new; set with Redraw
     std::atomic<bool> hold = false;    // present no new frame; set with HoldFrames
+    // Whether the hold paused the engine, to play on release; taken with the pause under holdLock.
+    SRWLOCK holdLock = SRWLOCK_INIT;
+    std::atomic<bool> heldPause = false;
     std::atomic<bool> frameWanted = false;  // post WM_APP_FRAME before the next frame; set with RequestFrame
     HANDLE stop = nullptr;             // tells the render thread and the previewer to exit
     HANDLE renderWake = nullptr;       // set on each engine event and redraw, while the render thread sleeps
@@ -398,7 +401,16 @@ void RenderLoop() {
         const bool fresh = g.engine->OnVideoStreamTick(&pts) == S_OK;
         if (fresh) frameTime = pts;
         if (g.hold) {
-            if (fresh) g.redraw = true;  // shown once released
+            if (fresh) {
+                g.redraw = true;  // shown once released
+                // A seek's frame came before its cues: the clock waits with it, so the sound doesn't run ahead.
+                AcquireSRWLockExclusive(&g.holdLock);
+                if (g.hold && !g.heldPause && !g.engine->IsSeeking() && !g.engine->IsPaused() &&
+                    !g.engine->IsEnded()) {
+                    g.heldPause = SUCCEEDED(g.engine->Pause());
+                }
+                ReleaseSRWLockExclusive(&g.holdLock);
+            }
         } else if (fresh || g.redraw) {
             // The subtitles are laid out outside the lock, so the window never waits for that.
             AcquireSRWLockShared(&g.lock);
@@ -859,15 +871,18 @@ void SetSubtitleLayout(const SubtitleLayout& layout) {
     if (changed) Redraw();
 }
 
-bool IsPlaying() { return g.engine && !g.engine->IsPaused() && !g.engine->IsEnded(); }
+bool IsPlaying() { return g.engine && (g.heldPause || !g.engine->IsPaused()) && !g.engine->IsEnded(); }
 
 void SetPlaying(bool playing) {
     if (!g.engine) return;
+    AcquireSRWLockExclusive(&g.holdLock);
+    g.heldPause = false;  // as asked now, not as before the hold
     if (playing) {
         g.engine->Play();  // from the start if it has ended
     } else {
         g.engine->Pause();
     }
+    ReleaseSRWLockExclusive(&g.holdLock);
 }
 
 double PlaybackTime() { return g.engine ? g.engine->GetCurrentTime() : 0; }
@@ -888,7 +903,11 @@ double SeekTo(double seconds, bool fast) {
 }
 
 void HoldFrames(bool hold) {
-    if (g.hold.exchange(hold) && !hold) Redraw();
+    AcquireSRWLockExclusive(&g.holdLock);
+    const bool released = g.hold.exchange(hold) && !hold;
+    if (released && g.heldPause.exchange(false)) g.engine->Play();
+    ReleaseSRWLockExclusive(&g.holdLock);
+    if (released) Redraw();
 }
 
 double Volume() { return g.engine ? g.engine->GetVolume() : 1; }
