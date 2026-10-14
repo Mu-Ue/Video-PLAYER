@@ -591,6 +591,61 @@ Shifts ReadShifts(const wchar_t* url, IMFByteStream* stream) {
     return shifts;
 }
 
+// Wraps the source made for the engine and hands it over through the engine's callback; on failure, hands over
+// the failure.
+void HandOver(HRESULT hr, IMFMediaSource* inner, const Shifts& shifts, IMFAsyncCallback* callback, IUnknown* state) {
+    ComPtr<ShiftedSource> source;
+    if (SUCCEEDED(hr)) {
+        source.Attach(new (std::nothrow) ShiftedSource(inner, shifts));
+        hr = source ? source->Start() : E_OUTOFMEMORY;
+        if (FAILED(hr)) source.Reset();
+    }
+    ComPtr<IMFAsyncResult> result;
+    if (SUCCEEDED(MFCreateAsyncResult(static_cast<IMFMediaSourceEx*>(source.Get()), callback, state, &result))) {
+        result->SetStatus(hr);
+        MFInvokeCallback(result.Get());
+    }
+    if (FAILED(hr) && inner) inner->Shutdown();
+}
+
+// Waits for the resolver to make a source off the engine's thread, then hands it over.
+class Creation final : public IMFAsyncCallback {
+  public:
+    Creation(IMFSourceResolver* resolver, const Shifts& shifts, IMFAsyncCallback* callback, IUnknown* state)
+        : resolver_(resolver), shifts_(shifts), callback_(callback), state_(state) {}
+
+    STDMETHODIMP QueryInterface(REFIID riid, void** object) override {
+        if (!object) return E_POINTER;
+        *object = riid == __uuidof(IUnknown) || riid == __uuidof(IMFAsyncCallback) ? this : nullptr;
+        if (!*object) return E_NOINTERFACE;
+        AddRef();
+        return S_OK;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return ++refs_; }
+    STDMETHODIMP_(ULONG) Release() override {
+        const ULONG left = --refs_;
+        if (!left) delete this;
+        return left;
+    }
+    STDMETHODIMP GetParameters(DWORD*, DWORD*) override { return E_NOTIMPL; }
+    STDMETHODIMP Invoke(IMFAsyncResult* result) override {
+        MF_OBJECT_TYPE type;
+        ComPtr<IUnknown> object;
+        ComPtr<IMFMediaSource> inner;
+        HRESULT hr = resolver_->EndCreateObjectFromByteStream(result, &type, &object);
+        if (SUCCEEDED(hr)) hr = object.As(&inner);
+        HandOver(hr, inner.Get(), shifts_, callback_.Get(), state_.Get());
+        return S_OK;
+    }
+
+  private:
+    std::atomic<ULONG> refs_ = 1;
+    const ComPtr<IMFSourceResolver> resolver_;
+    const Shifts shifts_;
+    const ComPtr<IMFAsyncCallback> callback_;
+    const ComPtr<IUnknown> state_;
+};
+
 class Extension final : public IMFMediaEngineExtension {
   public:
     STDMETHODIMP QueryInterface(REFIID riid, void** object) override {
@@ -608,7 +663,8 @@ class Extension final : public IMFMediaEngineExtension {
         *answer = MF_MEDIA_ENGINE_CANPLAY_NOT_SUPPORTED;
         return S_OK;
     }
-    // Creates the source at once; a file it leaves to the engine fails here, before any source is made.
+    // Hands over the source made ahead at once, or has the resolver make one; a file it leaves to the engine fails
+    // here, before any source is made.
     STDMETHODIMP BeginCreateObject(BSTR url, IMFByteStream* stream, MF_OBJECT_TYPE type, IUnknown** cancel,
                                    IMFAsyncCallback* callback, IUnknown* state) override {
         if (cancel) *cancel = nullptr;
@@ -618,21 +674,22 @@ class Extension final : public IMFMediaEngineExtension {
         const bool ready = TakePreparedSource(url, inner, shifts);
         if (!ready) shifts = ReadShifts(url, stream);
         shifts.lead = TakeAudioLead();
-        HRESULT hr = S_OK;
-        if (!ready) {
-            if (!shifts.Any()) return MF_E_UNSUPPORTED_BYTESTREAM_TYPE;
-            hr = CreateSource(url, stream, inner);
-            if (FAILED(hr)) return hr;
+        if (ready) {
+            HandOver(S_OK, inner.Get(), shifts, callback, state);
+            return S_OK;
         }
-        ComPtr<ShiftedSource> source;
-        source.Attach(new (std::nothrow) ShiftedSource(inner.Get(), shifts));
-        hr = source ? source->Start() : E_OUTOFMEMORY;
-        ComPtr<IMFAsyncResult> result;
+        if (!shifts.Any()) return MF_E_UNSUPPORTED_BYTESTREAM_TYPE;
+        ComPtr<IMFSourceResolver> resolver;
+        HRESULT hr = MFCreateSourceResolver(&resolver);
+        ComPtr<Creation> creation;
         if (SUCCEEDED(hr)) {
-            hr = MFCreateAsyncResult(static_cast<IMFMediaSourceEx*>(source.Get()), callback, state, &result);
+            creation.Attach(new (std::nothrow) Creation(resolver.Get(), shifts, callback, state));
+            if (!creation) hr = E_OUTOFMEMORY;
         }
-        if (SUCCEEDED(hr)) hr = MFInvokeCallback(result.Get());
-        if (FAILED(hr)) inner->Shutdown();
+        if (SUCCEEDED(hr)) {
+            hr = resolver->BeginCreateObjectFromByteStream(stream, url, MF_RESOLUTION_MEDIASOURCE | MF_RESOLUTION_READ,
+                                                           nullptr, nullptr, creation.Get(), nullptr);
+        }
         return hr;
     }
     STDMETHODIMP CancelObjectCreation(IUnknown*) override { return S_OK; }
