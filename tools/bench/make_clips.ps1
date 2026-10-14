@@ -54,7 +54,9 @@ function New-Clip([string]$name, [string]$rate, [int]$w, [int]$h, [string]$codec
     $ext = if ($extra -contains 'mkv') { 'mkv' } else { 'mp4' }
     $a = @('-y', '-v', 'error', '-f', 'lavfi', '-i', $video, '-f', 'lavfi', '-i', $audio)
     if ($ext -eq 'mkv') { $a += '-i', $srt }
-    $a += $codecArgs + @('-preset', 'veryfast', '-g', [string]$flashEvery, '-c:a', 'aac', '-b:a', '128k')
+    # PCM has no encoder delay, so it shows the offset of the player alone.
+    $audioArgs = if ($extra -contains 'pcm') { '-c:a', 'pcm_s16le' } else { '-c:a', 'aac', '-b:a', '128k' }
+    $a += $codecArgs + @('-preset', 'veryfast', '-g', [string]$flashEvery) + $audioArgs
     if ($ext -eq 'mkv') { $a += '-c:s', 'srt' }
     if ($extra -contains 'live') { $a += '-live', '1' }  # no index
     if ($extra -contains 'vfr') { $a += '-fps_mode', 'vfr' }
@@ -75,6 +77,7 @@ New-Clip 'r24_1080_h264' '24' 1920 1080 'h264' @()
 New-Clip 'r30_1080_h264' '30' 1920 1080 'h264' @()
 New-Clip 'r60_1080_h264' '60' 1920 1080 'h264' @()
 New-Clip 'r23976_1080_h264_subs' '23.976' 1920 1080 'h264' @('mkv')
+New-Clip 'r23976_1080_h264_pcm' '23.976' 1920 1080 'h264' @('mkv', 'pcm')
 New-Clip 'r23976_2160_hevc_subs' '23.976' 3840 2160 'hevc' @('mkv')
 New-Clip 'r23976_1080_h264_noindex' '23.976' 1920 1080 'h264' @('mkv', 'live')
 New-Clip 'v60_1080_h264' '60' 1920 1080 'h264' @('vfr')

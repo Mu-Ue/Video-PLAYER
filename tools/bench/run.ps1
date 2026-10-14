@@ -23,6 +23,8 @@ $suite = @(
     @('r30_1080_h264.mp4', 20, 0, @()),
     @('r60_1080_h264.mp4', 20, 0, @()),
     @('r23976_1080_h264_subs.mkv', 30, 6, @('--subs')),    # MKV subtitles across seeks
+    @('r23976_1080_h264_pcm.mkv', 30, 0, @()),             # the same with PCM audio: A/V without encoder delay
+    @('v60_1080_h264.mp4', 20, 0, @()),                    # variable frame rate
     @('r23976_2160_hevc_subs.mkv', 30, 6, @('--subs')),    # 4K HEVC
     @('r23976_1080_h264_noindex.mkv', 20, 3, @('--subs')), # no index
     @('r23976_2160_hevc_subs.mkv', 30, 6, @('--subs', '--cores', '2'))  # 2 cores
