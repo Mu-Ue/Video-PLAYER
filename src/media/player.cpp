@@ -616,7 +616,7 @@ ComPtr<IMFSample> ReadKeyFrame(IMFSourceReader* reader, LONGLONG time) {
     ComPtr<IMFSample> sample;
     DWORD flags = 0;
     LONGLONG at = 0;
-    for (int i = 0; i < 8 && !sample; ++i) {  // a gap in the stream comes as no sample
+    while (!sample) {  // a gap in the stream comes as no sample
         if (FAILED(reader->ReadSample(kVideoStream, 0, nullptr, &flags, &at, &sample)) ||
             (flags & (MF_SOURCE_READERF_ERROR | MF_SOURCE_READERF_ENDOFSTREAM))) {
             return nullptr;
