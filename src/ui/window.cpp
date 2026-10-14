@@ -946,6 +946,7 @@ void SelectSubtitle(int index) {
     }
     g.subtitle = index;
     DrawPanel();
+    g.dcomp->Commit();
     ShowSubtitles();
 }
 
