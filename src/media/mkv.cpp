@@ -29,6 +29,9 @@ constexpr UINT64 kUnknown = ~UINT64(0);  // an element size that isn't given, or
 constexpr UINT64 kMaxHeaderBytes = 1 << 22;  // of the elements read whole: the file header, Info and Tracks
 constexpr UINT64 kMaxBlockBytes = 1 << 16;   // of a subtitle block (group)
 constexpr size_t kPageBytes = 4096;          // the least the disk cache reads, so the least a read costs
+// How long before a seek target a cue still showing there may start, when the index gives no durations, so the
+// frame never waits on a sparse track's reading back to the start. A longer one arrives with the rest.
+constexpr double kMaxCueSeconds = 30;
 
 // Reads an EBML variable-length integer at p, moving p past it: an id keeps its length marker, a size loses it
 // (all ones: kUnknown).
@@ -103,12 +106,19 @@ struct Element {
     UINT64 at, data, size;
 };
 
-// A position the index lists: its time, its cluster, and the block's position in that and its duration, if given.
+// A position the index lists: its time, its cluster, the block's position in that and its duration, if given, and
+// its text track.
 struct Entry {
     UINT64 time, cluster, relative, duration = kUnknown;
+    const TextTrack* track = nullptr;
 };
 
 std::atomic<double> seekTarget = -1;  // the seek the reader is yet to take, in seconds, if not negative
+// The number of that seek, and whether the reader answers each one with WM_APP_SUBTITLES_READY. Taken with the
+// target under the lock, so the two always match.
+SRWLOCK seekLock = SRWLOCK_INIT;
+UINT seekNumber = 0;
+bool answering = false;
 
 struct Reader {
     HANDLE file = INVALID_HANDLE_VALUE;
@@ -122,6 +132,10 @@ struct Reader {
     UINT64 timeCluster = kUnknown, timeData = 0, time = 0;  // the last cluster ClusterTime found
     const TextTrack* lastTrack = nullptr;  // of the last cue AddBlock read, and its end
     double lastEnd = 0;
+    // While walking clusters for a seek: its time, and the tracks with a cue read that ended by then, also from blocks
+    // read before.
+    double endedBy = -1;
+    std::vector<const TextTrack*> ended;
     // The bytes read last: chunk of them from a page boundary, so headers, timestamps and blocks near each other
     // come from one read. A page for the blocks the index points to, more when walking clusters.
     std::vector<BYTE> buffer;
@@ -210,9 +224,9 @@ struct Reader {
         if (!PostMessageW(hwnd, WM_APP_SUBTITLE_CUES, WPARAM(t.number), LPARAM(batch))) delete batch;
     }
 
-    // Turns a block of a text track, with the duration of its group, into a cue. It is `at` the cluster's time, or
-    // its own if `own`.
-    void AddBlock(const BYTE* p, const BYTE* end, UINT64 at, bool own, UINT64 duration) {
+    // Turns a block of a text track, with the duration of its group, into a cue, posted unless read before. It is
+    // `at` the cluster's time, or its own if `own`.
+    void AddBlock(const BYTE* p, const BYTE* end, UINT64 at, bool own, UINT64 duration, bool fresh) {
         UINT64 number;
         if (!Vint(p, end, number, false) || end - p < 3 || (p[2] & 0x06)) return;  // laced: not text
         TextTrack* t = Find(number);
@@ -233,6 +247,8 @@ struct Reader {
         Cue cue{start, start + length};
         SetCueText(raw, cue);
         if (cue.text.empty() || !(cue.end > cue.start)) return;
+        if (cue.end <= endedBy && std::find(ended.begin(), ended.end(), t) == ended.end()) ended.push_back(t);
+        if (!fresh) return;
         ++t->count;
         lastTrack = t;
         lastEnd = cue.end;
@@ -261,11 +277,11 @@ struct Reader {
     // Reads a SimpleBlock or BlockGroup if it is of a text track, with the time AddBlock takes.
     void Block(const Element& e, UINT64 at, bool own) {
         std::vector<BYTE> data;
-        if (e.size > kMaxBlockBytes || !IsText(e) || !seen.insert(e.at).second || !Data(e, data, kMaxBlockBytes)) {
-            return;
-        }
+        if (e.size > kMaxBlockBytes || !IsText(e)) return;
+        const bool fresh = seen.insert(e.at).second;
+        if ((!fresh && endedBy < 0) || !Data(e, data, kMaxBlockBytes)) return;
         if (e.id == kSimpleBlock) {
-            AddBlock(data.data(), data.data() + data.size(), at, own, kUnknown);
+            AddBlock(data.data(), data.data() + data.size(), at, own, kUnknown, fresh);
             return;
         }
         const BYTE* block = nullptr;
@@ -275,7 +291,7 @@ struct Reader {
             if (child == kBlock) block = d, blockSize = s;
             if (child == kBlockDuration) duration = UInt(d, s);
         });
-        if (block) AddBlock(block, block + blockSize, at, own, duration);
+        if (block) AddBlock(block, block + blockSize, at, own, duration, fresh);
     }
 
     // Reads the text blocks of the cluster at `at`, or skips the other element there. Returns where the next one
@@ -339,10 +355,11 @@ struct Reader {
         return kUnknown;
     }
 
-    // The last cluster whose Timestamp is at most units, found without an index by halving the bytes it can be in.
+    // The last cluster whose Timestamp is at most units, found without an index by halving the bytes it can be in
+    // down to one read, then going through the clusters in that.
     UINT64 Bisect(UINT64 units, const std::atomic<bool>& stop) {
         UINT64 lo = firstCluster, hi = segmentEnd;  // lo is a cluster at most at units, the ones from hi on are later
-        while (hi - lo > 1 && !stop.load(std::memory_order_relaxed)) {
+        while (hi - lo > chunk && !stop.load(std::memory_order_relaxed)) {
             const UINT64 mid = lo + (hi - lo) / 2;
             const UINT64 at = Resync(mid, hi, stop);
             if (at != kUnknown && time <= units) {
@@ -351,6 +368,7 @@ struct Reader {
                 hi = mid;
             }
         }
+        for (UINT64 at = lo; (at = Resync(at + 1, hi, stop)) != kUnknown && time <= units;) lo = at;
         return lo;
     }
 
@@ -361,14 +379,26 @@ struct Reader {
         }
     }
 
-    // The seek the window asked for, in seconds, or a negative number. Posts what was read before it, and starts the
-    // batches small again so the cues there arrive at once.
-    double TakeSeek() {
+    // The seek the window asked for, in seconds, or a negative number, and its number. Posts what was read before
+    // it, and starts the batches small again so the cues there arrive at once.
+    double TakeSeek(UINT& number) {
+        AcquireSRWLockExclusive(&seekLock);
         const double t = seekTarget.exchange(-1);
+        number = seekNumber;
+        ReleaseSRWLockExclusive(&seekLock);
         if (t < 0) return t;
         PostAll();
         for (TextTrack& track : tracks) track.batchSize = 1;
         return t;
+    }
+
+    // Stops answering seeks with WM_APP_SUBTITLES_READY, answering the last one, which then waits for nothing more.
+    void StopAnswering() {
+        AcquireSRWLockExclusive(&seekLock);
+        answering = false;
+        const UINT number = seekNumber;
+        ReleaseSRWLockExclusive(&seekLock);
+        PostMessageW(hwnd, WM_APP_SUBTITLES_READY, number, 0);
     }
 
     UINT64 Units(double seconds) const { return UINT64(std::min(seconds / scale, 1e18)); }
@@ -404,31 +434,51 @@ struct Reader {
             last[i] = {lastTrack, lastEnd};
         };
         while (left && !stop.load(std::memory_order_relaxed)) {
-            const double t = TakeSeek();
+            UINT number;
+            const double t = TakeSeek(number);
             if (t >= 0) {
-                const UINT64 units = Units(t);
+                // The frame waits on these reads, so they don't yield to playback's.
+                SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+                const UINT64 units = Units(t), back = units - std::min(units, Units(kMaxCueSeconds));
                 next = size_t(std::upper_bound(blocks.begin(), blocks.end(), units,
                                                [](UINT64 u, const Entry& b) { return u < b.time; }) -
                               blocks.begin());
                 // The ones before it that still show then: those the index gives as lasting until then, or back
                 // until each track has a cue that ended by then if it gives no durations.
-                std::vector<const TextTrack*> ended;
+                ended.clear();
                 for (size_t i = next; i-- > 0 && ended.size() < tracks.size() && seekTarget < 0 &&
                                       !stop.load(std::memory_order_relaxed);) {
                     if (timed) {
                         if (blocks[i].time + blocks[i].duration > units) read(i);
                         continue;
                     }
+                    if (blocks[i].time < back) break;
                     read(i);
                     const auto [track, end] = last[i];
                     if (track && end <= t && std::find(ended.begin(), ended.end(), track) == ended.end()) {
                         ended.push_back(track);
                     }
                 }
+                // And each track's first block after it, so all cues that show until then are in.
+                std::vector<const TextTrack*> after;
+                for (size_t i = next; i < blocks.size() && after.size() < tracks.size() && seekTarget < 0 &&
+                                      !stop.load(std::memory_order_relaxed);
+                     ++i) {
+                    if (std::find(after.begin(), after.end(), blocks[i].track) != after.end()) continue;
+                    read(i);
+                    after.push_back(blocks[i].track);
+                }
+                SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+                if (stop.load(std::memory_order_relaxed)) return;
+                PostAll();
+                PostMessageW(hwnd, WM_APP_SUBTITLES_READY, number, 0);
             }
             if (next >= blocks.size()) next = 0;
             read(next++);
         }
+        if (stop.load(std::memory_order_relaxed)) return;
+        PostAll();
+        StopAnswering();
     }
 
     // Reads the clusters from the seek position on, and the ones not yet read after the end, without the subtitles'
@@ -439,37 +489,72 @@ struct Reader {
             const auto it = walked.upper_bound(at);
             return it != walked.begin() && std::prev(it)->second > at ? std::prev(it)->second : at;
         };
-        UINT64 at = firstCluster;
-        while (!stop.load(std::memory_order_relaxed)) {
-            const double t = TakeSeek();
-            if (t >= 0) {
-                // One cluster before the one at t, for a cue that started there and still shows.
-                const UINT64 units = Units(t);
-                if (!clusters.empty()) {
-                    const size_t n = size_t(std::upper_bound(clusters.begin(), clusters.end(), units,
-                                                             [](UINT64 u, const Entry& c) { return u < c.time; }) -
-                                            clusters.begin());
-                    at = n >= 2 ? clusters[n - 2].cluster : firstCluster;
-                } else {
-                    at = Bisect(units, stop);
-                    if (at != firstCluster && ClusterTime(at) && time) at = Bisect(time - 1, stop);
-                }
-            }
-            at = unread(at);
-            if (at >= segmentEnd) at = unread(firstCluster);
-            if (at >= segmentEnd) return;
+        // Reads the cluster at `at`, marks it read and returns where the next one starts.
+        const auto walk = [&](UINT64 at) {
             UINT64 next = Step(at, stop);
-            if (stop.load(std::memory_order_relaxed)) return;
+            if (stop.load(std::memory_order_relaxed)) return segmentEnd;
             if (next == kUnknown || next <= at) next = Resync(at + 1, segmentEnd, stop);
             next = std::min(next, segmentEnd);
-            // Marks [at, next) read, merged with the ranges it touches.
             UINT64 from = at, to = next;
             auto it = walked.lower_bound(from);
             if (it != walked.begin() && std::prev(it)->second >= from) from = (--it)->first;
             for (; it != walked.end() && it->first <= to; it = walked.erase(it)) to = std::max(to, it->second);
             walked[from] = to;
-            at = next;
+            return next;
+        };
+        // The last cluster starting at most at units, or the last one the index lists by then, or the first one. A
+        // listed time can be a little before its cluster's own.
+        const auto clusterAt = [&](UINT64 units) {
+            if (clusters.empty()) return Bisect(units, stop);
+            for (auto it = std::upper_bound(clusters.begin(), clusters.end(), units,
+                                            [](UINT64 u, const Entry& c) { return u < c.time; });
+                 it != clusters.begin();) {
+                --it;
+                if (!ClusterTime(it->cluster) || time <= units) return it->cluster;
+            }
+            return firstCluster;
+        };
+        UINT64 at = firstCluster;
+        while (!stop.load(std::memory_order_relaxed)) {
+            UINT number;
+            const double t = TakeSeek(number);
+            if (t >= 0) {
+                // The frame waits on these reads, so they don't yield to playback's.
+                SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+                // The clusters around t, then the ones before them until each track has a cue that ended by t, for
+                // one that started there and still shows. Each step back walks on to where the last one began, as
+                // the index may skip clusters.
+                endedBy = t;
+                ended.clear();
+                const UINT64 units = Units(t), back = units - std::min(units, Units(kMaxCueSeconds));
+                UINT64 from = at = clusterAt(units);
+                // On from there through the first cluster after t, whose cues can start just after it.
+                for (bool past = false; !past && seekTarget < 0 && !stop.load(std::memory_order_relaxed);) {
+                    past = ClusterTime(at) && time > units;
+                    if ((at = walk(at)) >= segmentEnd) break;
+                }
+                at = from;
+                while (ended.size() < tracks.size() && from != firstCluster && seekTarget < 0 &&
+                       !stop.load(std::memory_order_relaxed) && ClusterTime(from) && time > back) {
+                    const UINT64 to = from;
+                    from = clusterAt(time - 1);
+                    if (from >= to) break;
+                    for (UINT64 c = from; c < to && seekTarget < 0;) c = walk(c);
+                }
+                endedBy = -1;
+                SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+                if (stop.load(std::memory_order_relaxed)) return;
+                PostAll();
+                PostMessageW(hwnd, WM_APP_SUBTITLES_READY, number, 0);
+            }
+            at = unread(at);
+            if (at >= segmentEnd) at = unread(firstCluster);
+            if (at >= segmentEnd) break;
+            at = walk(at);
         }
+        if (stop.load(std::memory_order_relaxed)) return;
+        PostAll();
+        StopAnswering();
     }
 
     void Run(const std::atomic<bool>& stop) {
@@ -495,7 +580,7 @@ struct Reader {
                     clusters.push_back({0, cluster, kUnknown});
                     if (!t) return;
                     t->listed = true;
-                    blocks.push_back({0, cluster, relative, duration});
+                    blocks.push_back({0, cluster, relative, duration, t});
                 });
                 for (size_t i = firstBlock; i < blocks.size(); ++i) blocks[i].time = cueTime;
                 for (size_t i = firstPoint; i < clusters.size(); ++i) clusters[i].time = cueTime;
@@ -515,8 +600,9 @@ struct Reader {
                            clusters.end());
             chunk = kScanBytes;
             ReadClusters(clusters, stop);
+        } else {
+            StopAnswering();
         }
-        if (!stop.load(std::memory_order_relaxed)) PostAll();
     }
 };
 
@@ -637,6 +723,7 @@ std::vector<Track> StartMkvSubtitles(const std::wstring& path, HWND hwnd) {
         return {};
     }
     r->hwnd = hwnd;
+    answering = true;  // from the start, as the index tells only then whether seeks can be
     reader = std::thread([r = std::move(r)] {
         SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);  // its reads yield to playback's
         r->Run(stopReader);
@@ -644,8 +731,13 @@ std::vector<Track> StartMkvSubtitles(const std::wstring& path, HWND hwnd) {
     return tracks;
 }
 
-void SeekMkvSubtitles(double seconds) {
+bool SeekMkvSubtitles(double seconds, UINT number) {
+    AcquireSRWLockExclusive(&seekLock);
     seekTarget = std::max(0.0, seconds);
+    seekNumber = number;
+    const bool answered = answering;
+    ReleaseSRWLockExclusive(&seekLock);
+    return answered;
 }
 
 void StopMkvSubtitles() {
@@ -654,4 +746,5 @@ void StopMkvSubtitles() {
     stopReader = true;
     reader.join();
     stopReader = false;
+    answering = false;  // the reader is gone
 }

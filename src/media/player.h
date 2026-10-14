@@ -70,6 +70,8 @@ struct SubtitleLayout {
 // time, as if burned into it, so they change with the frame on screen and never apart from it.
 void SetSubtitles(std::shared_ptr<const Subtitles> subs);
 void SetSubtitleLayout(const SubtitleLayout& layout);
+// While held, no new frame is presented; the latest shows once released, so it never shows before its cues.
+void HoldFrames(bool hold);
 
 // The seek bar preview shows one picture for each 1/200 of the video (1 second at least): the key frame nearest
 // the span's middle, which needs no decoding up to it. Returns that key frame for a time, in 100 ns units.
@@ -88,8 +90,8 @@ void SetPlaying(bool playing);  // playing from the start if it has ended
 double PlaybackTime();  // seconds
 double Duration();      // seconds; NaN if unknown
 // Starts seeking to a time within the video; SEEKED follows. A fast seek lands on the nearest key frame, for
-// dragging along the seek bar and stepping.
-void SeekTo(double seconds, bool fast);
+// dragging along the seek bar and stepping. Returns where it lands, as far as known.
+double SeekTo(double seconds, bool fast);
 double Volume();  // 0..1
 bool IsMuted();
 // Changes the volume by delta (0..1 scale), unmuting when raising it, and returns the new volume.

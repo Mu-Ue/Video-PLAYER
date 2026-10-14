@@ -128,6 +128,7 @@ struct Window {
     // One seek at a time is in flight; the latest one asked for meanwhile waits for it to finish.
     bool seekBusy = false, seekQueued = false, seekFast = false;
     double seekTarget = 0;  // of the latest seek
+    UINT subtitleSeek = 0;  // the number of the last seek the subtitle reader was told of
     // A key frame seek by a step, from seekFrom: redone exactly if it lands on the wrong side of seekFrom.
     bool seekCheck = false;
     double seekFrom = 0;
@@ -1009,6 +1010,7 @@ bool OpenVideoFile(const std::wstring& path) {
     g.audio.clear();
     // Stop reading the previous video's subtitles and drop any of its cues still queued.
     StopMkvSubtitles();
+    HoldFrames(false);
     for (MSG msg; PeekMessageW(&msg, g.hwnd, WM_APP_SUBTITLE_CUE, WM_APP_SUBTITLE_CUE, PM_REMOVE);) {
         delete reinterpret_cast<Cue*>(msg.lParam);
     }
@@ -1134,17 +1136,24 @@ void ShowMenu(Control which) {
     }
 }
 
+// Starts the engine's seek, and has the subtitle reader go on from where it lands. While the track shown is one the
+// reader reads, frames wait for the cues there, so the first one never shows without them.
+void StartSeek(double seconds, bool fast) {
+    const double landing = SeekTo(seconds, fast);
+    const bool read = g.subtitle >= 0 && g.tracks[size_t(g.subtitle)].read;
+    HoldFrames(SeekMkvSubtitles(landing, ++g.subtitleSeek) && read);
+}
+
 // Seeks to a time within the video and returns it; the caller shows it. While a seek is in flight the new one waits, replacing any
 // that was already waiting, so dragging or holding an arrow key never piles up seeks in the engine.
 double RequestSeek(double seconds, bool fast) {
     g.seekTarget = std::max(0.0, std::isfinite(g.duration) ? std::min(seconds, g.duration) : seconds);
     g.seekFast = fast;
-    SeekMkvSubtitles(g.seekTarget);
     if (g.seekBusy) {
         g.seekQueued = true;
     } else {
         g.seekBusy = true;
-        SeekTo(g.seekTarget, fast);
+        StartSeek(g.seekTarget, fast);
     }
     return g.seekTarget;
 }
@@ -1154,14 +1163,14 @@ double RequestSeek(double seconds, bool fast) {
 void OnSeeked() {
     if (g.seekQueued) {
         g.seekQueued = false;
-        SeekTo(g.seekTarget, g.seekFast);
+        StartSeek(g.seekTarget, g.seekFast);
         return;
     }
     if (g.seekCheck) {
         g.seekCheck = false;
         const double landed = PlaybackTime();
         if (g.seekTarget > g.seekFrom ? landed <= g.seekFrom : landed >= g.seekFrom) {
-            SeekTo(g.seekTarget, false);
+            StartSeek(g.seekTarget, false);
             return;
         }
     }
@@ -1407,6 +1416,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_APP_SUBTITLE_CUES:
             OnSubtitleCues(wp, lp);
+            return 0;
+        case WM_APP_SUBTITLES_READY:
+            if (UINT(wp) == g.subtitleSeek) HoldFrames(false);  // its cues came before it
             return 0;
         case WM_APP_FRAME:
             OnFrame();

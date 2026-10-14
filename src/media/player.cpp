@@ -150,6 +150,7 @@ struct {
     SubtitleLayout subsLayout{};
     std::atomic<UINT> subsVersion = 0;
     std::atomic<bool> redraw = false;  // present the current frame even if it isn't new; set with Redraw
+    std::atomic<bool> hold = false;    // present no new frame; set with HoldFrames
     std::atomic<bool> frameWanted = false;  // post WM_APP_FRAME before the next frame; set with RequestFrame
     HANDLE stop = nullptr;             // tells the render thread and the previewer to exit
     HANDLE renderWake = nullptr;       // set on each engine event and redraw, while the render thread sleeps
@@ -395,8 +396,10 @@ void RenderLoop() {
         idle = WaitForSingleObject(g.renderWake, 0) == WAIT_OBJECT_0 ? 0 : idle + 1;
         LONGLONG pts;
         const bool fresh = g.engine->OnVideoStreamTick(&pts) == S_OK;
-        if (fresh || g.redraw) {
-            if (fresh) frameTime = pts;
+        if (fresh) frameTime = pts;
+        if (g.hold) {
+            if (fresh) g.redraw = true;  // shown once released
+        } else if (fresh || g.redraw) {
             // The subtitles are laid out outside the lock, so the window never waits for that.
             AcquireSRWLockShared(&g.lock);
             const bool part = g.chain2 && g.drawWidth && g.drawHeight;
@@ -871,16 +874,21 @@ double PlaybackTime() { return g.engine ? g.engine->GetCurrentTime() : 0; }
 
 double Duration() { return g.engine ? g.engine->GetDuration() : NAN; }
 
-void SeekTo(double seconds, bool fast) {
+double SeekTo(double seconds, bool fast) {
     // The engine's approximate seek still decodes from a key frame up to near the target, a frame at a time,
     // so a fast seek goes exactly to a key frame instead (just past it, so rounding can't land a frame early).
     if (fast && g.keyFrames) {
-        g.engine->SetCurrentTimeEx(NearestKeyFrame(g.keyFrames.Get(), seconds) + 0.0005,
-                                   MF_MEDIA_ENGINE_SEEK_MODE_NORMAL);
-        return;
+        const double key = NearestKeyFrame(g.keyFrames.Get(), seconds) + 0.0005;
+        g.engine->SetCurrentTimeEx(key, MF_MEDIA_ENGINE_SEEK_MODE_NORMAL);
+        return key;
     }
     g.engine->SetCurrentTimeEx(seconds,
                                fast ? MF_MEDIA_ENGINE_SEEK_MODE_APPROXIMATE : MF_MEDIA_ENGINE_SEEK_MODE_NORMAL);
+    return seconds;
+}
+
+void HoldFrames(bool hold) {
+    if (g.hold.exchange(hold) && !hold) Redraw();
 }
 
 double Volume() { return g.engine ? g.engine->GetVolume() : 1; }
