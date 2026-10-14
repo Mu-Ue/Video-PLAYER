@@ -1,8 +1,10 @@
 #include "media/source.h"
 
+#include <audioclient.h>
 #include <mfapi.h>
 #include <mferror.h>
 #include <mfidl.h>
+#include <mmdeviceapi.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -11,6 +13,8 @@
 #include <cwchar>
 #include <utility>
 #include <vector>
+
+#include "media/mkv.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -83,13 +87,58 @@ void Boxes(Reader& r, QWORD at, QWORD end, F&& f) {
     }
 }
 
-// How much earlier the video track's edit list starts it than its samples say, in 100 ns units; 0 if the edit
-// doesn't, delays the track instead or plays it at another rate, or the file has more than one video track.
-LONGLONG ReadVideoShift(IMFByteStream* s) {
+// How much earlier than their samples say a file's tracks start, in 100 ns units.
+struct Shifts {
+    LONGLONG video = 0;
+    std::vector<LONGLONG> audio;  // of each audio track, in file order
+    LONGLONG lead = 0;            // of every audio track, on top
+    bool Any() const {
+        return video || lead || std::any_of(audio.begin(), audio.end(), [](LONGLONG a) { return a != 0; });
+    }
+};
+
+// How far the engine's clock runs ahead of the sound: its audio renderer's buffer, which it doesn't count. That
+// is a shared stream's default buffer on the default output, which the renderer plays to. 0 if it can't tell.
+LONGLONG AudioLead() {
+    ComPtr<IMMDeviceEnumerator> devices;
+    ComPtr<IMMDevice> device;
+    ComPtr<IAudioClient> client;
+    WAVEFORMATEX* format = nullptr;
+    UINT32 frames = 0;
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&devices));
+    if (SUCCEEDED(hr)) hr = devices->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+    if (SUCCEEDED(hr)) hr = device->Activate(__uuidof(IAudioClient), CLSCTX_INPROC_SERVER, nullptr, &client);
+    if (SUCCEEDED(hr)) hr = client->GetMixFormat(&format);
+    if (SUCCEEDED(hr)) hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 0, 0, format, nullptr);
+    if (SUCCEEDED(hr)) hr = client->GetBufferSize(&frames);
+    const LONGLONG lead =
+        SUCCEEDED(hr) && format->nSamplesPerSec ? MFllMulDiv(frames, 10000000, format->nSamplesPerSec, 0) : 0;
+    CoTaskMemFree(format);
+    return std::clamp<LONGLONG>(lead, 0, 1'000'000);  // 100 ms at most
+}
+
+// The lead found ahead of the first file by PrepareSourceExtension, which loads the audio stack.
+std::atomic<PTP_WORK> leadWork = nullptr;
+LONGLONG preparedLead = 0;
+
+// The lead found ahead if there is one, else now, so a change of output shows on the next file.
+LONGLONG TakeAudioLead() {
+    if (const PTP_WORK work = leadWork.exchange(nullptr)) {
+        WaitForThreadpoolWorkCallbacks(work, FALSE);
+        CloseThreadpoolWork(work);
+        return preparedLead;
+    }
+    return AudioLead();
+}
+
+// Each track's shift from its edit list: 0 if the edit doesn't start it later, delays it instead or plays it at
+// another rate. The video's is 0 if the file has more than one video track.
+Shifts ReadMp4Shifts(IMFByteStream* s) {
     QWORD length;
-    if (FAILED(s->GetLength(&length))) return 0;
+    if (FAILED(s->GetLength(&length))) return {};
     Reader r(s);
-    LONGLONG shift = 0;
+    Shifts shifts;
+    LONGLONG video = 0;
     int videos = 0;
     Boxes(r, 0, length, [&](const Box& moov) {
         if (moov.type != Type("moov")) return true;
@@ -121,15 +170,17 @@ LONGLONG ReadVideoShift(IMFByteStream* s) {
                 }
                 return true;
             });
-            if (handler != Type("vide")) return true;
             // Rounded down: Media Foundation rounds the sample times either way, and the first frame mustn't land
             // before 0.
-            if (++videos == 1 && start > 0 && scale) shift = MFllMulDiv(start, 10000000, scale, 0);
+            const LONGLONG shift = start > 0 && scale ? MFllMulDiv(start, 10000000, scale, 0) : 0;
+            if (handler == Type("vide") && ++videos == 1) video = shift;
+            if (handler == Type("soun")) shifts.audio.push_back(std::min<LONGLONG>(shift, 10'000'000));  // 1 s at most
             return true;
         });
         return false;
     });
-    return videos == 1 ? shift : 0;
+    if (videos == 1) shifts.video = video;
+    return shifts;
 }
 
 // Passes on the events of an inner object through a queue of its own, after Adjust has had a look at each. The
@@ -193,11 +244,19 @@ class Relay : public I, public IMFAsyncCallback {
     ComPtr<IMFMediaEventGenerator> from_;
 };
 
-// One of the source's streams, whose samples it moves shift earlier.
+// The bytes and rate of a stream's uncompressed audio frames; 0 if it isn't uncompressed audio.
+struct Pcm {
+    UINT32 blockAlign = 0, rate = 0;
+};
+
+// One of the source's streams, whose samples it moves shift earlier. A video stream's shift is dropped if Media
+// Foundation turns out to apply the edit itself. Uncompressed audio is cut where playback starts, as the renderer
+// would drop a sample that starts before it whole, which leaves the sound early by up to a sample's length.
 class ShiftedStream final : public Relay<IMFMediaStream> {
   public:
-    ShiftedStream(IMFMediaSource* source, IMFMediaStream* inner, LONGLONG shift)
-        : source_(source), inner_(inner), shift_(shift) {}
+    ShiftedStream(IMFMediaSource* source, IMFMediaStream* inner, LONGLONG shift, bool video, Pcm pcm,
+                  const std::atomic<LONGLONG>& start)
+        : source_(source), inner_(inner), shift_(shift), first_(video), pcm_(pcm), start_(start) {}
     HRESULT Start() { return Listen(inner_.Get()); }
     IMFMediaStream* Inner() const { return inner_.Get(); }
     void Shutdown() { queue_->Shutdown(); }
@@ -217,7 +276,7 @@ class ShiftedStream final : public Relay<IMFMediaStream> {
     }
     void Adjust(ComPtr<IMFMediaEvent>& event) override {
         MediaEventType type;
-        if (!shift_ || FAILED(event->GetType(&type)) || type != MEMediaSample) return;
+        if ((!shift_ && !pcm_.blockAlign) || FAILED(event->GetType(&type)) || type != MEMediaSample) return;
         PROPVARIANT value;
         PropVariantInit(&value);
         ComPtr<IMFSample> sample;
@@ -232,21 +291,94 @@ class ShiftedStream final : public Relay<IMFMediaStream> {
                 if (time < shift_ - time) shift_ = 0;
             }
             if (shift_) sample->SetSampleTime(time - shift_);
+            if (pcm_.blockAlign) Cut(sample.Get(), time - shift_);
         }
         PropVariantClear(&value);
+    }
+
+    // Cuts off the frames of an uncompressed audio sample at `time` that come before playback starts.
+    void Cut(IMFSample* sample, LONGLONG time) const {
+        const LONGLONG start = start_;
+        ComPtr<IMFMediaBuffer> whole, cut;
+        DWORD length = 0;
+        if (time >= start || FAILED(sample->ConvertToContiguousBuffer(&whole)) ||
+            FAILED(whole->GetCurrentLength(&length))) {
+            return;
+        }
+        const DWORD frames = length / pcm_.blockAlign;
+        const DWORD skip = DWORD(std::min<LONGLONG>(MFllMulDiv(start - time, pcm_.rate, 10000000, 0), frames));
+        if (!skip || skip == frames || FAILED(MFCreateMemoryBuffer((frames - skip) * pcm_.blockAlign, &cut))) return;
+        BYTE *from = nullptr, *to = nullptr;
+        if (FAILED(whole->Lock(&from, nullptr, nullptr))) return;
+        if (SUCCEEDED(cut->Lock(&to, nullptr, nullptr))) {
+            memcpy(to, from + skip * pcm_.blockAlign, (frames - skip) * pcm_.blockAlign);
+            cut->Unlock();
+            cut->SetCurrentLength((frames - skip) * pcm_.blockAlign);
+        }
+        whole->Unlock();
+        if (to && SUCCEEDED(sample->RemoveAllBuffers()) && SUCCEEDED(sample->AddBuffer(cut.Get()))) {
+            sample->SetSampleTime(time + MFllMulDiv(skip, 10000000, pcm_.rate, 0));
+            sample->SetSampleDuration(MFllMulDiv(frames - skip, 10000000, pcm_.rate, 0));
+        }
     }
 
     const ComPtr<IMFMediaSource> source_;
     const ComPtr<IMFMediaStream> inner_;
     LONGLONG shift_;  // only touched while passing on events, one at a time
-    bool first_ = true;
+    bool first_;      // the first sample is yet to be checked
+    const Pcm pcm_;
+    const std::atomic<LONGLONG>& start_;  // the source's, which it outlives
 };
 
-// Media Foundation's own source for the file, with the video track's samples moved earlier.
+// The major type of a stream.
+GUID MajorType(IMFStreamDescriptor* descriptor) {
+    ComPtr<IMFMediaTypeHandler> handler;
+    GUID major = GUID_NULL;
+    if (SUCCEEDED(descriptor->GetMediaTypeHandler(&handler))) handler->GetMajorType(&major);
+    return major;
+}
+
+Pcm PcmFormat(IMFStreamDescriptor* descriptor) {
+    ComPtr<IMFMediaTypeHandler> handler;
+    ComPtr<IMFMediaType> type;
+    GUID subtype = GUID_NULL;
+    if (FAILED(descriptor->GetMediaTypeHandler(&handler)) || FAILED(handler->GetCurrentMediaType(&type)) ||
+        FAILED(type->GetGUID(MF_MT_SUBTYPE, &subtype)) ||
+        (subtype != MFAudioFormat_PCM && subtype != MFAudioFormat_Float)) {
+        return {};
+    }
+    const Pcm pcm{MFGetAttributeUINT32(type.Get(), MF_MT_AUDIO_BLOCK_ALIGNMENT, 0),
+                  MFGetAttributeUINT32(type.Get(), MF_MT_AUDIO_SAMPLES_PER_SECOND, 0)};
+    return pcm.blockAlign && pcm.rate ? pcm : Pcm{};
+}
+
+// Media Foundation's own source for the file, with the tracks' samples moved earlier.
 class ShiftedSource final : public Relay<IMFMediaSourceEx>, public IMFGetService {
   public:
-    ShiftedSource(IMFMediaSource* inner, LONGLONG shift) : inner_(inner), shift_(shift) {
+    ShiftedSource(IMFMediaSource* inner, const Shifts& shifts)
+        : inner_(inner), video_(shifts.video), lead_(shifts.lead) {
         inner->QueryInterface(IID_PPV_ARGS(&ex_));
+        // The stream ids aren't the file's track ids, but the audio streams come in the file's order. If their
+        // number doesn't match, which one is which isn't known, and none is moved.
+        ComPtr<IMFPresentationDescriptor> presentation;
+        DWORD count = 0;
+        if (FAILED(inner->CreatePresentationDescriptor(&presentation)) ||
+            FAILED(presentation->GetStreamDescriptorCount(&count))) {
+            return;
+        }
+        for (DWORD i = 0; i < count; ++i) {
+            BOOL selected;
+            ComPtr<IMFStreamDescriptor> descriptor;
+            DWORD id;
+            if (FAILED(presentation->GetStreamDescriptorByIndex(i, &selected, &descriptor)) ||
+                FAILED(descriptor->GetStreamIdentifier(&id)) ||
+                (MajorType(descriptor.Get()) == MFMediaType_Audio && audio_.size() == shifts.audio.size())) {
+                audio_.clear();
+                return;
+            }
+            if (MajorType(descriptor.Get()) == MFMediaType_Audio) audio_.push_back({id, shifts.audio[audio_.size()]});
+        }
+        if (audio_.size() != shifts.audio.size()) audio_.clear();
     }
     HRESULT Start() { return Listen(inner_.Get()); }
 
@@ -261,6 +393,7 @@ class ShiftedSource final : public Relay<IMFMediaSourceEx>, public IMFGetService
         return inner_->CreatePresentationDescriptor(descriptor);
     }
     STDMETHODIMP Start(IMFPresentationDescriptor* descriptor, const GUID* format, const PROPVARIANT* at) override {
+        if (at && at->vt == VT_I8) start_ = at->hVal.QuadPart;  // else it resumes where it was
         return inner_->Start(descriptor, format, at);
     }
     STDMETHODIMP Stop() override { return inner_->Stop(); }
@@ -330,15 +463,21 @@ class ShiftedSource final : public Relay<IMFMediaSourceEx>, public IMFGetService
             if (s->Inner() == inner) stream = s;
         }
         if (!stream && !shut_) {
-            // The stream ids aren't the file's track ids, but the file has only the one video track.
+            // The file has only the one video track.
             ComPtr<IMFStreamDescriptor> descriptor;
-            ComPtr<IMFMediaTypeHandler> handler;
             GUID major = GUID_NULL;
-            if (SUCCEEDED(inner->GetStreamDescriptor(&descriptor)) &&
-                SUCCEEDED(descriptor->GetMediaTypeHandler(&handler))) {
-                handler->GetMajorType(&major);
+            DWORD id = 0;
+            Pcm pcm;
+            if (SUCCEEDED(inner->GetStreamDescriptor(&descriptor)) && SUCCEEDED(descriptor->GetStreamIdentifier(&id))) {
+                major = MajorType(descriptor.Get());
+                if (major == MFMediaType_Audio) pcm = PcmFormat(descriptor.Get());
             }
-            stream.Attach(new (std::nothrow) ShiftedStream(this, inner, major == MFMediaType_Video ? shift_ : 0));
+            const bool video = major == MFMediaType_Video;
+            LONGLONG shift = video ? video_ : major == MFMediaType_Audio ? lead_ : 0;
+            for (const auto& [audioId, audioShift] : audio_) {
+                if (major == MFMediaType_Audio && audioId == id) shift += audioShift;
+            }
+            stream.Attach(new (std::nothrow) ShiftedStream(this, inner, shift, video, pcm, start_));
             if (stream && SUCCEEDED(stream->Start())) {
                 streams_.push_back(stream);
             } else {
@@ -351,15 +490,26 @@ class ShiftedSource final : public Relay<IMFMediaSourceEx>, public IMFGetService
 
     const ComPtr<IMFMediaSource> inner_;
     ComPtr<IMFMediaSourceEx> ex_;  // null if the inner source has none, and then not asked for
-    const LONGLONG shift_;
+    const LONGLONG video_, lead_;
+    std::vector<std::pair<DWORD, LONGLONG>> audio_;  // each audio stream's id and own shift
+    std::atomic<LONGLONG> start_ = 0;               // where playback last started
     SRWLOCK lock_ = SRWLOCK_INIT;
     std::vector<ComPtr<ShiftedStream>> streams_;
     bool shut_ = false;
 };
 
-bool IsMp4(const wchar_t* name) {
+bool HasExtension(const wchar_t* name, std::initializer_list<const wchar_t*> extensions) {
     const wchar_t* dot = wcsrchr(name, L'.');
-    return dot && (!_wcsicmp(dot, L".mp4") || !_wcsicmp(dot, L".m4v") || !_wcsicmp(dot, L".mov"));
+    return dot && std::any_of(extensions.begin(), extensions.end(), [&](const wchar_t* e) { return !_wcsicmp(dot, e); });
+}
+
+// The file's shifts: from its edit lists or CodecDelays if it is MPEG-4 or Matroska, and the audio's lead.
+Shifts ReadShifts(BSTR url, IMFByteStream* stream) {
+    Shifts shifts;
+    if (HasExtension(url, {L".mp4", L".m4v", L".mov"})) shifts = ReadMp4Shifts(stream);
+    if (HasExtension(url, {L".mkv", L".webm"})) shifts.audio = MkvAudioDelays(url);
+    shifts.lead = TakeAudioLead();
+    return shifts;
 }
 
 class Extension final : public IMFMediaEngineExtension {
@@ -383,11 +533,11 @@ class Extension final : public IMFMediaEngineExtension {
     STDMETHODIMP BeginCreateObject(BSTR url, IMFByteStream* stream, MF_OBJECT_TYPE type, IUnknown** cancel,
                                    IMFAsyncCallback* callback, IUnknown* state) override {
         if (cancel) *cancel = nullptr;
-        if (type != MF_OBJECT_MEDIASOURCE || !stream || !url || !IsMp4(url)) return MF_E_UNSUPPORTED_BYTESTREAM_TYPE;
-        const LONGLONG shift = ReadVideoShift(stream);
+        if (type != MF_OBJECT_MEDIASOURCE || !stream || !url) return MF_E_UNSUPPORTED_BYTESTREAM_TYPE;
+        const Shifts shifts = ReadShifts(url, stream);
         HRESULT hr = stream->SetCurrentPosition(0);
         if (FAILED(hr)) return hr;
-        if (!shift) return MF_E_UNSUPPORTED_BYTESTREAM_TYPE;
+        if (!shifts.Any()) return MF_E_UNSUPPORTED_BYTESTREAM_TYPE;
         ComPtr<IMFSourceResolver> resolver;
         ComPtr<IUnknown> object;
         ComPtr<IMFMediaSource> inner;
@@ -400,7 +550,7 @@ class Extension final : public IMFMediaEngineExtension {
         if (SUCCEEDED(hr)) hr = object.As(&inner);
         if (FAILED(hr)) return hr;
         ComPtr<ShiftedSource> source;
-        source.Attach(new (std::nothrow) ShiftedSource(inner.Get(), shift));
+        source.Attach(new (std::nothrow) ShiftedSource(inner.Get(), shifts));
         hr = source ? source->Start() : E_OUTOFMEMORY;
         ComPtr<IMFAsyncResult> result;
         if (SUCCEEDED(hr)) {
@@ -423,3 +573,16 @@ Extension extension;
 }  // namespace
 
 IMFMediaEngineExtension* SourceExtension() { return &extension; }
+
+void PrepareSourceExtension() {
+    const PTP_WORK work = CreateThreadpoolWork(
+        [](PTP_CALLBACK_INSTANCE, void*, PTP_WORK) {
+            const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+            preparedLead = AudioLead();
+            if (com) CoUninitialize();
+        },
+        nullptr, nullptr);
+    if (!work) return;
+    SubmitThreadpoolWork(work);
+    leadWork = work;
+}

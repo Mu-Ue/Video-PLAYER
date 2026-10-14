@@ -720,6 +720,7 @@ void PreviewLoop() {
 
 bool InitPlayer(HWND hwnd) {
     g.notify.hwnd = g.textNotify.hwnd = hwnd;
+    PrepareSourceExtension();
     if (FAILED(CreateDevice())) return false;
     g.started = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
     if (!g.started || FAILED(CreateEngines())) return false;

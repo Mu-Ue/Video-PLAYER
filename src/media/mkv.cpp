@@ -18,7 +18,7 @@ enum : UINT32 {
     kEbml = 0x1A45DFA3, kDocType = 0x4282, kSegment = 0x18538067, kSeekHead = 0x114D9B74, kSeek = 0x4DBB,
     kSeekId = 0x53AB, kSeekPosition = 0x53AC, kInfo = 0x1549A966, kTimestampScale = 0x2AD7B1,
     kTracks = 0x1654AE6B, kTrackEntry = 0xAE, kTrackNumber = 0xD7, kTrackType = 0x83, kCodecId = 0x86,
-    kLanguage = 0x22B59C, kLanguageBcp47 = 0x22B59D, kName = 0x536E, kDefaultDuration = 0x23E383,
+    kLanguage = 0x22B59C, kLanguageBcp47 = 0x22B59D, kName = 0x536E, kDefaultDuration = 0x23E383, kCodecDelay = 0x56AA,
     kContentEncodings = 0x6D80, kContentEncoding = 0x6240, kContentEncodingType = 0x5033,
     kContentCompression = 0x5034, kContentCompAlgo = 0x4254, kContentCompSettings = 0x4255,
     kCues = 0x1C53BB6B, kCuePoint = 0xBB, kCueTime = 0xB3, kCueTrackPositions = 0xB7, kCueTrack = 0xF7,
@@ -611,8 +611,9 @@ struct Reader {
     }
 };
 
-// Reads the file header, Info and Tracks, which come before the first cluster, and finds the index.
-bool ReadHeaders(Reader& r, std::vector<Track>& out) {
+// Reads the file header, Info and Tracks, which come before the first cluster, and finds the index. Also gives each
+// audio track's CodecDelay in nanoseconds, in track order, if asked.
+bool ReadHeaders(Reader& r, std::vector<Track>& out, std::vector<UINT64>* audioDelays = nullptr) {
     Element e;
     std::vector<BYTE> data;
     if (!r.Header(0, e) || e.id != kEbml || !r.Data(e, data, kMaxHeaderBytes)) return false;
@@ -660,7 +661,7 @@ bool ReadHeaders(Reader& r, std::vector<Track>& out) {
     Children(data.data(), data.data() + data.size(), [&](UINT32 id, const BYTE* d, size_t s) {
         if (id != kTrackEntry) return;
         TextTrack t{};
-        UINT64 type = 0;
+        UINT64 type = 0, delay = 0;
         bool text = false, encoded = false;
         Track track{};
         std::wstring language, bcp47;
@@ -677,6 +678,7 @@ bool ReadHeaders(Reader& r, std::vector<Track>& out) {
                 case kLanguageBcp47: bcp47 = Widen(v, n); break;
                 case kName: track.name = Widen(v, n); break;
                 case kDefaultDuration: t.defaultDuration = double(UInt(v, n)) * 1e-9; break;
+                case kCodecDelay: delay = UInt(v, n); break;
                 case kContentEncodings:
                     // Only header stripping, which keeps the rest of each block as it is, can be undone here.
                     Children(v, v + n, [&](UINT32 id2, const BYTE* d2, size_t s2) {
@@ -698,6 +700,7 @@ bool ReadHeaders(Reader& r, std::vector<Track>& out) {
                     break;
             }
         });
+        if (type == 2 && audioDelays) audioDelays->push_back(delay);
         if (type != 0x11 || !text) return;
         if (encoded || !t.number || t.number > MAXDWORD || r.Find(t.number) || t.prefix.size() > kMaxBlockBytes) {
             readable = false;
@@ -714,19 +717,36 @@ bool ReadHeaders(Reader& r, std::vector<Track>& out) {
 std::thread reader;
 std::atomic<bool> stopReader = false;
 
+// Opens a file for the reader; false if it can't, or it isn't a file on disk.
+bool OpenFile(Reader& r, const wchar_t* path) {
+    r.file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                         OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, nullptr);
+    LARGE_INTEGER size{};
+    if (r.file == INVALID_HANDLE_VALUE || GetFileType(r.file) != FILE_TYPE_DISK || !GetFileSizeEx(r.file, &size)) {
+        return false;
+    }
+    r.fileSize = UINT64(size.QuadPart);
+    return true;
+}
+
 }  // namespace
+
+std::vector<LONGLONG> MkvAudioDelays(const wchar_t* path) {
+    Reader r;
+    std::vector<Track> tracks;
+    std::vector<UINT64> delays;
+    if (!OpenFile(r, path)) return {};
+    ReadHeaders(r, tracks, &delays);  // false only for want of subtitles, which aren't asked for
+    std::vector<LONGLONG> out;
+    for (const UINT64 d : delays) out.push_back(LONGLONG(std::min<UINT64>(d / 100, 10'000'000)));  // 1 s at most
+    return out;
+}
 
 std::vector<Track> StartMkvSubtitles(const std::wstring& path, HWND hwnd) {
     StopMkvSubtitles();
     auto r = std::make_unique<Reader>();
-    r->file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                          OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, nullptr);
-    LARGE_INTEGER size{};
     std::vector<Track> tracks;
-    if (r->file == INVALID_HANDLE_VALUE || GetFileType(r->file) != FILE_TYPE_DISK || !GetFileSizeEx(r->file, &size) ||
-        (r->fileSize = UINT64(size.QuadPart), !ReadHeaders(*r, tracks))) {
-        return {};
-    }
+    if (!OpenFile(*r, path.c_str()) || !ReadHeaders(*r, tracks)) return {};
     r->hwnd = hwnd;
     answering = true;  // from the start, as the index tells only then whether seeks can be
     reader = std::thread([r = std::move(r)] {

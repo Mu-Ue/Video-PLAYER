@@ -3,8 +3,15 @@
 #include <windows.h>
 #include <mfmediaengine.h>
 
-// A media engine extension for MPEG-4 files whose video track's edit list starts it later than its first sample,
-// as B-frame files do. Media Foundation ignores the edit, which leaves the video late against the sound. The
-// extension hands the engine a source that moves the video's samples earlier by the edit; it leaves every other
-// file to the engine. Lives for the whole process.
+// A media engine extension that hands the engine Media Foundation's own source for each file, with its samples'
+// times fixed so the picture and the sound play in sync:
+// - Tracks that start later than their first samples: B-frame video, whose MPEG-4 edit list starts it later, and
+//   audio with an encoder delay (AAC's priming), which the MPEG-4 edit list or the Matroska CodecDelay skip. Media
+//   Foundation ignores both.
+// - The sound as a whole, moved earlier by the audio renderer's buffer, which the engine's clock runs ahead by.
+// - Uncompressed audio, cut exactly where playback starts.
+// Lives for the whole process.
 IMFMediaEngineExtension* SourceExtension();
+// Starts finding, on a thread of its own, what the first file needs from the audio output, so its opening doesn't
+// wait on that. Call once, before the first file.
+void PrepareSourceExtension();
