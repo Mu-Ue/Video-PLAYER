@@ -996,8 +996,9 @@ void AddSidecarSubtitles(const std::wstring& video) {
     FindClose(find);
 }
 
-bool OpenVideoFile(const std::wstring& path) {
-    const HRESULT hr = OpenVideo(path);
+// Plays a video, unless started, as the engine already loads it.
+bool OpenVideoFile(const std::wstring& path, bool started) {
+    const HRESULT hr = started ? S_OK : OpenVideo(path);
     if (FAILED(hr)) {
         const bool missing = hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) ||
                              hr == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
@@ -1037,11 +1038,11 @@ bool OpenVideoFile(const std::wstring& path) {
     return true;
 }
 
-// Plays the first video among paths, with the first subtitle file.
-bool OpenFiles(const std::vector<std::wstring>& paths) {
+// Plays the first video among paths, unless started, as the engine already loads it, with the first subtitle file.
+bool OpenFiles(const std::vector<std::wstring>& paths, bool started = false) {
     const auto video = std::find_if_not(paths.begin(), paths.end(), IsSubtitleFile);
     const auto subs = std::find_if(paths.begin(), paths.end(), IsSubtitleFile);
-    if (video != paths.end() && !OpenVideoFile(*video)) return false;
+    if (video != paths.end() && !OpenVideoFile(*video, started)) return false;
     if (subs != paths.end()) LoadSubtitleFile(*subs);
     return true;
 }
@@ -1722,18 +1723,22 @@ bool StartPlayer(HINSTANCE instance, const std::vector<std::wstring>& files, int
     g.hwnd = CreateMainWindow(instance);
     if (!g.hwnd) return false;
     // On failure, destroying the window stops the player's threads, which must not outlive it.
-    if (!InitPlayer(g.hwnd) || !InitComposition()) {
+    const bool player = InitPlayer(g.hwnd);
+    // The engine loads the video while the window's composition is set up.
+    const auto video = std::find_if_not(files.begin(), files.end(), IsSubtitleFile);
+    const bool started = player && video != files.end() && SUCCEEDED(OpenVideo(*video));
+    if (!player || !InitComposition()) {
         MessageBoxW(nullptr, L"Can't start: Direct3D 11 or Media Foundation isn't available.", kAppName,
                     MB_OK | MB_ICONERROR);
         DestroyWindow(g.hwnd);
         return false;
     }
-    if (std::none_of(files.begin(), files.end(), [](const std::wstring& f) { return !IsSubtitleFile(f); })) {
+    if (video == files.end()) {
         ShowMainWindow();
         Layout();
         return true;
     }
-    if (!OpenFiles(files)) {
+    if (!OpenFiles(files, started)) {
         DestroyWindow(g.hwnd);
         return false;
     }
