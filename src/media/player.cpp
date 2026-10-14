@@ -156,6 +156,7 @@ struct {
     std::atomic<UINT> subsVersion = 0;
     std::atomic<bool> redraw = false;  // present the current frame even if it isn't new; set with Redraw
     std::atomic<bool> frameWanted = false;  // post WM_APP_FRAME before the next frame; set with RequestFrame
+    std::atomic<LONGLONG> landing = -1;     // of the last seek, in 100 ns units, until its frame shows
     HANDLE stop = nullptr;             // tells the render thread and the previewer to exit
     HANDLE renderWake = nullptr;       // set on each engine event and redraw, while the render thread sleeps
     std::thread renderer;
@@ -454,7 +455,15 @@ void RenderLoop() {
             if (!WaitBeforeNextFrame(clock.Get(), timer, tick.QuadPart)) break;
             fresh = g.engine->OnVideoStreamTick(&pts) == S_OK;
         }
-        if (fresh) frameTime = pts;
+        if (fresh) {
+            // The engine gives the frame a seek lands on as at the seek's time, which can be past the frame's own
+            // time, and so past a cue's end.
+            LONGLONG landing = g.landing;
+            if (landing >= 0 && std::abs(pts - landing) <= 1 && g.landing.compare_exchange_strong(landing, -1)) {
+                pts = LandedFrameTime(pts);
+            }
+            frameTime = pts;
+        }
         if (fresh || g.redraw) {
             // The subtitles are laid out outside the lock, so the window never waits for that.
             AcquireSRWLockShared(&g.lock);
@@ -960,6 +969,7 @@ double SeekLanding(double seconds, bool fast) {
 }
 
 void SeekTo(double landing, bool fast) {
+    g.landing = std::llround(landing * 1e7);
     g.engine->SetCurrentTimeEx(landing, fast && !KeyFrames() ? MF_MEDIA_ENGINE_SEEK_MODE_APPROXIMATE
                                                              : MF_MEDIA_ENGINE_SEEK_MODE_NORMAL);
 }

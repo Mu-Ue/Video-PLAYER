@@ -12,6 +12,9 @@
 // - Uncompressed audio, cut exactly where playback starts.
 // Lives for the whole process.
 IMFMediaEngineExtension* SourceExtension();
+// The time of the frame the engine shows after a seek, which it gives as at the seek's time: the frame at or
+// before it. time if unknown.
+LONGLONG LandedFrameTime(LONGLONG time);
 // Starts finding what the first file needs from the audio output, and making that file's source, on threads of
 // their own, so its opening doesn't wait on that. path may be null for none; it is opened as a local file. Call once,
 // before the first file.

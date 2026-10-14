@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <cstring>
 #include <cwchar>
 #include <utility>
@@ -288,6 +289,39 @@ struct Pcm {
     UINT32 blockAlign = 0, rate = 0;
 };
 
+// The times of the last video samples handed to the engine since playback last started, for LandedFrameTime: a
+// frame shows a little after its sample is handed over, as it decodes.
+class RecentFrames {
+  public:
+    void Clear() {
+        AcquireSRWLockExclusive(&lock_);
+        count_ = next_ = 0;
+        ReleaseSRWLockExclusive(&lock_);
+    }
+    void Add(LONGLONG time) {
+        AcquireSRWLockExclusive(&lock_);
+        times_[next_] = time;
+        next_ = (next_ + 1) % std::size(times_);
+        count_ = std::min(count_ + 1, std::size(times_));
+        ReleaseSRWLockExclusive(&lock_);
+    }
+    // The latest one at or before time, or time if there is none.
+    LONGLONG AtOrBefore(LONGLONG time) {
+        LONGLONG best = LLONG_MIN;
+        AcquireSRWLockShared(&lock_);
+        for (size_t i = 0; i < count_; ++i) {
+            if (times_[i] <= time) best = std::max(best, times_[i]);
+        }
+        ReleaseSRWLockShared(&lock_);
+        return best == LLONG_MIN ? time : best;
+    }
+
+  private:
+    SRWLOCK lock_ = SRWLOCK_INIT;
+    LONGLONG times_[64];
+    size_t count_ = 0, next_ = 0;
+} recentFrames;
+
 // One of the source's streams, whose samples it moves shift earlier. A video stream's shift is dropped if Media
 // Foundation turns out to apply the edit itself. Uncompressed audio is cut where playback starts, as the renderer
 // would drop a sample that starts before it whole, which leaves the sound early by up to a sample's length.
@@ -295,7 +329,7 @@ class ShiftedStream final : public Relay<IMFMediaStream> {
   public:
     ShiftedStream(IMFMediaSource* source, IMFMediaStream* inner, LONGLONG shift, bool video, Pcm pcm,
                   const std::atomic<LONGLONG>& start)
-        : source_(source), inner_(inner), shift_(shift), first_(video), pcm_(pcm), start_(start) {}
+        : source_(source), inner_(inner), shift_(shift), video_(video), first_(video), pcm_(pcm), start_(start) {}
     HRESULT Start() { return Listen(inner_.Get()); }
     IMFMediaStream* Inner() const { return inner_.Get(); }
     void Shutdown() { queue_->Shutdown(); }
@@ -315,7 +349,7 @@ class ShiftedStream final : public Relay<IMFMediaStream> {
     }
     void Adjust(ComPtr<IMFMediaEvent>& event) override {
         MediaEventType type;
-        if ((!shift_ && !pcm_.blockAlign) || FAILED(event->GetType(&type)) || type != MEMediaSample) return;
+        if ((!shift_ && !video_ && !pcm_.blockAlign) || FAILED(event->GetType(&type)) || type != MEMediaSample) return;
         PROPVARIANT value;
         PropVariantInit(&value);
         ComPtr<IMFSample> sample;
@@ -330,6 +364,7 @@ class ShiftedStream final : public Relay<IMFMediaStream> {
                 if (time < shift_ - time) shift_ = 0;
             }
             if (shift_) sample->SetSampleTime(time - shift_);
+            if (video_) recentFrames.Add(time - shift_);
             if (pcm_.blockAlign) Cut(sample.Get(), time - shift_);
         }
         PropVariantClear(&value);
@@ -364,7 +399,8 @@ class ShiftedStream final : public Relay<IMFMediaStream> {
     const ComPtr<IMFMediaSource> source_;
     const ComPtr<IMFMediaStream> inner_;
     LONGLONG shift_;  // only touched while passing on events, one at a time
-    bool first_;      // the first sample is yet to be checked
+    const bool video_;
+    bool first_;  // the first sample is yet to be checked
     const Pcm pcm_;
     const std::atomic<LONGLONG>& start_;  // the source's, which it outlives
 };
@@ -432,7 +468,10 @@ class ShiftedSource final : public Relay<IMFMediaSourceEx>, public IMFGetService
         return inner_->CreatePresentationDescriptor(descriptor);
     }
     STDMETHODIMP Start(IMFPresentationDescriptor* descriptor, const GUID* format, const PROPVARIANT* at) override {
-        if (at && at->vt == VT_I8) start_ = at->hVal.QuadPart;  // else it resumes where it was
+        if (at && at->vt == VT_I8) {  // else it resumes where it was
+            start_ = at->hVal.QuadPart;
+            recentFrames.Clear();
+        }
         return inner_->Start(descriptor, format, at);
     }
     STDMETHODIMP Stop() override { return inner_->Stop(); }
@@ -609,6 +648,8 @@ Extension extension;
 }  // namespace
 
 IMFMediaEngineExtension* SourceExtension() { return &extension; }
+
+LONGLONG LandedFrameTime(LONGLONG time) { return recentFrames.AtOrBefore(time); }
 
 void PrepareSourceExtension(const wchar_t* path) {
     const auto start = [](std::atomic<PTP_WORK>& slot, PTP_WORK_CALLBACK callback) {
