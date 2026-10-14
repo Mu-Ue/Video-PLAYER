@@ -750,10 +750,12 @@ int wmain(int argc, wchar_t** argv) {
         }
     }
 
-    // A/V: each flash frame's first composition against the nearest click; positive means the video is late.
+    // A/V: each flash frame's first composition against the nearest click; positive means the video is late. Not
+    // just after a seek, which can land on a flash frame before its sound plays.
     std::vector<double> av;
-    for (const Change& c : changes) {
-        if (c.frame == 0 || c.frame % clip.flashEvery || Ms(c.time - launched) < 3000) continue;
+    for (size_t i = 0; i < changes.size(); ++i) {
+        const Change& c = changes[i];
+        if (c.frame == 0 || c.frame % clip.flashEvery || Ms(c.time - launched) < 3000 || afterSeek[i]) continue;
         double best = NAN;
         for (LONGLONG k : clicks) {
             const double d = Ms(c.time - k);
