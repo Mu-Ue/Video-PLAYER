@@ -136,10 +136,10 @@ struct {
     ComPtr<ID3D11Texture2D> taken;  // the last one the window took, alive while it opens it
     double previewBucket = -1;      // the window's last span
     LONGLONG previewKey = -1;       // and its key frame
-    // A second parser of the open file, which knows where its key frames are; null if the format doesn't say, or
-    // until OpenSeekHelpers opens keyPath.
-    std::wstring keyPath;
-    ComPtr<IMFMediaSource> keySource;
+    bool previewKeyed = false;      // found with keyFrames
+    // Where the open file's key frames are, from the previewer's parser of it: openedKeyFrames under previewLock as
+    // it opens, keyFrames the window's once taken by KeyFrames. Null if the format doesn't say, or until then.
+    ComPtr<IMFSeekInfo> openedKeyFrames;
     ComPtr<IMFSeekInfo> keyFrames;
     bool started = false;  // MFStartup succeeded
     // The swap chain, guarded by lock: the render thread presents into it and the window thread sizes it.
@@ -491,32 +491,15 @@ void RenderLoop() {
     if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
 }
 
-void CloseKeyFrames() {
-    g.keyFrames.Reset();
-    if (g.keySource) g.keySource->Shutdown();
-    g.keySource.Reset();
-}
-
-void OpenKeyFrames(const std::wstring& path) {
-    CloseKeyFrames();
-    ComPtr<IMFByteStream> stream;
-    ComPtr<IMFSourceResolver> resolver;
-    MF_OBJECT_TYPE type;
-    ComPtr<IUnknown> object;
-    ComPtr<IMFGetService> service;
-    if (FAILED(MFCreateFile(MF_ACCESSMODE_READ, MF_OPENMODE_FAIL_IF_NOT_EXIST, MF_FILEFLAGS_NONE, path.c_str(),
-                            &stream)) ||
-        FAILED(MFCreateSourceResolver(&resolver)) ||
-        FAILED(resolver->CreateObjectFromByteStream(stream.Get(), path.c_str(),
-                                                    MF_RESOLUTION_MEDIASOURCE | MF_RESOLUTION_READ, nullptr, &type,
-                                                    &object)) ||
-        FAILED(object.As(&g.keySource))) {
-        return;
+// The open file's key frames, for the window thread; null until the previewer has opened the file, or if the format
+// doesn't say.
+IMFSeekInfo* KeyFrames() {
+    if (!g.keyFrames) {
+        AcquireSRWLockShared(&g.previewLock);
+        g.keyFrames = g.openedKeyFrames;
+        ReleaseSRWLockShared(&g.previewLock);
     }
-    if (FAILED(g.keySource.As(&service)) ||
-        FAILED(service->GetService(MF_SCRUBBING_SERVICE, IID_PPV_ARGS(&g.keyFrames)))) {
-        CloseKeyFrames();
-    }
+    return g.keyFrames.Get();
 }
 
 // Whether a path names a device, such as a pipe, console or raw volume, rather than a file: "\\.\…", "\??\…",
@@ -579,13 +562,13 @@ constexpr DWORD kVideoStream = DWORD(MF_SOURCE_READER_FIRST_VIDEO_STREAM);
 constexpr double kPreviewCount = 200;   // preview pictures across the whole seek bar
 constexpr double kMinPreviewSpan = 1;  // seconds of video each preview picture stands for, at least
 
-// A reader of the file's video alone, which decodes on the GPU and hands out each frame shrunk there to w x h, its
-// display size fitted to 320 px, about the largest the preview shows; null if it can't.
+// A reader of the file's video alone, and w x h, its display size fitted to 320 px, about the largest the preview
+// shows; null if it has no video. It hands out frames as stored until SetPreviewType.
 ComPtr<IMFSourceReader> OpenPreviewReader(const std::wstring& path, UINT& w, UINT& h) {
     ComPtr<IMFByteStream> stream;
     ComPtr<IMFAttributes> attributes;
     ComPtr<IMFSourceReader> reader;
-    ComPtr<IMFMediaType> native, type;
+    ComPtr<IMFMediaType> native;
     HRESULT hr = MFCreateFile(MF_ACCESSMODE_READ, MF_OPENMODE_FAIL_IF_NOT_EXIST, MF_FILEFLAGS_NONE, path.c_str(),
                               &stream);
     if (SUCCEEDED(hr)) hr = MFCreateAttributes(&attributes, 4);
@@ -607,14 +590,20 @@ ComPtr<IMFSourceReader> OpenPreviewReader(const std::wstring& path, UINT& w, UIN
     const double dw = double(fw) * ax / ay, scale = 320.0 / std::max(dw, double(fh));
     w = UINT(std::max(2L, std::lround(dw * scale / 2) * 2));  // even, as video processing likes
     h = UINT(std::max(2L, std::lround(fh * scale / 2) * 2));
-    hr = MFCreateMediaType(&type);
+    return reader;
+}
+
+// Has the reader decode on the GPU and hand out each frame shrunk there to w x h; false if it can't.
+bool SetPreviewType(IMFSourceReader* reader, UINT w, UINT h) {
+    ComPtr<IMFMediaType> type;
+    HRESULT hr = MFCreateMediaType(&type);
     if (SUCCEEDED(hr)) hr = type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
     if (SUCCEEDED(hr)) hr = type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_ARGB32);  // the swap chain's format
     if (SUCCEEDED(hr)) hr = type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
     if (SUCCEEDED(hr)) hr = MFSetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, w, h);
     if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(type.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
     if (SUCCEEDED(hr)) hr = reader->SetCurrentMediaType(kVideoStream, nullptr, type.Get());
-    return SUCCEEDED(hr) ? reader : nullptr;
+    return SUCCEEDED(hr);
 }
 
 // Seeks the reader to the key frame at or before a time, in 100 ns units, and decodes just that frame; null if it
@@ -676,12 +665,13 @@ ComPtr<ID3D11Texture2D> KeepKeyFrame(IMFSample* sample) {
     return kept;
 }
 
-// Opens the files and decodes the key frames the window wants, one at a time, always the latest. Nothing queues:
-// each wake reads what is wanted now, and it decodes back to back while that changes. Each picture is handed to the
-// window, which keeps it, even if the mouse moved on while it decoded.
+// Opens the files, which also tells where their key frames are, and decodes the key frames the window wants, one at
+// a time, always the latest. Nothing queues: each wake reads what is wanted now, and it decodes back to back while
+// that changes. Each picture is handed to the window, which keeps it, even if the mouse moved on while it decoded.
 void PreviewLoop() {
     const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
     ComPtr<IMFSourceReader> reader;
+    bool decodes = false;  // the reader shrinks frames for the previews
     LONGLONG done = -1;  // the key frame last decoded, or tried, in 100 ns units
     const HANDLE events[] = {g.stop, g.previewWake};
     for (;;) {
@@ -692,13 +682,21 @@ void PreviewLoop() {
         if (!path.empty()) {
             UINT w = 0, h = 0;
             reader = OpenPreviewReader(path, w, h);
+            decodes = reader && SetPreviewType(reader.Get(), w, h);
             done = -1;
+            // The parser the reader opened knows where the key frames are, if the format says.
+            ComPtr<IMFSeekInfo> keyFrames;
+            if (reader) {
+                reader->GetServiceForStream(DWORD(MF_SOURCE_READER_MEDIASOURCE), MF_SCRUBBING_SERVICE,
+                                            IID_PPV_ARGS(&keyFrames));
+            }
             AcquireSRWLockExclusive(&g.previewLock);
-            g.previewWidth = reader ? w : 0;  // audio only, or a format it can't shrink: no previews
-            g.previewHeight = reader ? h : 0;
+            if (g.previewPath.empty()) g.openedKeyFrames = std::move(keyFrames);  // else another file is waiting
+            g.previewWidth = decodes ? w : 0;  // audio only, or a format it can't shrink: no previews
+            g.previewHeight = decodes ? h : 0;
             ReleaseSRWLockExclusive(&g.previewLock);
         }
-        if (!reader || time < 0 || time == done) {
+        if (!decodes || time < 0 || time == done) {
             if (WaitForMultipleObjects(2, events, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) break;
             continue;
         }
@@ -749,7 +747,8 @@ void ShutdownPlayer() {
     g.subs.reset();
     g.ready.Reset();
     g.taken.Reset();
-    CloseKeyFrames();
+    g.keyFrames.Reset();
+    g.openedKeyFrames.Reset();
     g.timedText.Reset();
     if (g.engine) g.engine->Shutdown();
     g.engine.Reset();
@@ -772,10 +771,10 @@ HRESULT OpenVideo(const std::wstring& path) {
     Redraw();  // the first frame, even if it never plays
     if (SUCCEEDED(hr)) hr = g.engine->Play();
     if (FAILED(hr)) return hr;
-    // The last file's key frames and previews are done with; OpenSeekHelpers opens this one's.
-    CloseKeyFrames();
-    g.keyPath = path;
+    // The last file's key frames and previews are done with; OpenSeekHelpers has the previewer open this one.
+    g.keyFrames.Reset();
     AcquireSRWLockExclusive(&g.previewLock);
+    g.openedKeyFrames.Reset();
     g.previewPath = path;
     g.previewOpen = false;
     g.previewWanted = -1;
@@ -787,11 +786,7 @@ HRESULT OpenVideo(const std::wstring& path) {
 }
 
 void OpenSeekHelpers() {
-    const std::wstring path = std::exchange(g.keyPath, {});
-    if (path.empty()) return;
-    OpenKeyFrames(path);
-    g.previewBucket = -1;  // a span looked up before has its key frame now
-    // The previewer reads the file on its own; if it can't, there are just no previews.
+    // The previewer reads the file on its own; if it can't, there are just no previews or key frames.
     AcquireSRWLockExclusive(&g.previewLock);
     g.previewOpen = true;
     ReleaseSRWLockExclusive(&g.previewLock);
@@ -803,10 +798,12 @@ LONGLONG PreviewKeyFrame(double seconds, double duration) {
     // one look up nothing.
     const double span = std::max(kMinPreviewSpan, duration / kPreviewCount);
     const double bucket = std::floor(seconds / span);
-    if (bucket == g.previewBucket) return g.previewKey;
+    IMFSeekInfo* keyFrames = KeyFrames();
+    if (bucket == g.previewBucket && g.previewKeyed == !!keyFrames) return g.previewKey;
     g.previewBucket = bucket;
+    g.previewKeyed = keyFrames;
     // Spans can share a key frame.
-    g.previewKey = std::llround(NearestKeyFrame(g.keyFrames.Get(), (bucket + 0.5) * span) * 1e7);
+    g.previewKey = std::llround(NearestKeyFrame(keyFrames, (bucket + 0.5) * span) * 1e7);
     return g.previewKey;
 }
 
@@ -954,11 +951,12 @@ double Duration() { return g.engine ? g.engine->GetDuration() : NAN; }
 // The engine's approximate seek still decodes from a key frame up to near the target, a frame at a time, so a fast
 // seek goes exactly to a key frame instead (just past it, so rounding can't land a frame early).
 double SeekLanding(double seconds, bool fast) {
-    return fast && g.keyFrames ? NearestKeyFrame(g.keyFrames.Get(), seconds) + 0.0005 : seconds;
+    IMFSeekInfo* keyFrames = fast ? KeyFrames() : nullptr;
+    return keyFrames ? NearestKeyFrame(keyFrames, seconds) + 0.0005 : seconds;
 }
 
 void SeekTo(double landing, bool fast) {
-    g.engine->SetCurrentTimeEx(landing, fast && !g.keyFrames ? MF_MEDIA_ENGINE_SEEK_MODE_APPROXIMATE
+    g.engine->SetCurrentTimeEx(landing, fast && !KeyFrames() ? MF_MEDIA_ENGINE_SEEK_MODE_APPROXIMATE
                                                              : MF_MEDIA_ENGINE_SEEK_MODE_NORMAL);
 }
 

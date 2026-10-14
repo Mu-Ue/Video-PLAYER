@@ -33,8 +33,9 @@ void RequestFrame();
 
 // Starts loading and playing a local file; the outcome arrives as events. Fails if the file can't be opened.
 HRESULT OpenVideo(const std::wstring& path);
-// Opens what fast seeks and the seek bar previews need of the video, which reads it again; called once its first
-// frame is ready, so that never holds the frame up.
+// Has a second parser of the video opened on a thread of its own, for where its key frames are, which fast seeks
+// and the seek bar previews need, and for the previews; called once its first frame is ready, so that never holds
+// the frame up.
 void OpenSeekHelpers();
 bool HasVideo();
 
