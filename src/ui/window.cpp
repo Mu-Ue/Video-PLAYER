@@ -20,6 +20,7 @@
 #include "media/player.h"
 #include "media/subtitles.h"
 #include "platform/file_dialog.h"
+#include "platform/settings.h"
 #include "ui/overlay.h"
 #include "ui/popup_menu.h"
 
@@ -1689,6 +1690,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_DESTROY:
+            SaveSettings({g.volume, g.muted});
             StopMkvSubtitles();
             ShutdownPlayer();
             SetThreadExecutionState(ES_CONTINUOUS);
@@ -1811,6 +1813,11 @@ bool StartPlayer(HINSTANCE instance, const std::vector<std::wstring>& files, int
     const auto video = std::find_if_not(files.begin(), files.end(), IsSubtitleFile);
     const bool hasVideo = video != files.end();
     if (hasVideo) PrepareVideo(*video);
+    // The volume of the last run, which the engine takes on when made.
+    const Settings saved = LoadSettings();
+    g.volume = SetVolume(saved.volume);
+    if (g.volume > 0) g.restoreVolume = g.volume;
+    if (saved.muted) g.muted = ToggleMute();
     g.hwnd = CreateMainWindow(instance);
     if (!g.hwnd) return false;
     // On failure, destroying the window stops the player's threads, which must not outlive it.
