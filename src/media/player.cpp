@@ -226,7 +226,8 @@ struct FrameText {
 // The render thread's subtitles: those drawn into the frames from time `from` until `next` (100 ns units), in the
 // painter's slots 0 and 1, and in slots 2 and 3 those drawn ahead for a time to come.
 struct FrameSubtitles {
-    FramePainter painter;
+    FramePainter painter;  // opened for the first text, as most videos have none
+    bool opened = false;
     UINT version = UINT_MAX;
     UINT width = 0;  // of the frames they are laid out for
     LONGLONG from = LLONG_MAX, next = LLONG_MIN;
@@ -263,7 +264,15 @@ FrameText TextAt(LONGLONG t, UINT w, LONGLONG& next) {
 }
 
 // Draws the text into the painter's slots first and first + 1 and sets where they go.
-void PrepareText(FramePainter& painter, int first, const FrameText& f, POINT at[2]) {
+void PrepareText(FrameSubtitles& subtitles, int first, const FrameText& f, POINT at[2]) {
+    FramePainter& painter = subtitles.painter;
+    if (!subtitles.opened && (!f.text[0].empty() || !f.text[1].empty())) {
+        subtitles.opened = true;
+        // Under lock, as the window lets go of the painter's target.
+        AcquireSRWLockExclusive(&g.lock);
+        painter.Open(g.device.Get());
+        ReleaseSRWLockExclusive(&g.lock);
+    }
     const SubtitleLayout& layout = f.layout;
     // Frames are drawn at another size than on screen only before Windows 8.1.
     const float w = float(f.width), scale = layout.width > 0 ? w / layout.width : 1;
@@ -291,7 +300,7 @@ void UpdateFrameSubtitles(FrameSubtitles& f, LONGLONG t, UINT w) {
         std::swap(f.at, f.aheadAt);
         return;
     }
-    PrepareText(f.painter, 0, text, f.at);
+    PrepareText(f, 0, text, f.at);
     f.drawn = std::move(text);
 }
 
@@ -306,7 +315,7 @@ void PrepareAhead(FrameSubtitles& f) {
     LONGLONG next;
     FrameText text = TextAt(f.next, f.width, next);
     if (text == f.drawn || text == f.ahead) return;
-    PrepareText(f.painter, 2, text, f.aheadAt);
+    PrepareText(f, 2, text, f.aheadAt);
     f.ahead = std::move(text);
 }
 
@@ -465,7 +474,6 @@ void RenderLoop() {
     const HANDLE events[] = {g.stop, g.renderWake};
     int idle = 0, latchGrace = 0;
     FrameSubtitles subtitles;
-    subtitles.painter.Open(g.device.Get());
     AcquireSRWLockExclusive(&g.lock);
     g.painter = &subtitles.painter;
     ReleaseSRWLockExclusive(&g.lock);
