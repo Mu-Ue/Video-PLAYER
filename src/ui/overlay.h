@@ -51,7 +51,6 @@ struct BarItem {
     bool dim = false;  // disabled
     bool mirror = false;  // flipped left to right
     bool checked = false;  // a check mark left of the text
-    bool label = false;    // text on the controls rather than an icon glyph
     bool operator==(const BarItem&) const = default;
 };
 

@@ -631,8 +631,8 @@ void DrawControls(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT 
             dc->SetTransform(D2D1::Matrix3x2F::Scale(item.mirror ? -zoom : zoom, zoom, center) * base);
             g.kit.brush->SetColor(D2D1::ColorF(item.dim ? 0x808080 : 0xffffff));
             if (item.replay) DrawReplayArrow(dc, center, 11 * scale, 2 * scale, item.replay);
-            IDWriteTextFormat* font = item.replay ? g.number.Get() : item.label ? g.title.Get() : g.icons.Get();
-            dc->DrawText(item.text.data(), UINT32(item.text.size()), font, r, g.kit.brush.Get());
+            dc->DrawText(item.text.data(), UINT32(item.text.size()), item.replay ? g.number.Get() : g.icons.Get(),
+                         r, g.kit.brush.Get());
         }
     });
 }

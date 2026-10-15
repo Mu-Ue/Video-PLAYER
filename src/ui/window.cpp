@@ -352,7 +352,9 @@ const wchar_t* VolumeGlyph() {
     return volume < 1.0 / 3 ? L"\xE993" : volume < 2.0 / 3 ? L"\xE994" : L"\xE995";
 }
 
-// A playback speed as the speed button shows it, such as 1× or 1.25×.
+constexpr wchar_t kSpeedGlyph[] = L"\xEC4A";  // a speedometer
+
+// A playback speed as its caption shows it, such as 1× or 1.25×.
 std::wstring FormatRate(double rate) {
     wchar_t text[16];
     swprintf_s(text, L"%g×", rate);
@@ -388,8 +390,6 @@ bool DrawControls() {
     RECT volume = SliderTrack(kVolumeBar), speed = SliderTrack(kSpeedBar);
     OffsetRect(&volume, 0, -top);
     OffsetRect(&speed, 0, -top);
-    BarItem speedButton = button(kSpeed, FormatRate(g.rate), off);
-    speedButton.label = true;
     Controls controls{
         seek,
         along(now),
@@ -404,7 +404,8 @@ bool DrawControls() {
         off ? L"" : FormatTime(now) + (std::isfinite(duration) ? L" / " + FormatTime(duration) : L""),
         g.title,
         {button(kPlay, g.playing ? L"\xE769" : L"\xF5B0", off), button(kBack, step, off, -1),
-         button(kForward, step, off, 1), button(kVolume, VolumeGlyph(), false), speedButton,
+         button(kForward, step, off, 1), button(kVolume, VolumeGlyph(), false),
+         button(kSpeed, kSpeedGlyph, off),
          button(kSubtitles, L"\xE7F0", off || !HasTrackChoice()),
          button(kFullscreen, g.fullscreen ? L"\xE73F" : L"\xE740", off && !g.fullscreen)}};
     g.controls->SetOffsetY(float(top));
@@ -1364,17 +1365,21 @@ void DragSeekToX(int x) {
     UpdateControlsAtFrame();
 }
 
-void SetRate(double rate) {
+// Sets the playback speed, within its range, popping up the new one; held (a key held down or the slider dragged)
+// keeps the icon up rather than popping it again.
+void SetRate(double rate, bool held) {
+    rate = std::clamp(rate, kMinRate, kMaxRate);
     if (rate == g.rate) return;
     SetPlaybackRate(g.rate = rate);
     UpdateControlsAtFrame();
+    ShowFlash(kSpeedGlyph, false, held, FormatRate(rate));
 }
 
 // Sets the playback speed under x on the speed slider, to the nearest of its stops.
 void SetSpeedToX(int x) {
     const RECT r = SliderTrack(kSpeedBar);
     const double at = std::clamp(double(x - r.left) / std::max(1L, r.right - r.left), 0.0, 1.0);
-    SetRate(kMinRate + std::round(at * (kMaxRate - kMinRate) / kRateStep) * kRateStep);
+    SetRate(kMinRate + std::round(at * (kMaxRate - kMinRate) / kRateStep) * kRateStep, true);
 }
 
 // Sets the volume under x on the volume slider.
@@ -1422,7 +1427,7 @@ void Press(Control c) {
         if (c == kPlay) {
             TogglePlay();
         } else if (c == kSpeed) {
-            SetRate(1);  // the slider sets the others
+            SetRate(1, false);  // the slider sets the others
         } else if (c == kSubtitles) {
             if (HasTrackChoice()) SetPanelOpen(!g.panelOpen);
         } else {
@@ -1538,9 +1543,14 @@ void OnKey(WPARAM key, bool repeat) {
         case VK_DOWN:
             StepVolume(key == VK_UP, repeat);
             break;
-        case VK_OEM_COMMA:
+        case VK_OEM_COMMA:  // with Shift, YouTube's < and > for the speed
         case VK_OEM_PERIOD:
-            if (video) StepFrame(key == VK_OEM_PERIOD);
+            if (!video) break;
+            if (GetKeyState(VK_SHIFT) < 0) {
+                SetRate(g.rate + (key == VK_OEM_PERIOD ? kRateStep : -kRateStep), repeat);
+            } else {
+                StepFrame(key == VK_OEM_PERIOD);
+            }
             break;
         case 'M':
             if (!repeat) ToggleMuted(true);

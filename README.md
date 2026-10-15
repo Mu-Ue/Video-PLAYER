@@ -39,6 +39,7 @@ The player remembers the volume and where you left each video.
 | `Ctrl+←` / `Ctrl+→`          | Back / forward 60 s     |
 | `Home` / `End`               | Start / end             |
 | `,` / `.`                    | Previous / next frame   |
+| `Shift+,` / `Shift+.`        | Speed down / up         |
 | `↑` / `↓` / scroll           | Volume up / down        |
 | `M`                          | Mute                    |
 | `S`                          | Subtitles on / off      |
