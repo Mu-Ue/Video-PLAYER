@@ -120,6 +120,7 @@ struct Window {
     SIZE drawnSize{};
     float drawnScale = 0;
     Control drag = kNone;  // kSeek or kVolumeBar while dragging along it
+    double dragSeconds = 0;  // the time under the mouse while dragging the seek bar; it seeks there on release
     bool controlsChanged = false;  // by a drag; a WM_APP_FRAME redraws them
     // The engine's state, kept here so drawing never waits on the engine. playing changes as soon as it is
     // asked to, then follows the engine's events.
@@ -339,7 +340,7 @@ const wchar_t* VolumeGlyph() {
 }
 
 // Where the video is, or will be once the seeks in flight are done.
-double ShownTime() { return g.seekBusy || g.drag == kSeek ? g.seekTarget : PlaybackTime(); }
+double ShownTime() { return g.seekBusy ? g.seekTarget : PlaybackTime(); }
 
 // Redraws the controls, unless they would look the same, and returns whether it did.
 bool DrawControls() {
@@ -356,7 +357,7 @@ bool DrawControls() {
     const auto button = [&](Control c, std::wstring text, bool dim, int replay = 0) {
         return BarItem{rect(c), std::move(text), replay, g.hot == c && !dim, dim, c == kFullscreen};
     };
-    const double now = ShownTime(), duration = g.duration;
+    const double now = g.drag == kSeek ? g.dragSeconds : ShownTime(), duration = g.duration;
     const std::wstring step = std::to_wstring(std::lround(kSeekStep));
     // Progress to the nearest pixel of the track, so it only changes when the drawing would.
     const RECT seek = rect(kSeek);
@@ -1271,13 +1272,24 @@ void ToggleSubtitles() {
     ShowFlash(L"\xE7F0", g.subtitle < 0);
 }
 
-// Seeks to the time under x on the seek bar.
-void SeekToX(int x, bool fast) {
+// The time under x on the seek bar.
+double SecondsAtX(int x) {
     const RECT r = ControlRect(kSeek);
-    const double duration = g.duration;
-    if (!(duration > 0)) return;
+    return std::clamp(double(x - r.left) / std::max(1L, r.right - r.left), 0.0, 1.0) * g.duration;
+}
+
+// Seeks to the exact frame under x on the seek bar.
+void SeekToX(int x) {
+    if (!(g.duration > 0)) return;
     g.seekCheck = false;
-    RequestSeek(std::clamp(double(x - r.left) / std::max(1L, r.right - r.left), 0.0, 1.0) * duration, fast);
+    RequestSeek(SecondsAtX(x), false);
+    UpdateControlsAtFrame();
+}
+
+// Moves the seek bar under the mouse while dragging it, leaving the video playing where it is.
+void DragSeekToX(int x) {
+    if (!(g.duration > 0)) return;
+    g.dragSeconds = SecondsAtX(x);
     UpdateControlsAtFrame();
 }
 
@@ -1551,7 +1563,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (c == kSeek && HasVideo()) {
                 g.drag = kSeek;
                 SetCapture(hwnd);
-                SeekToX(pt.x, true);
+                DragSeekToX(pt.x);
             } else if (c == kVolumeBar) {
                 g.drag = kVolumeBar;
                 SetCapture(hwnd);
@@ -1574,14 +1586,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g.drag) {
                 const Control drag = g.drag;
                 g.drag = kNone;
-                if (drag == kSeek) SeekToX(GET_X_LPARAM(lp), false);  // lands on the exact frame
+                if (drag == kSeek) SeekToX(GET_X_LPARAM(lp));
                 ReleaseCapture();
                 SetHot(HitTest({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}));  // closes the volume slider if left
                 UpdatePreview({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
             }
             return 0;
-        case WM_CAPTURECHANGED:
-            g.drag = kNone;
+        case WM_CAPTURECHANGED:  // a drag ended without a release seeks nowhere
+            if (std::exchange(g.drag, kNone) == kSeek) UpdateControls();
             return 0;
         case WM_MOUSEMOVE:
             if (lp != g.lastMouse) Wake();  // not the move SetCursorPos fakes
@@ -1591,7 +1603,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g.tracking = TrackMouseEvent(&tme);
             }
             if (g.drag == kSeek) {
-                SeekToX(GET_X_LPARAM(lp), true);
+                DragSeekToX(GET_X_LPARAM(lp));
             } else if (g.drag == kVolumeBar) {
                 SetVolumeToX(GET_X_LPARAM(lp));
             } else {
