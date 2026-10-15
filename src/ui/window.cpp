@@ -1283,6 +1283,14 @@ void Seek(double seconds) {
     ShowOsd(FormatTime(target) + L" / " + FormatTime(g.duration));
 }
 
+// Seeks exactly to a time, for the start and the end.
+void JumpTo(double seconds) {
+    g.seekCheck = false;
+    const double target = RequestSeek(seconds, false);
+    if (g.controlsShown) DrawControls();  // committed with the OSD
+    ShowOsd(FormatTime(target) + L" / " + FormatTime(g.duration));
+}
+
 // Plays or pauses, showing it at once rather than when the engine reports it.
 void TogglePlay() {
     g.playing = !g.playing;
@@ -1503,12 +1511,22 @@ void StepVolume(bool up, bool held) {
 }
 
 void OnKey(WPARAM key, bool repeat) {
+    const bool video = HasVideo();
     if (GetKeyState(VK_CONTROL) < 0) {
-        if (key == 'O' && !repeat) Open();
+        if (key == 'O' && !repeat) {
+            Open();
+        } else if ((key == VK_LEFT || key == VK_RIGHT) && video) {
+            Seek(key == VK_LEFT ? -kLongSeekStep : kLongSeekStep);
+        }
         return;
     }
-    const bool video = HasVideo();
     switch (key) {
+        case VK_HOME:
+            if (!repeat && video) JumpTo(0);
+            break;
+        case VK_END:  // which ends it
+            if (!repeat && video && std::isfinite(g.duration)) JumpTo(g.duration);
+            break;
         case VK_SPACE:
             if (!repeat && video) TogglePlay();
             break;
