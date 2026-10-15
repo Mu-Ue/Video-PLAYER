@@ -21,6 +21,8 @@ constexpr UINT WM_APP_SUBTITLE_CUE = WM_APP + 3;
 constexpr UINT WM_APP_FRAME = WM_APP + 4;
 // Posted when a seek bar preview picture DecodePreview asked for is ready for TakePreviewPicture.
 constexpr UINT WM_APP_PREVIEW = WM_APP + 5;
+// Posted once the video's audio tracks are known, after it opens.
+constexpr UINT WM_APP_AUDIO_TRACKS = WM_APP + 8;
 
 // Starts what opening the first video, if not empty, needs that can be done before InitPlayer, on threads of its
 // own. Call once, first.
@@ -49,7 +51,7 @@ struct Track {
     DWORD id;               // of a subtitle track
     bool selected;          // the audio track playing
 };
-// The video's audio tracks, once its metadata has loaded.
+// The video's audio tracks, once WM_APP_AUDIO_TRACKS tells they are known.
 std::vector<Track> AudioTracks();
 // Plays the audio track at index in AudioTracks() instead of the others.
 void SelectAudioTrack(size_t index);

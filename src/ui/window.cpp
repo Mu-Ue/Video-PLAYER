@@ -1436,17 +1436,23 @@ void Press(Control c) {
     }
 }
 
+// The video's audio tracks are known: the panel lists them with 2 or more.
+void OnAudioTracks() {
+    g.audio.clear();
+    g.audioTrack = -1;
+    for (const Track& t : AudioTracks()) {
+        if (t.selected && g.audioTrack < 0) g.audioTrack = int(g.audio.size());
+        g.audio.push_back(TrackLabel(t));
+    }
+    UpdateControls();
+    RefreshPanel();
+}
+
 void OnMediaEvent(WPARAM event, LPARAM param) {
     switch (event) {
         case MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA:
             g.attached = false;  // a new source may bring a new swap chain
             g.duration = Duration();
-            g.audio.clear();
-            g.audioTrack = -1;
-            for (const Track& t : AudioTracks()) {
-                if (t.selected && g.audioTrack < 0) g.audioTrack = int(g.audio.size());
-                g.audio.push_back(TrackLabel(t));
-            }
             if (!g.sized && HasVideo()) {
                 PlaceWindow();
                 g.sized = true;
@@ -1632,6 +1638,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_APP_PREVIEW:
             OnPreviewPicture();
+            return 0;
+        case WM_APP_AUDIO_TRACKS:
+            OnAudioTracks();
             return 0;
         case WM_PAINT:  // everything is drawn by DirectComposition
             ValidateRect(hwnd, nullptr);

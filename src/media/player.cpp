@@ -22,6 +22,7 @@
 #include <utility>
 
 #include "config.h"
+#include "media/audio.h"
 #include "media/mkv.h"
 #include "media/source.h"
 #include "media/subtitles.h"
@@ -51,6 +52,7 @@ class Notify final : public IMFMediaEngineNotify {
     STDMETHODIMP EventNotify(DWORD event, DWORD_PTR param1, DWORD) override {
         PostMessageW(hwnd, WM_APP_MEDIA, event, LPARAM(param1));
         if (wake) SetEvent(wake);
+        WakeAudio();
         return S_OK;
     }
 };
@@ -117,7 +119,6 @@ struct {
     ComPtr<IMFDXGIDeviceManager> manager;
     ComPtr<IMFMediaEngineEx> engine;
     ComPtr<IMFTimedText> timedText;  // null if unsupported
-    std::vector<DWORD> audioStreams;  // the engine's stream index of each audio track
     // The seek bar preview: a thread that decodes just the key frame the window wants. The window hands it a file
     // to open or a key frame to decode under previewLock, then sets previewWake; it hands back the picture, and the
     // pictures' size, there.
@@ -195,7 +196,6 @@ HRESULT CreateEngine(IMFMediaEngineNotify* notify, ComPtr<IMFMediaEngineEx>& out
     if (SUCCEEDED(hr)) hr = attributes->SetUnknown(MF_MEDIA_ENGINE_CALLBACK, notify);
     if (SUCCEEDED(hr)) hr = attributes->SetUnknown(MF_MEDIA_ENGINE_DXGI_MANAGER, g.manager.Get());
     if (SUCCEEDED(hr)) hr = attributes->SetUINT32(MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM);
-    if (SUCCEEDED(hr)) hr = attributes->SetUINT32(MF_MEDIA_ENGINE_AUDIO_CATEGORY, AudioCategory_Movie);
     if (SUCCEEDED(hr)) hr = attributes->SetUnknown(MF_MEDIA_ENGINE_EXTENSION, SourceExtension());
     ComPtr<IMFMediaEngineClassFactory> factory;
     if (SUCCEEDED(hr)) {
@@ -612,15 +612,17 @@ std::wstring Take(LPWSTR text) {
     return s;
 }
 
-std::wstring StreamString(DWORD stream, REFGUID key) {
-    PROPVARIANT value;
-    PropVariantInit(&value);
-    std::wstring s;
-    if (SUCCEEDED(g.engine->GetStreamAttribute(stream, key, &value)) && value.vt == VT_LPWSTR && value.pwszVal) {
-        s = value.pwszVal;
-    }
-    PropVariantClear(&value);
-    return s;
+// The sound's clock: where the picture is, and whether it moves on.
+bool PictureTime(double& seconds, LONGLONG& qpc) {
+    IMFMediaEngineEx* engine = g.engine.Get();
+    const bool moving = !engine->IsPaused() && !engine->IsSeeking() && !engine->IsEnded() &&
+                        engine->GetReadyState() >= MF_MEDIA_ENGINE_READY_HAVE_FUTURE_DATA;
+    LARGE_INTEGER now, frequency;
+    seconds = engine->GetCurrentTime();
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&frequency);
+    qpc = MFllMulDiv(now.QuadPart, 10000000, frequency.QuadPart, 0);
+    return moving;
 }
 
 // Where the key frames are, from a list of their times, for a file whose parser doesn't say.
@@ -882,8 +884,8 @@ bool InitPlayer(HWND hwnd) {
     if (FAILED(CreateDevice())) return false;
     g.started = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
     if (!g.started || FAILED(CreateEngines())) return false;
-    g.engine->SetVolume(g.volume);
-    g.engine->SetMuted(g.muted);
+    StartAudio(PictureTime, hwnd, WM_APP_AUDIO_TRACKS);
+    SetAudioVolume(g.volume, g.muted);
     g.stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g.previewWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g.renderWake = g.notify.wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -902,6 +904,7 @@ void ShutdownPlayer() {
     if (g.stop) SetEvent(g.stop);
     if (g.renderer.joinable()) g.renderer.join();
     if (g.previewer.joinable()) g.previewer.join();
+    StopAudio();  // before the engine, its clock
     g.previewFence.Reset();
     g.chain2.Reset();
     g.chain.Reset();
@@ -933,6 +936,7 @@ HRESULT OpenVideo(const std::wstring& path) {
     Redraw();  // the first frame, even if it never plays
     if (SUCCEEDED(hr)) hr = g.engine->Play();
     if (FAILED(hr)) return hr;
+    OpenAudio(path);
     // The last file's key frames and previews are done with; OpenSeekHelpers has the previewer open this one.
     g.keyFrames.Reset();
     AcquireSRWLockExclusive(&g.previewLock);
@@ -1003,31 +1007,9 @@ SIZE PreviewSize() {
 
 bool HasVideo() { return g.engine && g.engine->HasVideo(); }
 
-std::vector<Track> AudioTracks() {
-    std::vector<Track> tracks;
-    g.audioStreams.clear();
-    DWORD count = 0;
-    if (!g.engine || FAILED(g.engine->GetNumberOfStreams(&count))) return tracks;
-    for (DWORD i = 0; i < count; ++i) {
-        PROPVARIANT type;
-        PropVariantInit(&type);
-        const bool audio = SUCCEEDED(g.engine->GetStreamAttribute(i, MF_MT_MAJOR_TYPE, &type)) &&
-                           type.vt == VT_CLSID && type.puuid && *type.puuid == MFMediaType_Audio;
-        PropVariantClear(&type);
-        if (!audio) continue;
-        BOOL selected = FALSE;
-        g.engine->GetStreamSelection(i, &selected);
-        tracks.push_back({StreamString(i, MF_SD_LANGUAGE), StreamString(i, MF_SD_STREAM_NAME), 0, selected != FALSE});
-        g.audioStreams.push_back(i);
-    }
-    return tracks;
-}
+std::vector<Track> AudioTracks() { return AudioTrackList(); }
 
-void SelectAudioTrack(size_t index) {
-    if (index >= g.audioStreams.size()) return;
-    for (size_t k = 0; k < g.audioStreams.size(); ++k) g.engine->SetStreamSelection(g.audioStreams[k], k == index);
-    g.engine->ApplyStreamSelections();
-}
+void SelectAudioTrack(size_t index) { SelectAudio(index); }
 
 std::vector<Track> SubtitleTracks() {
     std::vector<Track> tracks;
@@ -1146,6 +1128,7 @@ double FrameGap() {
 void SetPlaybackRate(double rate) {
     g.rate = rate;
     if (g.engine) g.engine->SetPlaybackRate(rate);
+    SetAudioRate(rate);
 }
 
 double Volume() { return g.volume; }
@@ -1156,21 +1139,21 @@ namespace {
 
 void SetMuted(bool muted) {
     g.muted = muted;
-    if (g.engine) g.engine->SetMuted(muted);
+    SetAudioVolume(g.volume, g.muted);
 }
 
 }  // namespace
 
 double ChangeVolume(double delta) {
     g.volume = std::clamp(std::round((g.volume + delta) * 100) / 100, 0.0, 1.0);
-    if (g.engine) g.engine->SetVolume(g.volume);
+    SetAudioVolume(g.volume, g.muted);
     if (delta > 0) SetMuted(false);
     return g.volume;
 }
 
 double SetVolume(double volume) {
     g.volume = std::clamp(std::round(volume * 100) / 100, 0.0, 1.0);
-    if (g.engine) g.engine->SetVolume(g.volume);
+    SetAudioVolume(g.volume, g.muted);
     if (g.volume > 0) SetMuted(false);
     return g.volume;
 }
