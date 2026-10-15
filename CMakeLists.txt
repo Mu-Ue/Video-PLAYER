@@ -32,7 +32,7 @@ set(CMAKE_CXX_STANDARD_LIBRARIES "")
 target_link_libraries(VideoPLAYER PRIVATE delayimp kernel32 user32 gdi32 imm32 dwmapi advapi32 shell32 comdlg32
                       oleaut32 uuid mfplat mfreadwrite mfuuid avrt d3d11 dxgi dcomp d2d1 dwrite dxguid onecore_apiset)
 # The file picker and dropped files load their DLLs on first use, text drawing once the window lays out, and the
-# readers of the sound and the seek bar previews once a video opens.
+# reader of the seek bar previews once a video opens.
 target_link_options(VideoPLAYER PRIVATE /DELAYLOAD:comdlg32.dll /DELAYLOAD:shell32.dll /DELAYLOAD:d2d1.dll
                     /DELAYLOAD:dwrite.dll /DELAYLOAD:advapi32.dll /DELAYLOAD:mfreadwrite.dll)
 # Control-flow guard, shadow stack with checked exception continuations, and DLL imports from System32 only

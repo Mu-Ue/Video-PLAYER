@@ -5,7 +5,9 @@
 #include <mfmediaengine.h>
 
 // A media engine extension that hands the engine Media Foundation's own source for each file, with its samples'
-// times fixed so the picture and the sound play in sync, and without its sound, which the player plays itself:
+// times fixed so the picture and the sound play in sync. The engine doesn't see the sound: the source reads one
+// audio track for the player, which plays it itself.
+// The times fixed:
 // - Tracks that start later than their first samples: B-frame video, whose MPEG-4 edit list starts it later, and
 //   audio with an encoder delay (AAC's priming), which the MPEG-4 edit list or the Matroska CodecDelay skip. Media
 //   Foundation ignores both.
@@ -18,5 +20,3 @@ LONGLONG LandedFrameTime(LONGLONG time);
 // Starts making the first file's source on a thread of its own, so its opening doesn't wait on that. path may be
 // null for none; it is opened as a local file. Call once, before the first file.
 void PrepareSourceExtension(const wchar_t* path);
-// A source of a local file's sound, with its times fixed the same way, for playing it apart from the engine.
-HRESULT CreateAudioSource(const wchar_t* path, IMFMediaSource** source);

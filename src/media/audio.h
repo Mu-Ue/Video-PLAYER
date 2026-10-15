@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+struct IMFMediaStream;
 struct Track;
 
 // Plays a video's sound apart from the media engine, which plays just the picture: the engine restarts its sound,
@@ -21,10 +22,19 @@ void StartAudio(AudioClock clock, HWND hwnd, UINT tracks);
 void StopAudio();
 // Wakes the player to look at the clock again, after the engine's state changes.
 void WakeAudio();
-// Plays the sound of a local file from the clock, or none for an empty path.
+// Plays the sound of the local file at path from the clock once its source hands it over, or none for an empty path.
 void OpenAudio(const std::wstring& path);
 // The file's audio tracks, once known; one is selected.
 std::vector<Track> AudioTrackList();
 void SelectAudio(size_t index);
 void SetAudioRate(double rate);
 void SetAudioVolume(double volume, bool muted);
+
+// For the engine's source, which reads the sound along with the picture:
+// Tells the audio tracks of the file at url, as its source is made; returns the id of its sound, 0 if it isn't the
+// file asked for.
+UINT SetAudioTracks(const wchar_t* url, std::vector<Track> tracks);
+// The index of the audio track the source with the sound is to read: the one selected, or -1 for none.
+int AudioTrackToRead(UINT sound);
+// Hands over the stream of the track read, each time the source starts it.
+void SetAudioStream(UINT sound, IMFMediaStream* stream);

@@ -931,12 +931,12 @@ HRESULT OpenVideo(const std::wstring& path) {
     BSTR name = SysAllocString(path.c_str());  // the extension helps pick the container parser
     if (!name) return E_OUTOFMEMORY;
     g.opened = true;
+    OpenAudio(path);  // first, as the source hands it the sound
     hr = g.engine->SetSourceFromByteStream(stream.Get(), name);
     SysFreeString(name);
     Redraw();  // the first frame, even if it never plays
     if (SUCCEEDED(hr)) hr = g.engine->Play();
     if (FAILED(hr)) return hr;
-    OpenAudio(path);
     // The last file's key frames and previews are done with; OpenSeekHelpers has the previewer open this one.
     g.keyFrames.Reset();
     AcquireSRWLockExclusive(&g.previewLock);

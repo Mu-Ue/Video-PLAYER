@@ -13,7 +13,9 @@
 #include <utility>
 #include <vector>
 
+#include "media/audio.h"
 #include "media/mkv.h"
+#include "media/player.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -192,8 +194,8 @@ Shifts ReadMp4Shifts(IMFByteStream* s) {
     return shifts;
 }
 
-// Passes on the events of an inner object through a queue of its own, after Adjust has had a look at each. The
-// inner object holds it while it waits for an event, until it shuts down.
+// Passes on the events of an inner object through a queue of its own, after Adjust has had a look at each, which
+// may keep one back. The inner object holds it while it waits for an event, until it shuts down.
 template <class I>
 class Relay : public I, public IMFAsyncCallback {
   public:
@@ -228,8 +230,7 @@ class Relay : public I, public IMFAsyncCallback {
     STDMETHODIMP Invoke(IMFAsyncResult* result) override {
         ComPtr<IMFMediaEvent> event;
         if (FAILED(from_->EndGetEvent(result, &event))) return S_OK;  // shut down
-        Adjust(event);
-        queue_->QueueEvent(event.Get());
+        if (Adjust(event)) queue_->QueueEvent(event.Get());
         from_->BeginGetEvent(this, nullptr);
         return S_OK;
     }
@@ -244,7 +245,7 @@ class Relay : public I, public IMFAsyncCallback {
         return hr;
     }
     virtual void* Find(REFIID riid) = 0;  // another interface, not yet referenced; null if none
-    virtual void Adjust(ComPtr<IMFMediaEvent>& event) = 0;
+    virtual bool Adjust(ComPtr<IMFMediaEvent>& event) = 0;  // false to keep it back
 
     ComPtr<IMFMediaEventQueue> queue_;
 
@@ -316,9 +317,11 @@ class ShiftedStream final : public Relay<IMFMediaStream> {
     void* Find(REFIID riid) override {
         return riid == __uuidof(IMFMediaStream) ? static_cast<IMFMediaStream*>(this) : nullptr;
     }
-    void Adjust(ComPtr<IMFMediaEvent>& event) override {
+    bool Adjust(ComPtr<IMFMediaEvent>& event) override {
         MediaEventType type;
-        if ((!shift_ && !video_ && !pcm_.blockAlign) || FAILED(event->GetType(&type)) || type != MEMediaSample) return;
+        if ((!shift_ && !video_ && !pcm_.blockAlign) || FAILED(event->GetType(&type)) || type != MEMediaSample) {
+            return true;
+        }
         PROPVARIANT value;
         PropVariantInit(&value);
         ComPtr<IMFSample> sample;
@@ -337,6 +340,7 @@ class ShiftedStream final : public Relay<IMFMediaStream> {
             if (pcm_.blockAlign) Cut(sample.Get(), time - shift_);
         }
         PropVariantClear(&value);
+        return true;
     }
 
     // Cuts off the frames of an uncompressed audio sample at `time` that come before playback starts.
@@ -396,34 +400,48 @@ Pcm PcmFormat(IMFStreamDescriptor* descriptor) {
     return pcm.blockAlign && pcm.rate ? pcm : Pcm{};
 }
 
-// Media Foundation's own source for the file, with the tracks' samples moved earlier. The engine's hides the sound,
-// which the player plays apart from it from a source of its own.
+std::wstring Take(LPWSTR text) {
+    std::wstring s = text ? text : L"";
+    CoTaskMemFree(text);
+    return s;
+}
+
+// Media Foundation's own source for the file, with the tracks' samples moved earlier. The engine doesn't see the
+// sound: one audio track is read along with the picture, but its stream goes to the player, which plays it apart.
 class ShiftedSource final : public Relay<IMFMediaSourceEx>, public IMFGetService {
   public:
-    ShiftedSource(IMFMediaSource* inner, const Shifts& shifts, bool engine)
-        : inner_(inner), video_(shifts.video), engine_(engine) {
+    ShiftedSource(IMFMediaSource* inner, const Shifts& shifts, const wchar_t* url)
+        : inner_(inner), video_(shifts.video) {
         inner->QueryInterface(IID_PPV_ARGS(&ex_));
-        // The stream ids aren't the file's track ids, but the audio streams come in the file's order. If their
-        // number doesn't match, which one is which isn't known, and none is moved.
         ComPtr<IMFPresentationDescriptor> presentation;
         DWORD count = 0;
-        if (FAILED(inner->CreatePresentationDescriptor(&presentation)) ||
-            FAILED(presentation->GetStreamDescriptorCount(&count))) {
-            return;
+        if (SUCCEEDED(inner->CreatePresentationDescriptor(&presentation))) {
+            presentation->GetStreamDescriptorCount(&count);
         }
+        std::vector<Track> tracks;
+        size_t chosen = SIZE_MAX;
         for (DWORD i = 0; i < count; ++i) {
             BOOL selected;
             ComPtr<IMFStreamDescriptor> descriptor;
             DWORD id;
             if (FAILED(presentation->GetStreamDescriptorByIndex(i, &selected, &descriptor)) ||
-                FAILED(descriptor->GetStreamIdentifier(&id)) ||
-                (MajorType(descriptor.Get()) == MFMediaType_Audio && audio_.size() == shifts.audio.size())) {
-                audio_.clear();
-                return;
+                FAILED(descriptor->GetStreamIdentifier(&id)) || MajorType(descriptor.Get()) != MFMediaType_Audio) {
+                continue;
             }
-            if (MajorType(descriptor.Get()) == MFMediaType_Audio) audio_.push_back({id, shifts.audio[audio_.size()]});
+            LPWSTR language = nullptr, name = nullptr;
+            descriptor->GetAllocatedString(MF_SD_LANGUAGE, &language, nullptr);
+            descriptor->GetAllocatedString(MF_SD_STREAM_NAME, &name, nullptr);
+            if (selected && chosen == SIZE_MAX) chosen = tracks.size();
+            tracks.push_back({Take(language), Take(name), 0, false});
+            audioIds_.push_back(id);
         }
-        if (audio_.size() != shifts.audio.size()) audio_.clear();
+        // The stream ids aren't the file's track ids, but the audio streams come in the file's order. If their
+        // number doesn't match, which one is which isn't known, and none is moved.
+        if (audioIds_.size() == shifts.audio.size()) {
+            for (size_t k = 0; k < audioIds_.size(); ++k) audio_.push_back({audioIds_[k], shifts.audio[k]});
+        }
+        if (!tracks.empty()) tracks[chosen == SIZE_MAX ? 0 : chosen].selected = true;
+        sound_ = SetAudioTracks(url, std::move(tracks));
     }
     HRESULT Start() { return Listen(inner_.Get()); }
 
@@ -436,25 +454,20 @@ class ShiftedSource final : public Relay<IMFMediaSourceEx>, public IMFGetService
     }
     STDMETHODIMP CreatePresentationDescriptor(IMFPresentationDescriptor** descriptor) override {
         HRESULT hr = inner_->CreatePresentationDescriptor(descriptor);
-        DWORD count = 0;
-        if (SUCCEEDED(hr) && engine_ && SUCCEEDED((*descriptor)->GetStreamDescriptorCount(&count))) {
-            for (DWORD i = 0; i < count; ++i) {
-                BOOL selected;
-                ComPtr<IMFStreamDescriptor> stream;
-                if (SUCCEEDED((*descriptor)->GetStreamDescriptorByIndex(i, &selected, &stream)) &&
-                    MajorType(stream.Get()) == MFMediaType_Audio) {
-                    (*descriptor)->DeselectStream(i);
-                }
-            }
-        }
+        if (SUCCEEDED(hr)) ChooseAudio(*descriptor, -1);
         return hr;
     }
+    // Starts the engine's streams and the audio track the player asks for, which it changes on a seek, not on
+    // resuming.
     STDMETHODIMP Start(IMFPresentationDescriptor* descriptor, const GUID* format, const PROPVARIANT* at) override {
         if (at && at->vt == VT_I8) {  // else it resumes where it was
             start_ = at->hVal.QuadPart;
-            if (engine_) recentFrames.Clear();
+            recentFrames.Clear();
+            track_ = AudioTrackToRead(sound_);
         }
-        return inner_->Start(descriptor, format, at);
+        ComPtr<IMFPresentationDescriptor> started;
+        if (descriptor && SUCCEEDED(descriptor->Clone(&started))) ChooseAudio(started.Get(), track_);
+        return inner_->Start(started ? started.Get() : descriptor, format, at);
     }
     STDMETHODIMP Stop() override { return inner_->Stop(); }
     STDMETHODIMP Pause() override { return inner_->Pause(); }
@@ -491,16 +504,44 @@ class ShiftedSource final : public Relay<IMFMediaSourceEx>, public IMFGetService
         if (riid == __uuidof(IMFGetService)) return static_cast<IMFGetService*>(this);
         return nullptr;
     }
-    // Hands the engine its own stream for each of the inner source's, the same one each time.
-    void Adjust(ComPtr<IMFMediaEvent>& event) override {
+    // Selects the audio stream of the track at index in a presentation descriptor, and no other; none if -1.
+    void ChooseAudio(IMFPresentationDescriptor* descriptor, int index) const {
+        DWORD count = 0;
+        descriptor->GetStreamDescriptorCount(&count);
+        for (DWORD i = 0; i < count; ++i) {
+            BOOL selected;
+            ComPtr<IMFStreamDescriptor> stream;
+            DWORD id;
+            if (FAILED(descriptor->GetStreamDescriptorByIndex(i, &selected, &stream)) ||
+                MajorType(stream.Get()) != MFMediaType_Audio) {
+                continue;
+            }
+            const bool chosen = index >= 0 && size_t(index) < audioIds_.size() &&
+                                SUCCEEDED(stream->GetStreamIdentifier(&id)) && id == audioIds_[size_t(index)];
+            if (chosen) {
+                descriptor->SelectStream(i);
+            } else {
+                descriptor->DeselectStream(i);
+            }
+        }
+    }
+    // Hands the engine its own stream for each of the inner source's, the same one each time, and the player the
+    // audio stream instead.
+    bool Adjust(ComPtr<IMFMediaEvent>& event) override {
         MediaEventType type;
-        if (FAILED(event->GetType(&type)) || (type != MENewStream && type != MEUpdatedStream)) return;
+        if (FAILED(event->GetType(&type)) || (type != MENewStream && type != MEUpdatedStream)) return true;
         PROPVARIANT value;
         PropVariantInit(&value);
         ComPtr<IMFMediaStream> inner;
         if (SUCCEEDED(event->GetValue(&value)) && value.vt == VT_UNKNOWN && value.punkVal &&
             SUCCEEDED(value.punkVal->QueryInterface(IID_PPV_ARGS(&inner)))) {
-            ComPtr<ShiftedStream> stream = Wrap(inner.Get());
+            bool audio = false;
+            ComPtr<ShiftedStream> stream = Wrap(inner.Get(), audio);
+            if (audio) {
+                if (stream) SetAudioStream(sound_, stream.Get());
+                PropVariantClear(&value);
+                return false;
+            }
             GUID extended = GUID_NULL;
             HRESULT status = S_OK;
             event->GetExtendedType(&extended);
@@ -515,8 +556,16 @@ class ShiftedSource final : public Relay<IMFMediaSourceEx>, public IMFGetService
             }
         }
         PropVariantClear(&value);
+        return true;
     }
-    ComPtr<ShiftedStream> Wrap(IMFMediaStream* inner) {
+    ComPtr<ShiftedStream> Wrap(IMFMediaStream* inner, bool& audio) {
+        ComPtr<IMFStreamDescriptor> descriptor;
+        GUID major = GUID_NULL;
+        DWORD id = 0;
+        if (SUCCEEDED(inner->GetStreamDescriptor(&descriptor)) && SUCCEEDED(descriptor->GetStreamIdentifier(&id))) {
+            major = MajorType(descriptor.Get());
+        }
+        audio = major == MFMediaType_Audio;
         AcquireSRWLockExclusive(&lock_);
         ComPtr<ShiftedStream> stream;
         for (const auto& s : streams_) {
@@ -524,20 +573,13 @@ class ShiftedSource final : public Relay<IMFMediaSourceEx>, public IMFGetService
         }
         if (!stream && !shut_) {
             // The file has only the one video track.
-            ComPtr<IMFStreamDescriptor> descriptor;
-            GUID major = GUID_NULL;
-            DWORD id = 0;
-            Pcm pcm;
-            if (SUCCEEDED(inner->GetStreamDescriptor(&descriptor)) && SUCCEEDED(descriptor->GetStreamIdentifier(&id))) {
-                major = MajorType(descriptor.Get());
-                if (major == MFMediaType_Audio) pcm = PcmFormat(descriptor.Get());
-            }
+            const Pcm pcm = audio ? PcmFormat(descriptor.Get()) : Pcm{};
             const bool video = major == MFMediaType_Video;
             LONGLONG shift = video ? video_ : 0;
             for (const auto& [audioId, audioShift] : audio_) {
-                if (major == MFMediaType_Audio && audioId == id) shift += audioShift;
+                if (audio && audioId == id) shift += audioShift;
             }
-            stream.Attach(new (std::nothrow) ShiftedStream(this, inner, shift, video && engine_, pcm, start_));
+            stream.Attach(new (std::nothrow) ShiftedStream(this, inner, shift, video, pcm, start_));
             if (stream && SUCCEEDED(stream->Start())) {
                 streams_.push_back(stream);
             } else {
@@ -551,8 +593,10 @@ class ShiftedSource final : public Relay<IMFMediaSourceEx>, public IMFGetService
     const ComPtr<IMFMediaSource> inner_;
     ComPtr<IMFMediaSourceEx> ex_;  // null if the inner source has none, and then not asked for
     const LONGLONG video_;
-    const bool engine_;
+    std::vector<DWORD> audioIds_;                    // each audio track's stream id
     std::vector<std::pair<DWORD, LONGLONG>> audio_;  // each audio stream's id and own shift
+    UINT sound_ = 0;                                 // the player's id for this source's sound
+    int track_ = -1;                                 // the audio track read, or -1
     std::atomic<LONGLONG> start_ = 0;               // where playback last started
     SRWLOCK lock_ = SRWLOCK_INIT;
     std::vector<ComPtr<ShiftedStream>> streams_;
@@ -576,10 +620,11 @@ Shifts ReadShifts(const wchar_t* url, IMFByteStream* stream) {
 
 // Wraps the source made for the engine and hands it over through the engine's callback; on failure, hands over
 // the failure.
-void HandOver(HRESULT hr, IMFMediaSource* inner, const Shifts& shifts, IMFAsyncCallback* callback, IUnknown* state) {
+void HandOver(HRESULT hr, IMFMediaSource* inner, const Shifts& shifts, const std::wstring& url,
+              IMFAsyncCallback* callback, IUnknown* state) {
     ComPtr<ShiftedSource> source;
     if (SUCCEEDED(hr)) {
-        source.Attach(new (std::nothrow) ShiftedSource(inner, shifts, true));
+        source.Attach(new (std::nothrow) ShiftedSource(inner, shifts, url.c_str()));
         hr = source ? source->Start() : E_OUTOFMEMORY;
         if (FAILED(hr)) source.Reset();
     }
@@ -594,8 +639,9 @@ void HandOver(HRESULT hr, IMFMediaSource* inner, const Shifts& shifts, IMFAsyncC
 // Waits for the resolver to make a source off the engine's thread, then hands it over.
 class Creation final : public IMFAsyncCallback {
   public:
-    Creation(IMFSourceResolver* resolver, const Shifts& shifts, IMFAsyncCallback* callback, IUnknown* state)
-        : resolver_(resolver), shifts_(shifts), callback_(callback), state_(state) {}
+    Creation(IMFSourceResolver* resolver, const Shifts& shifts, const wchar_t* url, IMFAsyncCallback* callback,
+             IUnknown* state)
+        : resolver_(resolver), shifts_(shifts), url_(url), callback_(callback), state_(state) {}
 
     STDMETHODIMP QueryInterface(REFIID riid, void** object) override {
         if (!object) return E_POINTER;
@@ -617,7 +663,7 @@ class Creation final : public IMFAsyncCallback {
         ComPtr<IMFMediaSource> inner;
         HRESULT hr = resolver_->EndCreateObjectFromByteStream(result, &type, &object);
         if (SUCCEEDED(hr)) hr = object.As(&inner);
-        HandOver(hr, inner.Get(), shifts_, callback_.Get(), state_.Get());
+        HandOver(hr, inner.Get(), shifts_, url_, callback_.Get(), state_.Get());
         return S_OK;
     }
 
@@ -625,6 +671,7 @@ class Creation final : public IMFAsyncCallback {
     std::atomic<ULONG> refs_ = 1;
     const ComPtr<IMFSourceResolver> resolver_;
     const Shifts shifts_;
+    const std::wstring url_;
     const ComPtr<IMFAsyncCallback> callback_;
     const ComPtr<IUnknown> state_;
 };
@@ -656,14 +703,14 @@ class Extension final : public IMFMediaEngineExtension {
         const bool ready = TakePreparedSource(url, inner, shifts);
         if (!ready) shifts = ReadShifts(url, stream);
         if (ready) {
-            HandOver(S_OK, inner.Get(), shifts, callback, state);
+            HandOver(S_OK, inner.Get(), shifts, url, callback, state);
             return S_OK;
         }
         ComPtr<IMFSourceResolver> resolver;
         HRESULT hr = MFCreateSourceResolver(&resolver);
         ComPtr<Creation> creation;
         if (SUCCEEDED(hr)) {
-            creation.Attach(new (std::nothrow) Creation(resolver.Get(), shifts, callback, state));
+            creation.Attach(new (std::nothrow) Creation(resolver.Get(), shifts, url, callback, state));
             if (!creation) hr = E_OUTOFMEMORY;
         }
         if (SUCCEEDED(hr)) {
@@ -708,24 +755,4 @@ void PrepareSourceExtension(const wchar_t* path) {
         }
         if (com) CoUninitialize();
     });
-}
-
-HRESULT CreateAudioSource(const wchar_t* path, IMFMediaSource** out) {
-    *out = nullptr;
-    ComPtr<IMFByteStream> stream;
-    ComPtr<IMFMediaSource> inner;
-    ComPtr<ShiftedSource> source;
-    HRESULT hr = MFCreateFile(MF_ACCESSMODE_READ, MF_OPENMODE_FAIL_IF_NOT_EXIST, MF_FILEFLAGS_NONE, path, &stream);
-    const Shifts shifts = SUCCEEDED(hr) ? ReadShifts(path, stream.Get()) : Shifts();
-    if (SUCCEEDED(hr)) hr = CreateSource(path, stream.Get(), inner);
-    if (SUCCEEDED(hr)) {
-        source.Attach(new (std::nothrow) ShiftedSource(inner.Get(), shifts, false));
-        hr = source ? source->Start() : E_OUTOFMEMORY;
-    }
-    if (FAILED(hr)) {
-        if (inner) inner->Shutdown();
-        return hr;
-    }
-    *out = static_cast<IMFMediaSourceEx*>(source.Detach());
-    return S_OK;
 }

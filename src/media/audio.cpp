@@ -3,26 +3,26 @@
 #include <audioclient.h>
 #include <avrt.h>
 #include <mfapi.h>
+#include <mferror.h>
 #include <mfidl.h>
-#include <mfreadwrite.h>
+#include <mftransform.h>
 #include <mmdeviceapi.h>
 #include <wrl/client.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <deque>
 #include <thread>
 
 #include "media/player.h"
-#include "media/source.h"
 
 using Microsoft::WRL::ComPtr;
 
 namespace {
 
 constexpr double kAhead = 1.0;          // seconds of sound decoded ahead of the player
-constexpr double kNear = 5;             // seconds ahead the decoder decodes on to rather than seeking
 constexpr double kGap = 0.01;           // seconds between samples' times taken as a gap, or overlap, in the sound
 constexpr double kQueued = 0.04;        // seconds of sound queued at the output: how soon a new speed is heard
 constexpr double kDeadband = 0.003;     // seconds the sound may drift from the picture before it is eased back
@@ -42,34 +42,30 @@ LONGLONG Now() {  // in 100 ns units
     return MFllMulDiv(now.QuadPart, 10000000, frequency.QuadPart, 0);
 }
 
-std::wstring Take(LPWSTR text) {
-    std::wstring s = text ? text : L"";
-    CoTaskMemFree(text);
-    return s;
-}
-
-// The sound decoded ahead, which the decoder adds to and the player takes from, and what the player asks of the
-// decoder; all under lock.
+// The sound decoded ahead, which the decoder adds to and the player takes from, and the stream it comes from; all
+// under lock.
 struct Shared {
     SRWLOCK lock = SRWLOCK_INIT;
     HANDLE decoderWake = nullptr;  // auto-reset
     HANDLE playerWake = nullptr;   // auto-reset
     bool quit = false;
-    // Asked of the decoder.
-    std::wstring path;
-    bool open = false;     // path is yet to be opened
-    int track = -1;        // the audio track to switch to, or -1
-    double seekTo = -1;    // where to decode from, or -1
-    // The decoder's.
+    // The file's, from its source.
+    std::wstring path;  // the file whose sound plays
+    UINT sound = 0;     // the id of its source's sound, once that has told its tracks
     std::vector<Track> tracks;
+    ComPtr<IMFMediaStream> stream;  // of the track read, once handed over
+    UINT streamVersion = 0;         // counts the streams handed over
+    std::vector<ComPtr<IMFMediaStream>> listened;  // the file's streams whose events are listened to
+    std::vector<ComPtr<IMFMediaEvent>> events;     // stream's, for the decoder
+    // The decoder's.
     std::vector<BYTE> format;  // a WAVEFORMATEX of float samples; empty if there is no sound
     UINT formatVersion = 0;
     std::vector<float> samples;  // interleaved, from head on
     size_t head = 0;
     double time = 0;  // of the frame at head, in seconds
     bool end = false;  // nothing more to decode
-    bool seeking = false;  // a seek is asked or under way, and samples holds nothing yet
-    double asked = -1;     // where the player last asked to decode from, or -1 if it is yet to ask
+    bool seeking = false;  // the source started anew, and samples holds nothing yet
+    double asked = -1;     // where the player asked the sound from, before which it is passed; -1 if anywhere
     // The player's.
     double rate = 1;
     float gain = 1;
@@ -79,6 +75,7 @@ struct Shared {
 } s;
 
 std::thread decoder, player;
+UINT sounds = 0;  // under s.lock: counts the sounds of sources
 
 UINT32 Channels() {
     return s.format.size() >= sizeof(WAVEFORMATEX)
@@ -86,208 +83,401 @@ UINT32 Channels() {
                : 0;
 }
 
+bool Contains(const std::vector<ComPtr<IMFMediaStream>>& streams, IMFMediaStream* stream) {
+    return std::any_of(streams.begin(), streams.end(), [&](const auto& s) { return s.Get() == stream; });
+}
+
+// Hands the decoder the events of the stream read, and keeps listening to each of the file's streams: a track
+// switched back to comes as the same one. Lives for the whole process.
+class Listener final : public IMFAsyncCallback {
+  public:
+    STDMETHODIMP QueryInterface(REFIID riid, void** object) override {
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IMFAsyncCallback)) {
+            *object = static_cast<IMFAsyncCallback*>(this);
+            return S_OK;
+        }
+        *object = nullptr;
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return 2; }
+    STDMETHODIMP_(ULONG) Release() override { return 1; }
+    STDMETHODIMP GetParameters(DWORD*, DWORD*) override { return E_NOTIMPL; }
+    STDMETHODIMP Invoke(IMFAsyncResult* result) override {
+        ComPtr<IUnknown> state;
+        ComPtr<IMFMediaStream> stream;
+        ComPtr<IMFMediaEvent> event;
+        if (FAILED(result->GetState(&state)) || FAILED(state.As(&stream)) ||
+            FAILED(stream->EndGetEvent(result, &event))) {
+            return S_OK;  // shut down
+        }
+        AcquireSRWLockExclusive(&s.lock);
+        const bool read = s.stream.Get() == stream.Get();
+        const bool listened = Contains(s.listened, stream.Get());
+        if (read) s.events.push_back(event);
+        ReleaseSRWLockExclusive(&s.lock);
+        if (read) SetEvent(s.decoderWake);
+        if (listened) stream->BeginGetEvent(this, stream.Get());
+        return S_OK;
+    }
+} listener;
+
 // --- The decoder ---
 
+// Adds frames of sound at a time, in seconds; frames from before where the player asked are passed.
+void Add(double time, const float* f, size_t frames, UINT32 rate, UINT32 channels) {
+    AcquireSRWLockExclusive(&s.lock);
+    if (frames && !(s.samples.size() == s.head && s.asked >= 0 && time + double(frames) / rate < s.asked)) {
+        size_t skip = 0;
+        if (s.samples.size() == s.head) {
+            s.samples.clear();
+            s.head = 0;
+            s.time = time;
+        } else {
+            // Gaps are filled with silence and overlaps cut, so the samples stay one timeline; not the rounding of
+            // times, such as Matroska's to the millisecond, as the samples themselves follow on.
+            const double expected = s.time + double(s.samples.size() - s.head) / channels / rate;
+            const double gap = time - expected;
+            if (gap > kGap) {
+                s.samples.resize(s.samples.size() + size_t(std::min(gap, 1.0) * rate) * channels, 0.0f);
+            } else if (gap < -kGap) {
+                skip = std::min(frames, size_t(-gap * rate));
+            }
+        }
+        s.samples.insert(s.samples.end(), f + skip * channels, f + frames * channels);
+        s.seeking = false;
+    }
+    ReleaseSRWLockExclusive(&s.lock);
+}
+
+// Decodes a stream's samples to float ones, with the decoder Media Foundation has for its format, or none if it is
+// uncompressed. A track it can't decode plays as silence, so it still keeps time.
 struct Decoder {
-    ComPtr<IMFMediaSource> source;
-    ComPtr<IMFSourceReader> reader;
-    std::vector<DWORD> streams;  // the reader's stream index of each audio track
-    int track = -1;
-    UINT32 rate = 0, channels = 0;
+    ComPtr<IMFTransform> mft;
+    GUID subtype = GUID_NULL;  // of what is converted, MFAudioFormat_Float or MFAudioFormat_PCM; GUID_NULL if silent
+    UINT32 rate = 0, channels = 0, bits = 0;
+    bool provides = false;     // the decoder makes its own output samples
+    DWORD outputSize = 0;
+    ComPtr<IMFSample> output;  // made for the decoder, if it doesn't
+    double next = -1;          // the time the decoder's next output follows on at, in seconds, or -1
+    bool fed = false;          // the decoder was given a sample since it started or was flushed
+    std::vector<float> floats;
 
     void Close() {
-        reader.Reset();
-        if (source) source->Shutdown();
-        source.Reset();
-        streams.clear();
-        track = -1;
+        if (mft) mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+        mft.Reset();
+        output.Reset();
+        subtype = GUID_NULL;
+        next = -1;
+        fed = false;
     }
 
-    // Has the reader decode the track to float samples, and returns their format; empty if it can't.
-    std::vector<BYTE> Select(int index) {
-        track = index;
-        reader->SetStreamSelection(DWORD(MF_SOURCE_READER_ALL_STREAMS), FALSE);
-        const DWORD stream = streams[size_t(index)];
-        ComPtr<IMFMediaType> type, current;
-        WAVEFORMATEX* wave = nullptr;
-        UINT32 size = 0;
-        HRESULT hr = reader->SetStreamSelection(stream, TRUE);
-        if (SUCCEEDED(hr)) hr = MFCreateMediaType(&type);
-        if (SUCCEEDED(hr)) hr = type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-        if (SUCCEEDED(hr)) hr = type->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_Float);
-        if (SUCCEEDED(hr)) hr = reader->SetCurrentMediaType(stream, nullptr, type.Get());
-        if (SUCCEEDED(hr)) hr = reader->GetCurrentMediaType(stream, &current);
-        if (SUCCEEDED(hr)) hr = MFCreateWaveFormatExFromMFMediaType(current.Get(), &wave, &size);
-        std::vector<BYTE> format;
-        if (SUCCEEDED(hr) && wave->nChannels && wave->nSamplesPerSec && wave->wBitsPerSample == 32) {
-            format.assign(reinterpret_cast<BYTE*>(wave), reinterpret_cast<BYTE*>(wave) + size);
-            rate = wave->nSamplesPerSec;
-            channels = wave->nChannels;
-        }
-        CoTaskMemFree(wave);
-        return format;
-    }
-
-    // Opens a file's sound; the tracks are empty if it has none.
-    std::vector<Track> Open(const std::wstring& path) {
-        Close();
-        std::vector<Track> tracks;
-        CreateAudioSource(path.c_str(), &source);
-        ComPtr<IMFPresentationDescriptor> presentation;
-        ComPtr<IMFAttributes> attributes;
-        if (!source || FAILED(source->CreatePresentationDescriptor(&presentation)) ||
-            FAILED(MFCreateAttributes(&attributes, 1)) ||
-            FAILED(attributes->SetUINT32(MF_SOURCE_READER_DISCONNECT_MEDIASOURCE_ON_SHUTDOWN, TRUE)) ||
-            FAILED(MFCreateSourceReaderFromMediaSource(source.Get(), attributes.Get(), &reader))) {
-            Close();
-            return tracks;
-        }
-        DWORD count = 0;
-        presentation->GetStreamDescriptorCount(&count);
-        int chosen = -1;
-        for (DWORD i = 0; i < count; ++i) {
-            BOOL selected = FALSE;
-            ComPtr<IMFStreamDescriptor> descriptor;
-            ComPtr<IMFMediaTypeHandler> handler;
-            GUID major = GUID_NULL;
-            if (FAILED(presentation->GetStreamDescriptorByIndex(i, &selected, &descriptor)) ||
-                FAILED(descriptor->GetMediaTypeHandler(&handler)) || FAILED(handler->GetMajorType(&major)) ||
-                major != MFMediaType_Audio) {
-                continue;
-            }
-            LPWSTR language = nullptr, name = nullptr;
-            descriptor->GetAllocatedString(MF_SD_LANGUAGE, &language, nullptr);
-            descriptor->GetAllocatedString(MF_SD_STREAM_NAME, &name, nullptr);
-            if (selected && chosen < 0) chosen = int(streams.size());
-            tracks.push_back({Take(language), Take(name), 0, false});
-            streams.push_back(i);
-        }
-        if (tracks.empty()) Close();
-        else tracks[size_t(std::max(chosen, 0))].selected = true;
-        return tracks;
-    }
-
-    // Decodes the next sample and adds it; false at the end, or if it can't.
-    bool Read(UINT seekVersion, const UINT& currentSeekVersion) {
-        DWORD flags = 0;
-        LONGLONG at = 0;
-        ComPtr<IMFSample> sample;
-        if (FAILED(reader->ReadSample(streams[size_t(track)], 0, nullptr, &flags, &at, &sample)) ||
-            (flags & (MF_SOURCE_READERF_ERROR | MF_SOURCE_READERF_ENDOFSTREAM))) {
+    // Takes on the format of type, if it is uncompressed audio it can convert.
+    bool Take(IMFMediaType* type) {
+        GUID sub = GUID_NULL;
+        type->GetGUID(MF_MT_SUBTYPE, &sub);
+        const UINT32 r = MFGetAttributeUINT32(type, MF_MT_AUDIO_SAMPLES_PER_SECOND, 0);
+        const UINT32 c = MFGetAttributeUINT32(type, MF_MT_AUDIO_NUM_CHANNELS, 0);
+        const UINT32 b = MFGetAttributeUINT32(type, MF_MT_AUDIO_BITS_PER_SAMPLE, 0);
+        if (!r || !c || c > 32 ||
+            !((sub == MFAudioFormat_Float && b == 32) ||
+              (sub == MFAudioFormat_PCM && (b == 8 || b == 16 || b == 24 || b == 32)))) {
             return false;
         }
+        subtype = sub;
+        rate = r;
+        channels = c;
+        bits = b;
+        return true;
+    }
+
+    // Has the decoder output float samples if it can, else integer ones.
+    bool SetOutput() {
+        ComPtr<IMFMediaType> type, pcm;
+        for (DWORD i = 0; SUCCEEDED(mft->GetOutputAvailableType(0, i, &type)); ++i, type.Reset()) {
+            GUID sub = GUID_NULL;
+            type->GetGUID(MF_MT_SUBTYPE, &sub);
+            if (sub == MFAudioFormat_Float) break;
+            if (sub == MFAudioFormat_PCM && !pcm) pcm = type;
+        }
+        if (!type) type = pcm;
+        MFT_OUTPUT_STREAM_INFO info{};
+        if (!type || FAILED(mft->SetOutputType(0, type.Get(), 0)) || !Take(type.Get()) ||
+            FAILED(mft->GetOutputStreamInfo(0, &info))) {
+            subtype = GUID_NULL;
+            return false;
+        }
+        provides = info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES);
+        outputSize = std::max<DWORD>(info.cbSize, rate * channels * (bits / 8) / 4);  // a quarter second
+        output.Reset();
+        return true;
+    }
+
+    // The format the samples are converted to, with the channel mask of type if it has one.
+    std::vector<BYTE> Format(IMFMediaType* type) const {
+        WAVEFORMATEXTENSIBLE wave{};
+        wave.Format.wFormatTag = channels > 2 ? WAVE_FORMAT_EXTENSIBLE : WAVE_FORMAT_IEEE_FLOAT;
+        wave.Format.nChannels = WORD(channels);
+        wave.Format.nSamplesPerSec = rate;
+        wave.Format.wBitsPerSample = 32;
+        wave.Format.nBlockAlign = WORD(channels * 4);
+        wave.Format.nAvgBytesPerSec = rate * channels * 4;
+        size_t size = sizeof(WAVEFORMATEX);
+        if (channels > 2) {
+            wave.Format.cbSize = sizeof(wave) - sizeof(WAVEFORMATEX);
+            wave.Samples.wValidBitsPerSample = 32;
+            wave.dwChannelMask = type ? MFGetAttributeUINT32(type, MF_MT_AUDIO_CHANNEL_MASK, 0) : 0;
+            wave.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+            size = sizeof(wave);
+        }
+        const BYTE* p = reinterpret_cast<const BYTE*>(&wave);
+        return std::vector<BYTE>(p, p + size);
+    }
+
+    // Opens a stream's track; returns the format its sound is decoded to.
+    std::vector<BYTE> Open(IMFMediaStream* stream) {
+        Close();
+        ComPtr<IMFStreamDescriptor> descriptor;
+        ComPtr<IMFMediaTypeHandler> handler;
+        ComPtr<IMFMediaType> type, decoded;
+        if (FAILED(stream->GetStreamDescriptor(&descriptor)) || FAILED(descriptor->GetMediaTypeHandler(&handler)) ||
+            FAILED(handler->GetCurrentMediaType(&type))) {
+            type.Reset();
+        } else if (!Take(type.Get())) {
+            GUID sub = GUID_NULL;
+            type->GetGUID(MF_MT_SUBTYPE, &sub);
+            const MFT_REGISTER_TYPE_INFO input{MFMediaType_Audio, sub};
+            IMFActivate** found = nullptr;
+            UINT32 count = 0;
+            if (SUCCEEDED(MFTEnumEx(MFT_CATEGORY_AUDIO_DECODER,
+                                    MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER,
+                                    &input, nullptr, &found, &count))) {
+                for (UINT32 i = 0; i < count; ++i) {
+                    if (!mft && SUCCEEDED(found[i]->ActivateObject(IID_PPV_ARGS(&mft))) &&
+                        (FAILED(mft->SetInputType(0, type.Get(), 0)) || !SetOutput())) {
+                        mft.Reset();
+                        found[i]->ShutdownObject();
+                    }
+                    found[i]->Release();
+                }
+                CoTaskMemFree(found);
+            }
+            if (mft) {
+                mft->GetOutputCurrentType(0, &decoded);
+                mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+                mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+            }
+        }
+        if (subtype == GUID_NULL) {  // silent
+            rate = 48000;
+            channels = 2;
+        }
+        return Format(decoded ? decoded.Get() : type.Get());
+    }
+
+    // Converts a sample of uncompressed sound and adds it at time.
+    void Convert(IMFSample* sample, double time) {
         ComPtr<IMFMediaBuffer> buffer;
         BYTE* data = nullptr;
         DWORD length = 0;
-        if (!sample || FAILED(sample->ConvertToContiguousBuffer(&buffer)) ||
-            FAILED(buffer->Lock(&data, nullptr, &length))) {
-            return true;  // a gap: nothing to add
+        if (FAILED(sample->ConvertToContiguousBuffer(&buffer)) || FAILED(buffer->Lock(&data, nullptr, &length))) {
+            return;
         }
-        const size_t frames = length / (sizeof(float) * channels);
-        const float* f = reinterpret_cast<const float*>(data);
-        AcquireSRWLockExclusive(&s.lock);
-        const double time = at / 1e7;
-        // Sound before where the player asked for it, which a source can start from after a seek (Matroska's of
-        // a track just selected, from long before), is decoded past.
-        if (seekVersion == currentSeekVersion && frames &&
-            !(s.seeking && s.asked >= 0 && time + double(frames) / rate < s.asked)) {
-            size_t skip = 0;
-            if (s.samples.size() == s.head) {
-                s.samples.clear();
-                s.head = 0;
-                s.time = time;
-            } else {
-                // Gaps are filled with silence and overlaps cut, so the samples stay one timeline; not the
-                // rounding of times, such as Matroska's to the millisecond, as the samples themselves follow on.
-                const double expected = s.time + double(s.samples.size() - s.head) / channels / rate;
-                const double gap = time - expected;
-                if (gap > kGap) {
-                    s.samples.resize(s.samples.size() + size_t(std::min(gap, 1.0) * rate) * channels, 0.0f);
-                } else if (gap < -kGap) {
-                    skip = std::min(frames, size_t(-gap * rate));
+        const size_t frames = length / (bits / 8) / channels, count = frames * channels;
+        floats.resize(count);
+        float* f = floats.data();
+        if (subtype == MFAudioFormat_Float) {
+            memcpy(f, data, count * sizeof(float));
+        } else if (bits == 16) {
+            const auto* p = reinterpret_cast<const INT16*>(data);
+            for (size_t i = 0; i < count; ++i) f[i] = p[i] * (1.0f / 32768);
+        } else if (bits == 24) {
+            for (size_t i = 0; i < count; ++i) {
+                const BYTE* p = data + i * 3;
+                f[i] = float(INT32(UINT32(p[0]) << 8 | UINT32(p[1]) << 16 | UINT32(p[2]) << 24)) * (1.0f / 2147483648.0f);
+            }
+        } else if (bits == 32) {
+            const auto* p = reinterpret_cast<const INT32*>(data);
+            for (size_t i = 0; i < count; ++i) f[i] = float(p[i]) * (1.0f / 2147483648.0f);
+        } else {
+            for (size_t i = 0; i < count; ++i) f[i] = (int(data[i]) - 128) * (1.0f / 128);
+        }
+        buffer->Unlock();
+        Add(time, f, frames, rate, channels);
+        next = time + double(frames) / rate;
+    }
+
+    // Takes what the decoder has made; false if the format of its sound changed.
+    bool Pull() {
+        for (;;) {
+            if (!provides && !output) {
+                ComPtr<IMFMediaBuffer> buffer;
+                if (FAILED(MFCreateSample(&output)) || FAILED(MFCreateMemoryBuffer(outputSize, &buffer)) ||
+                    FAILED(output->AddBuffer(buffer.Get()))) {
+                    output.Reset();
+                    return true;
                 }
             }
-            s.samples.insert(s.samples.end(), f + skip * channels, f + frames * channels);
-            s.seeking = false;
+            if (!provides) {
+                ComPtr<IMFMediaBuffer> buffer;
+                if (SUCCEEDED(output->GetBufferByIndex(0, &buffer))) buffer->SetCurrentLength(0);
+            }
+            MFT_OUTPUT_DATA_BUFFER out{0, provides ? nullptr : output.Get(), 0, nullptr};
+            DWORD status = 0;
+            const HRESULT hr = mft->ProcessOutput(0, 1, &out, &status);
+            if (out.pEvents) out.pEvents->Release();
+            ComPtr<IMFSample> made;
+            if (provides) {
+                made.Attach(out.pSample);
+            } else {
+                made = output;
+            }
+            if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+                SetOutput();
+                return false;
+            }
+            if (FAILED(hr) || !made) return true;
+            LONGLONG at = 0;
+            const double time = SUCCEEDED(made->GetSampleTime(&at)) ? at / 1e7 : next;
+            if (time >= 0 && subtype != GUID_NULL) Convert(made.Get(), time);
         }
-        ReleaseSRWLockExclusive(&s.lock);
-        buffer->Unlock();
-        return true;
+    }
+
+    // Decodes a sample of the stream; false if the format of the sound changed.
+    bool Decode(IMFSample* sample) {
+        LONGLONG at = 0;
+        const bool timed = SUCCEEDED(sample->GetSampleTime(&at));
+        if (subtype == GUID_NULL) {  // silence as long as the sample
+            LONGLONG duration = 0;
+            if (!timed) return true;
+            if (FAILED(sample->GetSampleDuration(&duration)) || duration <= 0) duration = 200000;
+            floats.assign(size_t(MFllMulDiv(duration, rate, 10000000, 0)) * channels, 0.0f);
+            Add(at / 1e7, floats.data(), floats.size() / channels, rate, channels);
+            return true;
+        }
+        if (!mft) {
+            if (timed) Convert(sample, at / 1e7);
+            return true;
+        }
+        if (next < 0 && timed) next = at / 1e7;
+        fed = true;
+        if (mft->ProcessInput(0, sample, 0) == MF_E_NOTACCEPTING) {
+            if (!Pull()) return false;
+            mft->ProcessInput(0, sample, 0);
+        }
+        return Pull();
+    }
+
+    // Drops what the decoder holds; not before it is fed anything, which some decoders (FLAC's) don't take.
+    void Flush() {
+        if (mft && fed) mft->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+        fed = false;
+        next = -1;
+    }
+    bool Drain() {
+        if (!mft) return true;
+        mft->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+        return Pull();
     }
 };
 
-UINT seekVersion = 0;  // under s.lock: counts the seeks asked of the decoder
+// Starts the sound over, from nothing decoded yet, in a format; the player waits for where it starts.
+void StartOver(std::vector<BYTE>* format, bool end) {
+    AcquireSRWLockExclusive(&s.lock);
+    if (format) {
+        s.format = std::move(*format);
+        ++s.formatVersion;
+    }
+    s.samples.clear();
+    s.head = 0;
+    s.end = end;
+    s.seeking = true;
+    s.asked = -1;
+    ReleaseSRWLockExclusive(&s.lock);
+    SetEvent(s.playerWake);
+}
 
 void DecoderLoop() {
     const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
     Decoder d;
-    UINT readVersion = 0;
+    ComPtr<IMFMediaStream> stream;
+    UINT streamVersion = 0;
+    std::vector<ComPtr<IMFMediaEvent>> events;
+    // A sample is asked for; the stream refused the last ask (until its next event); it is stopped; it ended.
+    bool requested = false, refused = false, stopped = true, ended = false;
     for (;;) {
         AcquireSRWLockExclusive(&s.lock);
         if (s.quit) {
             ReleaseSRWLockExclusive(&s.lock);
             break;
         }
-        const bool open = std::exchange(s.open, false);
-        const std::wstring path = open ? s.path : std::wstring();
-        const int track = std::exchange(s.track, -1);
-        const double seekTo = std::exchange(s.seekTo, -1.0);
-        readVersion = seekVersion;
-        const bool full = s.end || double(s.samples.size() - s.head) / std::max<UINT32>(Channels(), 1) /
-                                           std::max<UINT32>(d.rate, 1) >= kAhead;
+        const bool changed = s.streamVersion != streamVersion;
+        if (changed) {
+            streamVersion = s.streamVersion;
+            stream = s.stream;
+        }
+        events.swap(s.events);
+        const bool full = double(s.samples.size() - s.head) / std::max<UINT32>(Channels(), 1) /
+                              std::max<UINT32>(d.rate, 1) >= kAhead;
         ReleaseSRWLockExclusive(&s.lock);
 
-        if (open || (track >= 0 && d.reader && track < int(d.streams.size()) && track != d.track)) {
-            std::vector<Track> tracks;
-            int index = track;
-            if (open) {
-                tracks = d.Open(path);
-                index = int(std::find_if(tracks.begin(), tracks.end(), [](const Track& t) { return t.selected; }) -
-                            tracks.begin());
-            }
-            std::vector<BYTE> format = d.reader && index < int(d.streams.size()) ? d.Select(index) : std::vector<BYTE>();
-            AcquireSRWLockExclusive(&s.lock);
-            if (open) {
-                s.tracks = std::move(tracks);
-                if (s.open) {  // another file was asked for meanwhile
-                    ReleaseSRWLockExclusive(&s.lock);
-                    continue;
+        if (changed) {
+            d.Close();
+            std::vector<BYTE> format = stream ? d.Open(stream.Get()) : std::vector<BYTE>();
+            StartOver(&format, !stream);
+            requested = refused = ended = false;
+            stopped = true;
+        }
+        for (const auto& event : events) {
+            MediaEventType type = MEUnknown;
+            HRESULT status = S_OK;
+            event->GetType(&type);
+            event->GetStatus(&status);
+            refused = false;
+            bool same = true;  // the format of the sound stays
+            if (FAILED(status) || type == MEError || type == MEEndOfStream) {
+                ended = true;
+                requested = false;
+                if (SUCCEEDED(status) && type == MEEndOfStream) same = d.Drain();
+                AcquireSRWLockExclusive(&s.lock);
+                s.end = true;
+                ReleaseSRWLockExclusive(&s.lock);
+                SetEvent(s.playerWake);
+            } else if (type == MEMediaSample) {
+                requested = false;
+                PROPVARIANT value;
+                PropVariantInit(&value);
+                ComPtr<IMFSample> sample;
+                if (SUCCEEDED(event->GetValue(&value)) && value.vt == VT_UNKNOWN && value.punkVal &&
+                    SUCCEEDED(value.punkVal->QueryInterface(IID_PPV_ARGS(&sample)))) {
+                    same = d.Decode(sample.Get());
                 }
+                PropVariantClear(&value);
+            } else if (type == MEStreamSeeked || (type == MEStreamStarted && stopped)) {
+                stopped = ended = requested = false;  // a sample asked for before is dropped
+                d.Flush();
+                StartOver(nullptr, false);
+            } else if (type == MEStreamStarted) {
+                stopped = false;
+            } else if (type == MEStreamStopped) {
+                stopped = true;
+                requested = false;
             }
-            for (Track& t : s.tracks) t.selected = &t - s.tracks.data() == index;
-            s.format = std::move(format);
-            ++s.formatVersion;
-            s.samples.clear();
-            s.head = 0;
-            s.end = s.format.empty();
-            s.seeking = true;  // the player asks where to start
-            s.asked = -1;
-            ReleaseSRWLockExclusive(&s.lock);
-            if (open) PostMessageW(s.hwnd, s.tracksMessage, 0, 0);
-            SetEvent(s.playerWake);
-            continue;
+            if (!same) {
+                std::vector<BYTE> format = d.Format(nullptr);
+                StartOver(&format, ended);
+            }
         }
-        if (seekTo >= 0 && d.reader) {
-            PROPVARIANT position{};
-            position.vt = VT_I8;
-            position.hVal.QuadPart = std::llround(seekTo * 1e7);
-            d.reader->SetCurrentPosition(GUID_NULL, position);
-            AcquireSRWLockExclusive(&s.lock);
-            s.end = false;
-            ReleaseSRWLockExclusive(&s.lock);
-            continue;
+        // Asks for one sample at a time while less than kAhead is decoded.
+        if (stream && !requested && !refused && !stopped && !ended && !full) {
+            requested = SUCCEEDED(stream->RequestSample(nullptr));
+            refused = !requested;
         }
-        if (!d.reader || d.track < 0 || full) {
-            WaitForSingleObject(s.decoderWake, INFINITE);
-            continue;
-        }
-        if (!d.Read(readVersion, seekVersion)) {
-            AcquireSRWLockExclusive(&s.lock);
-            if (readVersion == seekVersion) s.end = true;
-            ReleaseSRWLockExclusive(&s.lock);
-        }
+        const bool idle = events.empty();
+        events.clear();
+        if (idle) WaitForSingleObject(s.decoderWake, INFINITE);
     }
     d.Close();
+    stream.Reset();
     if (com) CoUninitialize();
 }
 
@@ -572,35 +762,30 @@ void PlayerLoop() {
                 failed = true;
                 continue;
             }
-            // Starts the sound where the picture will be when its first frame is heard: from what is decoded
-            // ahead if that reaches there, else once the decoder has gone there.
+            // Starts the sound where the picture will be when its first frame is heard, from what is decoded ahead.
+            // If that doesn't reach there, the decoder passes what comes before, as it decodes far faster than it
+            // plays; if it starts later, as just after a seek, the picture catches up.
             const double start = clock + (double(Now() - clockAt) / 1e7 + out.delay + out.period) * rate;
             AcquireSRWLockExclusive(&s.lock);
             bool ready = false;
             const size_t c = out.channels;
             const double end = s.time + double(s.samples.size() - s.head) / c / out.rate;
-            if (!s.seeking && start >= s.time && start < end - 0.05) {
-                s.head += size_t((start - s.time) * out.rate) * c;
-                s.time = start;
-                ready = true;
-            } else {
-                // Else the decoder goes on to there, as it decodes far faster than it plays: from where it is if
-                // that is a little before, or after a seek of its own.
-                const bool nearby = s.seeking ? s.asked >= 0 && start >= s.asked && start < s.asked + kNear
-                                            : start >= s.time && start < end + kNear;
-                s.samples.clear();
-                s.head = 0;
-                s.seeking = true;
-                s.asked = std::max(0.0, start - 0.05);  // so the samples begin a little before
-                if (!nearby) {
-                    s.seekTo = s.asked;
-                    ++seekVersion;
+            if (!s.seeking && start >= s.time) {
+                if (start < end - 0.05) {
+                    s.head += size_t((start - s.time) * out.rate) * c;
+                    s.time = start;
+                    ready = true;
+                } else if (!s.end) {
+                    s.head = s.samples.size();
+                    s.time = end;
+                    s.asked = std::max(0.0, start - 0.05);  // so the samples begin a little before
+                    SetEvent(s.decoderWake);
                 }
-                SetEvent(s.decoderWake);
             }
+            const bool over = s.end && !ready;
             ReleaseSRWLockExclusive(&s.lock);
             if (!ready) {
-                WaitForSingleObject(s.playerWake, 5);
+                WaitForSingleObject(s.playerWake, over ? 20 : 5);
                 continue;
             }
             stretch.Reset(out.rate, out.channels);
@@ -725,6 +910,11 @@ void StopAudio() {
     if (s.playerWake) SetEvent(s.playerWake);
     if (decoder.joinable()) decoder.join();
     if (player.joinable()) player.join();
+    AcquireSRWLockExclusive(&s.lock);
+    s.stream.Reset();
+    std::vector<ComPtr<IMFMediaStream>> listened = std::move(s.listened);
+    s.events.clear();
+    ReleaseSRWLockExclusive(&s.lock);
 }
 
 void WakeAudio() {
@@ -734,21 +924,14 @@ void WakeAudio() {
 void OpenAudio(const std::wstring& path) {
     AcquireSRWLockExclusive(&s.lock);
     s.path = path;
-    s.open = true;
-    s.track = -1;
-    s.seekTo = -1;
+    s.sound = 0;
     s.tracks.clear();
-    s.format.clear();
-    ++s.formatVersion;
-    s.samples.clear();
-    s.head = 0;
-    s.end = true;
-    s.seeking = false;
-    s.asked = -1;
-    ++seekVersion;
+    s.stream.Reset();
+    ++s.streamVersion;
+    std::vector<ComPtr<IMFMediaStream>> listened = std::move(s.listened);  // let go of after the lock
+    s.events.clear();
     ReleaseSRWLockExclusive(&s.lock);
     SetEvent(s.decoderWake);
-    SetEvent(s.playerWake);
 }
 
 std::vector<Track> AudioTrackList() {
@@ -760,9 +943,10 @@ std::vector<Track> AudioTrackList() {
 
 void SelectAudio(size_t index) {
     AcquireSRWLockExclusive(&s.lock);
-    s.track = int(index);
+    if (index < s.tracks.size()) {
+        for (Track& t : s.tracks) t.selected = &t - s.tracks.data() == ptrdiff_t(index);
+    }
     ReleaseSRWLockExclusive(&s.lock);
-    SetEvent(s.decoderWake);
 }
 
 void SetAudioRate(double rate) {
@@ -776,4 +960,44 @@ void SetAudioVolume(double volume, bool muted) {
     AcquireSRWLockExclusive(&s.lock);
     s.gain = muted ? 0.0f : float(volume);
     ReleaseSRWLockExclusive(&s.lock);
+}
+
+UINT SetAudioTracks(const wchar_t* url, std::vector<Track> tracks) {
+    AcquireSRWLockExclusive(&s.lock);
+    const bool mine = url && !s.path.empty() && CompareStringOrdinal(url, -1, s.path.c_str(), -1, TRUE) == CSTR_EQUAL;
+    if (mine) {
+        s.sound = ++sounds;
+        s.tracks = std::move(tracks);
+    }
+    const UINT sound = mine ? s.sound : 0;
+    ReleaseSRWLockExclusive(&s.lock);
+    if (mine) PostMessageW(s.hwnd, s.tracksMessage, 0, 0);
+    return sound;
+}
+
+int AudioTrackToRead(UINT sound) {
+    AcquireSRWLockShared(&s.lock);
+    int index = -1;
+    if (sound && sound == s.sound) {
+        for (const Track& t : s.tracks) {
+            if (t.selected) index = int(&t - s.tracks.data());
+        }
+    }
+    ReleaseSRWLockShared(&s.lock);
+    return index;
+}
+
+void SetAudioStream(UINT sound, IMFMediaStream* stream) {
+    AcquireSRWLockExclusive(&s.lock);
+    const bool mine = sound && sound == s.sound;
+    const bool listen = mine && !Contains(s.listened, stream);
+    if (listen) s.listened.push_back(stream);
+    if (mine && s.stream.Get() != stream) {
+        s.stream = stream;
+        ++s.streamVersion;
+        s.events.clear();
+    }
+    ReleaseSRWLockExclusive(&s.lock);
+    if (listen) stream->BeginGetEvent(&listener, stream);
+    if (mine) SetEvent(s.decoderWake);
 }

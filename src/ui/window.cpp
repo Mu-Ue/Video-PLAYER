@@ -1187,10 +1187,16 @@ void OnSubtitleCues(WPARAM track, LPARAM cues) {
     if (AddCues(it->subs, std::move(*owned)) && it - g.tracks.begin() == g.subtitle) ShowSubtitles();
 }
 
+double RequestSeek(double seconds, bool fast);
+
 // Plays the audio track or shows the subtitle track (0 for off) in the panel's column and row.
 void PickTrack(int column, int row) {
     if (column == 0 && row != g.audioTrack) {
+        // The source reads the track from its next start, which a seek makes: into the frame before, as a seek
+        // within the frame the engine is at does nothing, or past the next ones at the first.
         SelectAudioTrack(size_t(row));
+        const double frame = FrameTime(), gap = FrameGap();
+        RequestSeek(frame >= gap / 2 ? frame - gap / 2 : frame + 2.5 * gap, false);
         g.audioTrack = row;
         DrawPanel();
         g.dcomp->Commit();

@@ -53,7 +53,7 @@ struct Track {
 };
 // The video's audio tracks, once WM_APP_AUDIO_TRACKS tells they are known.
 std::vector<Track> AudioTracks();
-// Plays the audio track at index in AudioTracks() instead of the others.
+// Plays the audio track at index in AudioTracks() instead of the others, from the source's next start: a seek.
 void SelectAudioTrack(size_t index);
 // The video's text subtitle tracks (SRT, SSA / ASS or WebVTT in MKV).
 std::vector<Track> SubtitleTracks();
