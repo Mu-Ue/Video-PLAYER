@@ -163,6 +163,9 @@ struct {
     HANDLE stop = nullptr;             // tells the render thread and the previewer to exit
     HANDLE renderWake = nullptr;       // set on each engine event and redraw, while the render thread sleeps
     std::thread renderer;
+    // The volume and mute, also kept here so they can be set before the engine is made.
+    double volume = 1;
+    bool muted = false;
 } g;
 
 HRESULT CreateDevice() {
@@ -376,14 +379,14 @@ SIZE DisplaySize(IMFMediaEngineEx* engine) {
 // Has the render thread present the current frame even if it isn't new.
 void Redraw() {
     g.redraw = true;
-    SetEvent(g.renderWake);
+    if (g.renderWake) SetEvent(g.renderWake);
 }
 
 }  // namespace
 
 void RequestFrame() {
     g.frameWanted = true;
-    SetEvent(g.renderWake);
+    if (g.renderWake) SetEvent(g.renderWake);
 }
 
 namespace {
@@ -871,6 +874,8 @@ bool InitPlayer(HWND hwnd) {
     if (FAILED(CreateDevice())) return false;
     g.started = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
     if (!g.started || FAILED(CreateEngines())) return false;
+    g.engine->SetVolume(g.volume);
+    g.engine->SetMuted(g.muted);
     g.stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g.previewWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g.renderWake = g.notify.wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -1118,26 +1123,34 @@ void SeekTo(double landing, bool fast) {
                                                              : MF_MEDIA_ENGINE_SEEK_MODE_NORMAL);
 }
 
-double Volume() { return g.engine ? g.engine->GetVolume() : 1; }
+double Volume() { return g.volume; }
 
-bool IsMuted() { return g.engine && g.engine->GetMuted(); }
+bool IsMuted() { return g.muted; }
+
+namespace {
+
+void SetMuted(bool muted) {
+    g.muted = muted;
+    if (g.engine) g.engine->SetMuted(muted);
+}
+
+}  // namespace
 
 double ChangeVolume(double delta) {
-    const double volume = std::clamp(std::round((g.engine->GetVolume() + delta) * 100) / 100, 0.0, 1.0);
-    g.engine->SetVolume(volume);
-    if (delta > 0) g.engine->SetMuted(FALSE);
-    return volume;
+    g.volume = std::clamp(std::round((g.volume + delta) * 100) / 100, 0.0, 1.0);
+    if (g.engine) g.engine->SetVolume(g.volume);
+    if (delta > 0) SetMuted(false);
+    return g.volume;
 }
 
 double SetVolume(double volume) {
-    volume = std::clamp(std::round(volume * 100) / 100, 0.0, 1.0);
-    g.engine->SetVolume(volume);
-    if (volume > 0) g.engine->SetMuted(FALSE);
-    return volume;
+    g.volume = std::clamp(std::round(volume * 100) / 100, 0.0, 1.0);
+    if (g.engine) g.engine->SetVolume(g.volume);
+    if (g.volume > 0) SetMuted(false);
+    return g.volume;
 }
 
 bool ToggleMute() {
-    const bool muted = !g.engine->GetMuted();
-    g.engine->SetMuted(muted);
-    return muted;
+    SetMuted(!g.muted);
+    return g.muted;
 }

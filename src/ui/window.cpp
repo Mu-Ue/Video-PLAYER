@@ -97,6 +97,8 @@ struct Window {
     SIZE videoSize{};               // swap chain size: the video fitted to the monitor
     RECT videoRect{};               // where the video is, in client pixels
 
+    // A window opened without a video starts the player with the first one, so until then it holds no engine.
+    bool playerTried = false, player = false;
     bool sized = false;  // the window has been sized to a video
     std::vector<SubtitleTrack> tracks;  // the video's own first, then files
     int subtitle = -1;                  // the track shown, or -1 for off
@@ -395,6 +397,7 @@ void UpdateControls() {
 // UpdateControls just before the next frame, for a drag: a fast mouse reports far more often than frames are shown,
 // and each redraw draws them all.
 void UpdateControlsAtFrame() {
+    if (!g.player) return UpdateControls();  // no frames to wait for
     g.controlsChanged = true;
     RequestFrame();
 }
@@ -1027,8 +1030,21 @@ void AddSidecarSubtitles(const std::wstring& video) {
     FindClose(find);
 }
 
+// Starts the player for a first video, unless tried already; returns whether it runs.
+bool StartVideoPlayer(const std::wstring& path) {
+    if (!std::exchange(g.playerTried, true)) {
+        PrepareVideo(path);
+        g.player = InitPlayer(g.hwnd);
+    }
+    return g.player;
+}
+
 // Plays a video, unless started, as the engine already loads it.
 bool OpenVideoFile(const std::wstring& path, bool started) {
+    if (!started && !StartVideoPlayer(path)) {
+        ShowError(L"Can't play videos: Direct3D 11 or Media Foundation isn't available.");
+        return false;
+    }
     const HRESULT hr = started ? S_OK : OpenVideo(path);
     if (FAILED(hr)) {
         const bool missing = hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) ||
@@ -1752,14 +1768,16 @@ HWND CreateMainWindow(HINSTANCE instance) {
 bool StartPlayer(HINSTANCE instance, const std::vector<std::wstring>& files, int showCmd) {
     g.showCmd = showCmd;
     const auto video = std::find_if_not(files.begin(), files.end(), IsSubtitleFile);
-    PrepareVideo(video != files.end() ? *video : std::wstring());
+    const bool hasVideo = video != files.end();
+    if (hasVideo) PrepareVideo(*video);
     g.hwnd = CreateMainWindow(instance);
     if (!g.hwnd) return false;
     // On failure, destroying the window stops the player's threads, which must not outlive it.
-    const bool player = InitPlayer(g.hwnd);
+    g.playerTried = hasVideo;
+    g.player = hasVideo && InitPlayer(g.hwnd);
     // The engine loads the video while the window's composition is set up.
-    const bool started = player && video != files.end() && SUCCEEDED(OpenVideo(*video));
-    if (!player || !InitComposition()) {
+    const bool started = g.player && SUCCEEDED(OpenVideo(*video));
+    if (g.player != hasVideo || !InitComposition()) {
         MessageBoxW(nullptr, L"Can't start: Direct3D 11 or Media Foundation isn't available.", kAppName,
                     MB_OK | MB_ICONERROR);
         DestroyWindow(g.hwnd);
