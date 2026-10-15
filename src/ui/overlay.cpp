@@ -606,11 +606,12 @@ void DrawControls(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT 
             dc->FillEllipse(D2D1::Ellipse({px, y}, knob, knob), g.kit.brush.Get());
         }
 
-        // The volume slider, the same way in white.
-        if (c.volumeTrack.right > c.volumeTrack.left) {
-            const D2D1_RECT_F v = RectF(c.volumeTrack);
+        // The volume and speed sliders, the same way in white.
+        for (const auto& [track, level] : {std::pair{c.volumeTrack, c.volumeLevel}, std::pair{c.speedTrack, c.speedLevel}}) {
+            if (track.right <= track.left) continue;
+            const D2D1_RECT_F v = RectF(track);
             const float vy = (v.top + v.bottom) / 2, vhalf = 1.5f * scale;
-            const float vx = v.left + float(c.volumeLevel) * (v.right - v.left);
+            const float vx = v.left + float(level) * (v.right - v.left);
             g.kit.brush->SetColor(D2D1::ColorF(1, 1, 1, 0.35f));
             dc->FillRectangle(D2D1::RectF(vx, vy - vhalf, v.right, vy + vhalf), g.kit.brush.Get());
             g.kit.brush->SetColor(D2D1::ColorF(0xffffff));
@@ -630,8 +631,8 @@ void DrawControls(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT 
             dc->SetTransform(D2D1::Matrix3x2F::Scale(item.mirror ? -zoom : zoom, zoom, center) * base);
             g.kit.brush->SetColor(D2D1::ColorF(item.dim ? 0x808080 : 0xffffff));
             if (item.replay) DrawReplayArrow(dc, center, 11 * scale, 2 * scale, item.replay);
-            dc->DrawText(item.text.data(), UINT32(item.text.size()), item.replay ? g.number.Get() : g.icons.Get(),
-                         r, g.kit.brush.Get());
+            IDWriteTextFormat* font = item.replay ? g.number.Get() : item.label ? g.title.Get() : g.icons.Get();
+            dc->DrawText(item.text.data(), UINT32(item.text.size()), font, r, g.kit.brush.Get());
         }
     });
 }

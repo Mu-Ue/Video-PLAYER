@@ -160,6 +160,7 @@ struct {
     std::atomic<bool> frameWanted = false;  // post WM_APP_FRAME before the next frame; set with RequestFrame
     std::atomic<LONGLONG> landing = -1;     // of the last seek, in 100 ns units, until its frame shows
     std::atomic<bool> opened = false;       // a new video was opened, whose frames may come faster
+    std::atomic<double> rate = 1;           // the playback speed, which video time passes at
     HANDLE stop = nullptr;             // tells the render thread and the previewer to exit
     HANDLE renderWake = nullptr;       // set on each engine event and redraw, while the render thread sleeps
     std::thread renderer;
@@ -509,10 +510,10 @@ void RenderLoop() {
         bool fresh = g.engine->OnVideoStreamTick(&pts) == S_OK;
         // While playing, a frame not due yet is looked for again just before the next compositor frame, so it makes
         // that frame rather than racing the compositor at the following tick; unless none can be due by then, as
-        // frames come no faster than the fastest yet.
+        // frames come no faster than the fastest yet. Video time passes at the playback speed.
         if (!fresh && waitClock && !g.engine->IsPaused() &&
             (!fastest || frameTime + fastest - std::llround(g.engine->GetCurrentTime() * 1e7) <=
-                             framePeriod() * 10'000'000 / clock.Frequency())) {
+                             std::llround(framePeriod() * 1e7 / clock.Frequency() * g.rate))) {
             if (!WaitBeforeNextFrame(clock, timer, tick.QuadPart, framePeriod())) break;
             fresh = g.engine->OnVideoStreamTick(&pts) == S_OK;
         }
@@ -1123,6 +1124,11 @@ void SeekTo(double landing, bool fast) {
     g.landing = std::llround(landing * 1e7);
     g.engine->SetCurrentTimeEx(landing, fast && !KeyFrames() ? MF_MEDIA_ENGINE_SEEK_MODE_APPROXIMATE
                                                              : MF_MEDIA_ENGINE_SEEK_MODE_NORMAL);
+}
+
+void SetPlaybackRate(double rate) {
+    g.rate = rate;
+    if (g.engine) g.engine->SetPlaybackRate(rate);
 }
 
 double Volume() { return g.volume; }

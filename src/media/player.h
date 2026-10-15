@@ -102,6 +102,7 @@ double Duration();      // seconds; NaN if unknown
 double SeekLanding(double seconds, bool fast);
 // Starts seeking to a landing from SeekLanding; SEEKED follows.
 void SeekTo(double landing, bool fast);
+void SetPlaybackRate(double rate);  // 1 for normal speed
 double Volume();  // 0..1
 bool IsMuted();
 // Changes the volume by delta (0..1 scale), unmuting when raising it, and returns the new volume.

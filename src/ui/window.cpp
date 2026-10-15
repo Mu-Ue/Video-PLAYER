@@ -30,10 +30,11 @@ namespace {
 
 enum : UINT_PTR { kOsdTimer = 1, kIdleTimer, kShowTimer };
 enum : UINT { kCmdOpen = 1, kCmdAddSubtitles };
-// The buttons on the menu bar, then the controls: buttons left to right, the seek bar, the volume slider, and two
-// labels.
+// The buttons on the menu bar, then the controls: buttons left to right, the seek bar, the volume and speed
+// sliders, and two labels.
 enum Control {
-    kNone, kFile, kSubs, kPlay, kBack, kForward, kVolume, kSubtitles, kFullscreen, kSeek, kVolumeBar, kTime, kTitle
+    kNone, kFile, kSubs, kPlay, kBack, kForward, kVolume, kSpeed, kSubtitles, kFullscreen, kSeek, kVolumeBar,
+    kSpeedBar, kTime, kTitle
 };
 constexpr UINT kShowFallbackMs = 1000;  // show the window even if the video's size isn't known by then
 constexpr float kFadeSeconds = 0.2f;    // of the controls
@@ -122,7 +123,7 @@ struct Window {
     Controls drawn{};  // what the controls show, at drawnSize and drawnScale
     SIZE drawnSize{};
     float drawnScale = 0;
-    Control drag = kNone;  // kSeek or kVolumeBar while dragging along it
+    Control drag = kNone;  // kSeek, kVolumeBar or kSpeedBar while dragging along it
     double dragSeconds = 0;  // the time under the mouse while dragging the seek bar; it seeks there on release
     bool controlsChanged = false;  // by a drag; a WM_APP_FRAME redraws them
     // The engine's state, kept here so drawing never waits on the engine. playing changes as soon as it is
@@ -132,6 +133,7 @@ struct Window {
     double volume = 1;
     bool muted = false;
     double restoreVolume = 1;  // what unmuting from 0% goes back to: the volume before it was turned down
+    double rate = 1;           // the playback speed
     int wheel = 0;             // wheel delta short of a volume step, from touchpads and free-spinning wheels
     LONG lastWheelStep = 0;    // message time of the last volume step by the wheel
     // One seek at a time is in flight; the latest one asked for meanwhile waits for it to finish.
@@ -270,30 +272,36 @@ int ControlsTop() {
 
 // The volume slider opens right of the volume button while the mouse is on either, or dragging the slider.
 bool VolumeExpanded() { return g.hot == kVolume || g.hot == kVolumeBar || g.drag == kVolumeBar; }
+// The speed slider the same way, left of the speed button.
+bool SpeedExpanded() { return g.hot == kSpeed || g.hot == kSpeedBar || g.drag == kSpeedBar; }
 
 // Where a control is, in client pixels: the seek bar across the window, and below it a row of buttons, the volume
-// slider and time right of the left ones, and the centered title.
+// slider and time right of the left ones, the speed slider left of the right ones, and the centered title.
 RECT ControlRect(Control c) {
     RECT client;
     GetClientRect(g.hwnd, &client);
     if (c == kFile) return {0, 0, Px(40), MenuBarHeight()};
     if (c == kSubs) return {Px(40), 0, Px(112), MenuBarHeight()};
-    const int margin = Px(12), step = Px(56), slider = Px(64), time = Px(140);
+    const int margin = Px(12), step = Px(56), slider = Px(64), speedSlider = Px(96), time = Px(140);
     const int seekY = client.bottom - Px(80), rowY = client.bottom - Px(34), half = Px(24);
     const int sliderX = margin + 4 * step;  // right of the volume button
+    const int speedX = int(client.right) - margin - (kFullscreen - kSpeed + 1) * step;  // left of the speed button
     switch (c) {
         case kSeek: return {margin, seekY - Px(16), client.right - margin, seekY + Px(16)};
         case kVolumeBar: return {sliderX, rowY - half, sliderX + (VolumeExpanded() ? slider : 0), rowY + half};
+        case kSpeedBar: return {speedX - (SpeedExpanded() ? speedSlider : 0), rowY - half, speedX, rowY + half};
         case kTime: {
             const int x = int(ControlRect(kVolumeBar).right) + Px(8);
             return {x, rowY - half, x + time, rowY + half};
         }
         case kTitle: {
             const int center = int(client.right) / 2;
-            // Clear of the time with the slider open, so the title doesn't move with it.
-            const int w = std::max(0, center - (sliderX + slider + Px(8) + time));
+            // Clear of the time and the speed slider open, so the title doesn't move with them.
+            const int w = std::max(0, std::min(center - (sliderX + slider + Px(8) + time),
+                                               speedX - speedSlider - Px(8) - center));
             return {center - w, rowY - half, center + w, rowY + half};
         }
+        case kSpeed:
         case kSubtitles:
         case kFullscreen: {
             const int x = client.right - margin - (kFullscreen - c + 1) * step;
@@ -306,9 +314,10 @@ RECT ControlRect(Control c) {
     }
 }
 
-// The volume slider's track, inset so the knob fits at either end; empty while the slider is closed.
-RECT VolumeTrack() {
-    RECT r = ControlRect(kVolumeBar);
+// A slider's track, kVolumeBar's or kSpeedBar's, inset so the knob fits at either end; empty while the slider is
+// closed.
+RECT SliderTrack(Control slider) {
+    RECT r = ControlRect(slider);
     if (r.right > r.left) InflateRect(&r, -Px(8), 0);
     return r;
 }
@@ -320,7 +329,8 @@ bool IsOnBar(POINT pt) { return pt.y < MenuBarHeight() || IsOnControls(pt); }
 
 Control HitTest(POINT pt) {
     for (const Control c :
-         {kFile, kSubs, kPlay, kBack, kForward, kVolume, kSubtitles, kFullscreen, kSeek, kVolumeBar}) {
+         {kFile, kSubs, kPlay, kBack, kForward, kVolume, kSpeed, kSubtitles, kFullscreen, kSeek, kVolumeBar,
+          kSpeedBar}) {
         const RECT r = ControlRect(c);
         if (PtInRect(&r, pt) && (IsMenuButton(c) || g.controlsShown)) return c;
     }
@@ -340,6 +350,13 @@ const wchar_t* VolumeGlyph() {
     const double volume = g.volume;
     if (g.muted || volume == 0) return L"\xE74F";
     return volume < 1.0 / 3 ? L"\xE993" : volume < 2.0 / 3 ? L"\xE994" : L"\xE995";
+}
+
+// A playback speed as the speed button shows it, such as 1× or 1.25×.
+std::wstring FormatRate(double rate) {
+    wchar_t text[16];
+    swprintf_s(text, L"%g×", rate);
+    return text;
 }
 
 // Where the video is, or will be once the seeks in flight are done.
@@ -368,8 +385,11 @@ bool DrawControls() {
     const auto along = [&](double seconds) {
         return duration > 0 ? std::round(std::clamp(seconds / duration, 0.0, 1.0) * track) / track : 0.0;
     };
-    RECT volume = VolumeTrack();
+    RECT volume = SliderTrack(kVolumeBar), speed = SliderTrack(kSpeedBar);
     OffsetRect(&volume, 0, -top);
+    OffsetRect(&speed, 0, -top);
+    BarItem speedButton = button(kSpeed, FormatRate(g.rate), off);
+    speedButton.label = true;
     Controls controls{
         seek,
         along(now),
@@ -377,12 +397,14 @@ bool DrawControls() {
         !off && (g.hot == kSeek || g.drag == kSeek),
         volume,
         g.muted ? 0.0 : g.volume,
+        speed,
+        (g.rate - kMinRate) / (kMaxRate - kMinRate),
         rect(kTime),
         rect(kTitle),
         off ? L"" : FormatTime(now) + (std::isfinite(duration) ? L" / " + FormatTime(duration) : L""),
         g.title,
         {button(kPlay, g.playing ? L"\xE769" : L"\xF5B0", off), button(kBack, step, off, -1),
-         button(kForward, step, off, 1), button(kVolume, VolumeGlyph(), false),
+         button(kForward, step, off, 1), button(kVolume, VolumeGlyph(), false), speedButton,
          button(kSubtitles, L"\xE7F0", off || !HasTrackChoice()),
          button(kFullscreen, g.fullscreen ? L"\xE73F" : L"\xE740", off && !g.fullscreen)}};
     g.controls->SetOffsetY(float(top));
@@ -1068,6 +1090,7 @@ bool OpenVideoFile(const std::wstring& path, bool started) {
     }
     g.path = path;
     g.resume = LoadPosition(path);
+    SetPlaybackRate(g.rate = 1);  // each video starts at normal speed
     // Seeks and tracks belong to the video they were for.
     g.duration = NAN;
     g.seekBusy = g.seekQueued = g.seekCheck = g.seekWaits = false;
@@ -1308,9 +1331,22 @@ void DragSeekToX(int x) {
     UpdateControlsAtFrame();
 }
 
+void SetRate(double rate) {
+    if (rate == g.rate) return;
+    SetPlaybackRate(g.rate = rate);
+    UpdateControlsAtFrame();
+}
+
+// Sets the playback speed under x on the speed slider, to the nearest of its stops.
+void SetSpeedToX(int x) {
+    const RECT r = SliderTrack(kSpeedBar);
+    const double at = std::clamp(double(x - r.left) / std::max(1L, r.right - r.left), 0.0, 1.0);
+    SetRate(kMinRate + std::round(at * (kMaxRate - kMinRate) / kRateStep) * kRateStep);
+}
+
 // Sets the volume under x on the volume slider.
 void SetVolumeToX(int x) {
-    const RECT r = VolumeTrack();
+    const RECT r = SliderTrack(kVolumeBar);
     g.volume = SetVolume(std::clamp(double(x - r.left) / std::max(1L, r.right - r.left), 0.0, 1.0));
     g.muted = g.muted && g.volume == 0;
     UpdateControlsAtFrame();
@@ -1352,6 +1388,8 @@ void Press(Control c) {
     } else if (c != kNone && c != kSeek && HasVideo()) {
         if (c == kPlay) {
             TogglePlay();
+        } else if (c == kSpeed) {
+            SetRate(1);  // the slider sets the others
         } else if (c == kSubtitles) {
             if (HasTrackChoice()) SetPanelOpen(!g.panelOpen);
         } else {
@@ -1607,6 +1645,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SetCapture(hwnd);
                 if (g.volume > 0) g.restoreVolume = g.volume;
                 SetVolumeToX(pt.x);
+            } else if (c == kSpeedBar && HasVideo()) {
+                g.drag = kSpeedBar;
+                SetCapture(hwnd);
+                SetSpeedToX(pt.x);
             } else if (IsOnBar(pt)) {  // a double click there is just a second click
                 Press(c);
             } else if (msg == WM_LBUTTONDBLCLK &&
@@ -1644,6 +1686,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 DragSeekToX(GET_X_LPARAM(lp));
             } else if (g.drag == kVolumeBar) {
                 SetVolumeToX(GET_X_LPARAM(lp));
+            } else if (g.drag == kSpeedBar) {
+                SetSpeedToX(GET_X_LPARAM(lp));
             } else {
                 SetHot(HitTest({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}));
                 SetPanelHot({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});

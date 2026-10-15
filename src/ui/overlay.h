@@ -51,6 +51,7 @@ struct BarItem {
     bool dim = false;  // disabled
     bool mirror = false;  // flipped left to right
     bool checked = false;  // a check mark left of the text
+    bool label = false;    // text on the controls rather than an icon glyph
     bool operator==(const BarItem&) const = default;
 };
 
@@ -67,6 +68,8 @@ struct Controls {
     bool seekHot;        // the track is thicker
     RECT volumeTrack;    // the volume slider's track runs along its middle; none if empty
     double volumeLevel;  // 0..1 of the volume track filled
+    RECT speedTrack;     // the speed slider's, the same way
+    double speedLevel;
     RECT timeRect, titleRect;
     std::wstring time, title;
     std::vector<BarItem> buttons;  // hot ones are drawn larger
