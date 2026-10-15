@@ -28,20 +28,25 @@ Open a video by dropping it on the window or with File → Open. Add subtitles t
 
 Subtitles built into an MKV and `.srt` files named like the video (`Movie.en.srt`) are found automatically but start hidden. Press `S` to show them, or pick an audio or subtitle track with the subtitles button.
 
-Move the mouse to show the controls. Hover over the seek bar to preview any frame.
+Move the mouse to show the controls. Hover over the seek bar to preview any frame. Hover over the speed button to change the playback speed.
 
-| Input                  | Action                  |
-| ---------------------- | ----------------------- |
-| `Space` / click        | Play / pause            |
-| `←` / `→`              | Back / forward 5 s      |
-| `↑` / `↓` / scroll     | Volume up / down        |
-| `M`                    | Mute                    |
-| `S`                    | Subtitles on / off      |
-| `F11` / double-click   | Fullscreen              |
-| `Ctrl+O`               | Open video or subtitles |
-| `Alt+F`                | File menu               |
-| `Alt+S`                | Subtitles menu          |
-| `Esc`                  | Exit fullscreen / close |
+The player remembers the volume and where you left each video.
+
+| Input                        | Action                  |
+| ---------------------------- | ----------------------- |
+| `Space` / click / media key  | Play / pause            |
+| `←` / `→` / mouse side keys  | Back / forward 5 s      |
+| `Ctrl+←` / `Ctrl+→`          | Back / forward 60 s     |
+| `Home` / `End`               | Start / end             |
+| `,` / `.`                    | Previous / next frame   |
+| `↑` / `↓` / scroll           | Volume up / down        |
+| `M`                          | Mute                    |
+| `S`                          | Subtitles on / off      |
+| `F11` / double-click         | Fullscreen              |
+| `Ctrl+O`                     | Open video or subtitles |
+| `Alt+F`                      | File menu               |
+| `Alt+S`                      | Subtitles menu          |
+| `Esc`                        | Exit fullscreen / close |
 
 ## Build
 
