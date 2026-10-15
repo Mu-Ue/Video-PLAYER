@@ -93,6 +93,7 @@ HANDLE TakePreviewPicture(LONGLONG& time);
 SIZE PreviewSize();
 
 bool IsPlaying();
+bool HasEnded();
 void SetPlaying(bool playing);  // playing from the start if it has ended
 double PlaybackTime();  // seconds
 double Duration();      // seconds; NaN if unknown

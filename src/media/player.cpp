@@ -1097,6 +1097,8 @@ void SetSubtitleLayout(const SubtitleLayout& layout) {
 
 bool IsPlaying() { return g.engine && !g.engine->IsPaused() && !g.engine->IsEnded(); }
 
+bool HasEnded() { return g.engine && g.engine->IsEnded(); }
+
 void SetPlaying(bool playing) {
     if (!g.engine) return;
     if (playing) {

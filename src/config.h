@@ -25,3 +25,4 @@ constexpr size_t kMaxCueChars = 2048;
 constexpr size_t kScanBytes = 512 << 10;
 constexpr size_t kMaxCues = 100000;  // per subtitle file; a film has a few thousand
 constexpr int kMaxSidecarSubtitles = 32;  // .srt files picked up next to a video
+constexpr size_t kMaxPositions = 50;      // videos whose position is kept for resuming

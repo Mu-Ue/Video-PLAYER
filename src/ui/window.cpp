@@ -116,6 +116,8 @@ struct Window {
     Control hot = kNone;    // under the mouse
     Control menuOpen = kNone;  // kFile or kSubs while its menu is showing
     std::wstring title;     // the video's file name
+    std::wstring path;      // the video's
+    double resume = 0;      // where it was left, to seek to once its metadata loads
     bool controlsShown = false;
     Controls drawn{};  // what the controls show, at drawnSize and drawnScale
     SIZE drawnSize{};
@@ -1045,12 +1047,18 @@ bool StartVideoPlayer(const std::wstring& path) {
     return g.player;
 }
 
+// Keeps where the video open was left, for the next time it opens; one watched to the end starts over.
+void SavePlaybackPosition() {
+    if (!g.path.empty() && HasVideo()) SavePosition(g.path, HasEnded() ? 0 : ShownTime());
+}
+
 // Plays a video, unless started, as the engine already loads it.
 bool OpenVideoFile(const std::wstring& path, bool started) {
     if (!started && !StartVideoPlayer(path)) {
         ShowError(L"Can't play videos: Direct3D 11 or Media Foundation isn't available.");
         return false;
     }
+    if (!started) SavePlaybackPosition();  // while it is still the engine's
     const HRESULT hr = started ? S_OK : OpenVideo(path);
     if (FAILED(hr)) {
         const bool missing = hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) ||
@@ -1058,6 +1066,8 @@ bool OpenVideoFile(const std::wstring& path, bool started) {
         ShowError(L"Can't open \"" + FileName(path) + L"\"." + (missing ? L"\n\nThe file doesn't exist." : L""));
         return false;
     }
+    g.path = path;
+    g.resume = LoadPosition(path);
     // Seeks and tracks belong to the video they were for.
     g.duration = NAN;
     g.seekBusy = g.seekQueued = g.seekCheck = g.seekWaits = false;
@@ -1367,6 +1377,7 @@ void OnMediaEvent(WPARAM event, LPARAM param) {
             }
             ShowMainWindow();
             Layout();
+            if (g.resume > 0) RequestSeek(std::exchange(g.resume, 0.0), false);  // where it was left
             break;
         case MF_MEDIA_ENGINE_EVENT_FORMATCHANGE:
             g.attached = false;
@@ -1691,6 +1702,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_DESTROY:
             SaveSettings({g.volume, g.muted});
+            SavePlaybackPosition();
             StopMkvSubtitles();
             ShutdownPlayer();
             SetThreadExecutionState(ES_CONTINUOUS);
