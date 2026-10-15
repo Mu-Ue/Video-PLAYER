@@ -16,6 +16,7 @@ constexpr const wchar_t* kVideoExtensions[] = {L".mp4", L".m4v", L".mov", L".mkv
 constexpr double kSeekStep = 5.0;     // seconds
 constexpr double kLongSeekStep = 60.0;  // seconds, with Ctrl
 constexpr double kVolumeStep = 0.05;  // of full volume
+constexpr double kMaxVolume = 2.0;   // of full volume, boosted past it
 constexpr double kMinRate = 0.5, kMaxRate = 2.0, kRateStep = 0.25;  // playback speeds the speed slider stops at
 constexpr UINT kOsdMs = 1500;          // how long seek / volume feedback stays up
 constexpr UINT kDoubleClickMs = 300;  // max gap between the clicks of a fullscreen double click

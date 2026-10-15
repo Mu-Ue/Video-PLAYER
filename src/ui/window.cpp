@@ -396,7 +396,7 @@ bool DrawControls() {
         g.drag == kSeek && duration > 0 ? along(ShownTime()) : -1.0,
         !off && (g.hot == kSeek || g.drag == kSeek),
         volume,
-        g.muted ? 0.0 : g.volume,
+        g.muted ? 0.0 : g.volume / kMaxVolume,
         speed,
         (g.rate - kMinRate) / (kMaxRate - kMinRate),
         rect(kTime),
@@ -1391,7 +1391,7 @@ void SetSpeedToX(int x) {
 // Sets the volume under x on the volume slider.
 void SetVolumeToX(int x) {
     const RECT r = SliderTrack(kVolumeBar);
-    g.volume = SetVolume(std::clamp(double(x - r.left) / std::max(1L, r.right - r.left), 0.0, 1.0));
+    g.volume = SetVolume(std::clamp(double(x - r.left) / std::max(1L, r.right - r.left), 0.0, 1.0) * kMaxVolume);
     g.muted = g.muted && g.volume == 0;
     UpdateControlsAtFrame();
 }

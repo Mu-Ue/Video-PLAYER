@@ -1145,14 +1145,14 @@ void SetMuted(bool muted) {
 }  // namespace
 
 double ChangeVolume(double delta) {
-    g.volume = std::clamp(std::round((g.volume + delta) * 100) / 100, 0.0, 1.0);
+    g.volume = std::clamp(std::round((g.volume + delta) * 100) / 100, 0.0, kMaxVolume);
     SetAudioVolume(g.volume, g.muted);
     if (delta > 0) SetMuted(false);
     return g.volume;
 }
 
 double SetVolume(double volume) {
-    g.volume = std::clamp(std::round(volume * 100) / 100, 0.0, 1.0);
+    g.volume = std::clamp(std::round(volume * 100) / 100, 0.0, kMaxVolume);
     SetAudioVolume(g.volume, g.muted);
     if (g.volume > 0) SetMuted(false);
     return g.volume;

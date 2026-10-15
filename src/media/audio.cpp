@@ -839,7 +839,16 @@ void PlayerLoop() {
         BYTE* buffer = nullptr;
         if (room && SUCCEEDED(out.render->GetBuffer(room, &buffer))) {
             float* to = reinterpret_cast<float*>(buffer);
-            for (size_t i = 0; i < size_t(room) * c; ++i) to[i] = made[i] * gain;
+            if (gain <= 1) {
+                for (size_t i = 0; i < size_t(room) * c; ++i) to[i] = made[i] * gain;
+            } else {  // boosted: peaks bend smoothly toward full scale rather than clipping
+                constexpr float knee = 0.9f;
+                for (size_t i = 0; i < size_t(room) * c; ++i) {
+                    const float y = made[i] * gain;
+                    const float a = std::abs(y);
+                    to[i] = a <= knee ? y : std::copysign(knee + (1 - knee) * std::tanh((a - knee) / (1 - knee)), y);
+                }
+            }
             out.render->ReleaseBuffer(room, 0);
             made.erase(made.begin(), made.begin() + ptrdiff_t(room) * ptrdiff_t(c));
             madeFrames += room;

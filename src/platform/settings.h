@@ -4,7 +4,7 @@
 
 // What the player keeps between runs, for the current user. --unregister clears it.
 struct Settings {
-    double volume = 1;  // 0..1
+    double volume = 1;  // 0..kMaxVolume
     bool muted = false;
 };
 

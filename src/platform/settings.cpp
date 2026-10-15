@@ -64,13 +64,13 @@ std::vector<Position> ReadPositions() {
 Settings LoadSettings() {
     Settings s;
     DWORD value;
-    if (GetDword(L"Volume", value)) s.volume = std::min<DWORD>(value, 100) / 100.0;
+    if (GetDword(L"Volume", value)) s.volume = std::min<DWORD>(value, DWORD(kMaxVolume * 100)) / 100.0;
     if (GetDword(L"Muted", value)) s.muted = value != 0;
     return s;
 }
 
 void SaveSettings(const Settings& s) {
-    SetDword(L"Volume", DWORD(std::lround(std::clamp(s.volume, 0.0, 1.0) * 100)));
+    SetDword(L"Volume", DWORD(std::lround(std::clamp(s.volume, 0.0, kMaxVolume) * 100)));
     SetDword(L"Muted", s.muted);
 }
 
