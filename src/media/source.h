@@ -8,7 +8,8 @@
 // - Tracks that start later than their first samples: B-frame video, whose MPEG-4 edit list starts it later, and
 //   audio with an encoder delay (AAC's priming), which the MPEG-4 edit list or the Matroska CodecDelay skip. Media
 //   Foundation ignores both.
-// - The sound as a whole, moved earlier by the audio renderer's buffer, which the engine's clock runs ahead by.
+// - The sound as a whole, moved earlier by the audio renderer's buffer, which the engine's clock runs ahead by, less
+//   the half compositor frame a picture shows late by on average.
 // - Uncompressed audio, cut exactly where playback starts.
 // Lives for the whole process.
 IMFMediaEngineExtension* SourceExtension();

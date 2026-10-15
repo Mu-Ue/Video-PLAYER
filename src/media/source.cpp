@@ -1,6 +1,8 @@
 #include "media/source.h"
 
 #include <audioclient.h>
+#include <dcomp.h>
+#include <dwmapi.h>
 #include <mfapi.h>
 #include <mferror.h>
 #include <mfidl.h>
@@ -98,8 +100,36 @@ struct Shifts {
     }
 };
 
+// The time between compositor frames, in 100 ns units: from the frame statistics of Windows 11, which pace the
+// render thread, or before that from the desktop's timing. 0 if it can't tell.
+LONGLONG CompositorPeriod() {
+    using GetFrameIdFn = HRESULT(WINAPI*)(COMPOSITION_FRAME_ID_TYPE, COMPOSITION_FRAME_ID*);
+    using GetStatisticsFn = HRESULT(WINAPI*)(COMPOSITION_FRAME_ID, COMPOSITION_FRAME_STATS*, UINT,
+                                             COMPOSITION_TARGET_ID*, UINT*);
+    const HMODULE dcomp = GetModuleHandleW(L"dcomp.dll");
+    const auto getFrameId = reinterpret_cast<GetFrameIdFn>(GetProcAddress(dcomp, "DCompositionGetFrameId"));
+    const auto getStatistics = reinterpret_cast<GetStatisticsFn>(GetProcAddress(dcomp, "DCompositionGetStatistics"));
+    LARGE_INTEGER frequency;
+    QueryPerformanceFrequency(&frequency);
+    LONGLONG ticks = 0;
+    COMPOSITION_FRAME_ID id;
+    COMPOSITION_FRAME_STATS stats;
+    DWM_TIMING_INFO timing{sizeof(timing)};
+    if (getFrameId && getStatistics) {
+        if (SUCCEEDED(getFrameId(COMPOSITION_FRAME_ID_CREATED, &id)) &&
+            SUCCEEDED(getStatistics(id, &stats, 0, nullptr, nullptr))) {
+            ticks = LONGLONG(stats.framePeriod);
+        }
+    } else if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &timing))) {
+        ticks = LONGLONG(timing.qpcRefreshPeriod);
+    }
+    return MFllMulDiv(ticks, 10000000, frequency.QuadPart, 0);
+}
+
 // How far the engine's clock runs ahead of the sound: its audio renderer's buffer, which it doesn't count. That
-// is a shared stream's default buffer on the default output, which the renderer plays to. 0 if it can't tell.
+// is a shared stream's default buffer on the default output, which the renderer plays to. Less half a compositor
+// frame: a picture shows at the first composition after its time, so that much late on average. 0 if it can't
+// tell.
 LONGLONG AudioLead() {
     ComPtr<IMMDeviceEnumerator> devices;
     ComPtr<IMMDevice> device;
@@ -112,8 +142,9 @@ LONGLONG AudioLead() {
     if (SUCCEEDED(hr)) hr = client->GetMixFormat(&format);
     if (SUCCEEDED(hr)) hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 0, 0, format, nullptr);
     if (SUCCEEDED(hr)) hr = client->GetBufferSize(&frames);
-    const LONGLONG lead =
-        SUCCEEDED(hr) && format->nSamplesPerSec ? MFllMulDiv(frames, 10000000, format->nSamplesPerSec, 0) : 0;
+    const LONGLONG lead = SUCCEEDED(hr) && format->nSamplesPerSec
+                              ? MFllMulDiv(frames, 10000000, format->nSamplesPerSec, 0) - CompositorPeriod() / 2
+                              : 0;
     CoTaskMemFree(format);
     return std::clamp<LONGLONG>(lead, 0, 1'000'000);  // 100 ms at most
 }
