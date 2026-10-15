@@ -161,6 +161,8 @@ struct {
     std::atomic<LONGLONG> landing = -1;     // of the last seek, in 100 ns units, until its frame shows
     std::atomic<bool> opened = false;       // a new video was opened, whose frames may come faster
     std::atomic<double> rate = 1;           // the playback speed, which video time passes at
+    // The time of the frame on screen and the shortest time between frames yet, in 100 ns units; -1 and 0 if none.
+    std::atomic<LONGLONG> shownFrame = -1, frameGap = 0;
     HANDLE stop = nullptr;             // tells the render thread and the previewer to exit
     HANDLE renderWake = nullptr;       // set on each engine event and redraw, while the render thread sleeps
     std::thread renderer;
@@ -485,7 +487,10 @@ void RenderLoop() {
     LONGLONG fastest = 0;     // the shortest time between frames of the video yet, or 0
     LONGLONG previous = -1;   // the video's last frame, for that
     for (;;) {
-        if (g.opened.exchange(false)) fastest = 0, previous = -1;
+        if (g.opened.exchange(false)) {
+            fastest = 0, previous = -1;
+            g.shownFrame = -1, g.frameGap = 0;
+        }
         if (idle >= kIdleTicks && (!g.engine->HasVideo() || (g.engine->IsPaused() && !g.redraw))) {
             if (WaitForMultipleObjects(2, events, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) break;
             idle = 0;
@@ -526,6 +531,8 @@ void RenderLoop() {
             }
             if (previous >= 0 && pts > previous && (!fastest || pts - previous < fastest)) fastest = pts - previous;
             frameTime = previous = pts;
+            g.shownFrame = pts;
+            g.frameGap = fastest;
         }
         if (fresh || g.redraw) {
             // The subtitles are laid out outside the lock, so the window never waits for that.
@@ -1124,6 +1131,16 @@ void SeekTo(double landing, bool fast) {
     g.landing = std::llround(landing * 1e7);
     g.engine->SetCurrentTimeEx(landing, fast && !KeyFrames() ? MF_MEDIA_ENGINE_SEEK_MODE_APPROXIMATE
                                                              : MF_MEDIA_ENGINE_SEEK_MODE_NORMAL);
+}
+
+double FrameTime() {
+    const LONGLONG shown = g.shownFrame;
+    return shown >= 0 ? shown / 1e7 : PlaybackTime();
+}
+
+double FrameGap() {
+    const LONGLONG gap = g.frameGap;
+    return gap > 0 ? gap / 1e7 : 1 / 30.0;
 }
 
 void SetPlaybackRate(double rate) {

@@ -102,6 +102,10 @@ double Duration();      // seconds; NaN if unknown
 double SeekLanding(double seconds, bool fast);
 // Starts seeking to a landing from SeekLanding; SEEKED follows.
 void SeekTo(double landing, bool fast);
+// The time of the frame on screen, in seconds, and the shortest time between the video's frames yet (a guess
+// until two have shown), for stepping a frame by exact seeks.
+double FrameTime();
+double FrameGap();
 void SetPlaybackRate(double rate);  // 1 for normal speed
 double Volume();  // 0..1
 bool IsMuted();

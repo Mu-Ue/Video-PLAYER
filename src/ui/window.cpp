@@ -1291,6 +1291,31 @@ void TogglePlay() {
     ShowFlash(g.playing ? L"\xF5B0" : L"\xE769");
 }
 
+// Pauses and shows the next or previous frame, by an exact seek into the middle of its time: half a frame back
+// lands on the previous one even at a variable frame rate, one and a half forward on the next at a constant one.
+// The engine's own frame step does nothing while it hands out frames. A seek in flight is stepped on from, so a
+// held key keeps stepping.
+void StepFrame(bool forward) {
+    if (g.playing) {
+        g.playing = false;
+        SetPlaying(false);
+    }
+    const double gap = FrameGap();
+    g.seekCheck = false;
+    if (g.seekBusy) {
+        RequestSeek(g.seekTarget + (forward ? gap : -gap), false);
+    } else if (!forward) {
+        RequestSeek(FrameTime() - gap / 2, false);
+    } else {
+        // Paused, the engine's clock can be past the frame on screen, in the next one, and a seek within the frame
+        // it is in does nothing: then it first goes back into the one on screen, which looks the same.
+        const double frame = FrameTime();
+        if (PlaybackTime() >= frame + gap) RequestSeek(frame + gap / 4, false);
+        RequestSeek(frame + 1.5 * gap, false);
+    }
+    UpdateControls();
+}
+
 // Mutes or unmutes, popping up the new volume icon if flash. At 0% it already counts as muted, so it unmutes to
 // the volume before that, at least a little.
 void ToggleMuted(bool flash) {
@@ -1494,6 +1519,10 @@ void OnKey(WPARAM key, bool repeat) {
         case VK_UP:
         case VK_DOWN:
             StepVolume(key == VK_UP, repeat);
+            break;
+        case VK_OEM_COMMA:
+        case VK_OEM_PERIOD:
+            if (video) StepFrame(key == VK_OEM_PERIOD);
             break;
         case 'M':
             if (!repeat) ToggleMuted(true);
