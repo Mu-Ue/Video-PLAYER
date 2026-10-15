@@ -282,7 +282,7 @@ RECT ControlRect(Control c) {
     GetClientRect(g.hwnd, &client);
     if (c == kFile) return {0, 0, Px(40), MenuBarHeight()};
     if (c == kSubs) return {Px(40), 0, Px(112), MenuBarHeight()};
-    const int margin = Px(12), step = Px(56), slider = Px(64), speedSlider = Px(96), time = Px(140);
+    const int margin = Px(12), step = Px(56), slider = Px(128), speedSlider = Px(96), time = Px(140);
     const int seekY = client.bottom - Px(80), rowY = client.bottom - Px(34), half = Px(24);
     const int sliderX = margin + 4 * step;  // right of the volume button
     const int speedX = int(client.right) - margin - (kFullscreen - kSpeed + 1) * step;  // left of the speed button
@@ -397,6 +397,7 @@ bool DrawControls() {
         !off && (g.hot == kSeek || g.drag == kSeek),
         volume,
         g.muted ? 0.0 : g.volume / kMaxVolume,
+        1 / kMaxVolume,
         speed,
         (g.rate - kMinRate) / (kMaxRate - kMinRate),
         rect(kTime),

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <tuple>
 #include <utility>
 
 using Microsoft::WRL::ComPtr;
@@ -606,16 +607,22 @@ void DrawControls(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT 
             dc->FillEllipse(D2D1::Ellipse({px, y}, knob, knob), g.kit.brush.Get());
         }
 
-        // The volume and speed sliders, the same way in white.
-        for (const auto& [track, level] : {std::pair{c.volumeTrack, c.volumeLevel}, std::pair{c.speedTrack, c.speedLevel}}) {
+        // The volume and speed sliders, the same way in white, but red past full volume as a warning.
+        for (const auto& [track, level, full] : {std::tuple{c.volumeTrack, c.volumeLevel, c.volumeFull},
+                                                 std::tuple{c.speedTrack, c.speedLevel, 1.0}}) {
             if (track.right <= track.left) continue;
             const D2D1_RECT_F v = RectF(track);
             const float vy = (v.top + v.bottom) / 2, vhalf = 1.5f * scale;
             const float vx = v.left + float(level) * (v.right - v.left);
+            const float fx = v.left + float(full) * (v.right - v.left);
             g.kit.brush->SetColor(D2D1::ColorF(1, 1, 1, 0.35f));
-            dc->FillRectangle(D2D1::RectF(vx, vy - vhalf, v.right, vy + vhalf), g.kit.brush.Get());
+            dc->FillRectangle(D2D1::RectF(vx, vy - vhalf, std::max(vx, fx), vy + vhalf), g.kit.brush.Get());
+            g.kit.brush->SetColor(D2D1::ColorF(0xe50914, 0.45f));
+            dc->FillRectangle(D2D1::RectF(std::max(vx, fx), vy - vhalf, v.right, vy + vhalf), g.kit.brush.Get());
+            g.kit.brush->SetColor(D2D1::ColorF(0xe50914));
+            dc->FillRectangle(D2D1::RectF(fx, vy - vhalf, std::max(vx, fx), vy + vhalf), g.kit.brush.Get());
             g.kit.brush->SetColor(D2D1::ColorF(0xffffff));
-            dc->FillRectangle(D2D1::RectF(v.left, vy - vhalf, vx, vy + vhalf), g.kit.brush.Get());
+            dc->FillRectangle(D2D1::RectF(v.left, vy - vhalf, std::min(vx, fx), vy + vhalf), g.kit.brush.Get());
             dc->FillEllipse(D2D1::Ellipse({vx, vy}, 6 * scale, 6 * scale), g.kit.brush.Get());
         }
 

@@ -67,6 +67,7 @@ struct Controls {
     bool seekHot;        // the track is thicker
     RECT volumeTrack;    // the volume slider's track runs along its middle; none if empty
     double volumeLevel;  // 0..1 of the volume track filled
+    double volumeFull;   // 0..1 of the volume track at full volume, red past it where boosted
     RECT speedTrack;     // the speed slider's, the same way
     double speedLevel;
     RECT timeRect, titleRect;
