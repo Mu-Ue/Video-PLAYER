@@ -149,6 +149,7 @@ struct {
     ComPtr<IDXGISwapChain2> chain2;  // null before Windows 8.1: then the whole swap chain is drawn
     UINT width = 0, height = 0;
     UINT drawWidth = 0, drawHeight = 0;  // the part drawn: the video's size on screen, at most the swap chain's
+    UINT sourceWidth = 0, sourceHeight = 0;  // the swap chain's source size, last set; 0 x 0 after a resize
     FramePainter* painter = nullptr;     // the render thread's, which keeps a buffer until told to let go
     // The subtitles drawn into the frames, which the window sets under subsLock, counting each change in subsVersion.
     SRWLOCK subsLock = SRWLOCK_INIT;
@@ -329,7 +330,11 @@ bool PresentFrame(UINT w, UINT h, FrameSubtitles& subtitles) {
     if (FAILED(g.engine->TransferVideoFrame(buffer.Get(), nullptr, &dest, &black))) return false;
     subtitles.painter.Draw(buffer.Get(), subtitles.at);  // the frame still shows if they can't be
     // Takes effect with this present, so the picture and its size change in the same compositor frame.
-    if (g.chain2 && FAILED(g.chain2->SetSourceSize(w, h))) return false;
+    if (g.chain2 && (w != g.sourceWidth || h != g.sourceHeight)) {
+        if (FAILED(g.chain2->SetSourceSize(w, h))) return false;
+        g.sourceWidth = w;
+        g.sourceHeight = h;
+    }
     return SUCCEEDED(g.chain->Present(0, 0));
 }
 
@@ -1046,6 +1051,7 @@ void SetVideoSize(int width, int height) {
     const HRESULT hr = SizeChain(g.chain, UINT(width), UINT(height));
     if (SUCCEEDED(hr)) {
         if (!g.chain2) g.chain.As(&g.chain2);
+        g.sourceWidth = g.sourceHeight = 0;  // resizing set it to the whole size
         g.width = UINT(width);
         g.height = UINT(height);
         Redraw();  // at the new size, even while paused
