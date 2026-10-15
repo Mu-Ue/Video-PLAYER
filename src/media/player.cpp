@@ -425,16 +425,11 @@ class CompositorClock {
     LARGE_INTEGER frequency_;
 };
 
-// The time between compositor frames, in 100 ns units, or 0 if unknown.
-LONGLONG CompositorPeriod(const CompositorClock& clock) {
-    return clock.Period() * 10'000'000 / clock.Frequency();
-}
-
-// Waits until shortly before the compositor frame after the one at tick, a performance counter time, so the window
-// can update as late as it can and still make that frame; at once if it can't tell when that is. Returns false if
-// told to stop.
-bool WaitBeforeNextFrame(const CompositorClock& clock, HANDLE timer, LONGLONG tick) {
-    const LONGLONG period = clock.Period(), freq = clock.Frequency();
+// Waits until shortly before the compositor frame after the one at tick, a performance counter time, period
+// ticks long, so the window can update as late as it can and still make that frame; at once if it can't tell when
+// that is. Returns false if told to stop.
+bool WaitBeforeNextFrame(const CompositorClock& clock, HANDLE timer, LONGLONG tick, LONGLONG period) {
+    const LONGLONG freq = clock.Frequency();
     if (!timer || period <= 0) return true;
     const LONGLONG next = tick + period;
     LARGE_INTEGER now;
@@ -497,6 +492,9 @@ void RenderLoop() {
         }
         LARGE_INTEGER tick;
         QueryPerformanceCounter(&tick);
+        // The compositor's period, looked up once a tick and only if needed.
+        LONGLONG period = -1;
+        const auto framePeriod = [&] { return period < 0 ? period = clock.Period() : period; };
         // An event that came while awake restarts the grace.
         idle = WaitForSingleObject(g.renderWake, 0) == WAIT_OBJECT_0 ? 0 : idle + 1;
         LONGLONG pts;
@@ -506,8 +504,8 @@ void RenderLoop() {
         // frames come no faster than the fastest yet.
         if (!fresh && waitClock && !g.engine->IsPaused() &&
             (!fastest || frameTime + fastest - std::llround(g.engine->GetCurrentTime() * 1e7) <=
-                             CompositorPeriod(clock))) {
-            if (!WaitBeforeNextFrame(clock, timer, tick.QuadPart)) break;
+                             framePeriod() * 10'000'000 / clock.Frequency())) {
+            if (!WaitBeforeNextFrame(clock, timer, tick.QuadPart, framePeriod())) break;
             fresh = g.engine->OnVideoStreamTick(&pts) == S_OK;
         }
         if (fresh) {
@@ -540,7 +538,7 @@ void RenderLoop() {
         // Then waits for the next frame's latest moment while frames are wanted, and a little after, as a request
         // that comes just after a frame begins would otherwise wait out the next one.
         if (g.frameWanted || latchGrace > 0) {
-            if (!WaitBeforeNextFrame(clock, timer, tick.QuadPart)) break;
+            if (!WaitBeforeNextFrame(clock, timer, tick.QuadPart, framePeriod())) break;
             if (g.frameWanted.exchange(false)) {
                 latchGrace = kLatchTicks;
                 PostMessageW(g.notify.hwnd, WM_APP_FRAME, 0, 0);
