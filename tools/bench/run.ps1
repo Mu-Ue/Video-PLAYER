@@ -33,6 +33,8 @@ $suite = @(
 for ($r = 0; $r -lt $Repeat; $r++) {
     foreach ($t in $suite) {
         $a = @($Player, (Join-Path $clips $t[0]), '--seconds', $t[1], '--seeks', $t[2], '--label', $Label, '--csv', $Csv) + $t[3]
+        # Each clip plays from the start, not where the player left it the last time.
+        Remove-ItemProperty 'HKCU:\Software\VideoPLAYER' -Name Positions -ErrorAction SilentlyContinue
         & $bench @a | Select-Object -Last 1
         Start-Sleep -Seconds 1
     }
