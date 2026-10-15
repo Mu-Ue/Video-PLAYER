@@ -376,7 +376,7 @@ bool DrawControls() {
         {button(kPlay, g.playing ? L"\xE769" : L"\xF5B0", off), button(kBack, step, off, -1),
          button(kForward, step, off, 1), button(kVolume, VolumeGlyph(), false),
          button(kSubtitles, L"\xE7F0", off || !HasTrackChoice()),
-         button(kFullscreen, g.fullscreen ? L"\xE73F" : L"\xE740", false)}};
+         button(kFullscreen, g.fullscreen ? L"\xE73F" : L"\xE740", off && !g.fullscreen)}};
     g.controls->SetOffsetY(float(top));
     const SIZE size{client.right, h};
     if (controls == g.drawn && size.cx == g.drawnSize.cx && size.cy == g.drawnSize.cy && scale == g.drawnScale) {
@@ -1290,7 +1290,9 @@ void SetVolumeToX(int x) {
 }
 
 // Switches between the normal window and a borderless one covering its monitor.
+// Only with a video: fullscreen hides the menu bar, which opens one.
 void ToggleFullscreen() {
+    if (!g.fullscreen && !HasVideo()) return;
     g.fullscreen = !g.fullscreen;
     g.hot = kNone;
     g.drag = kNone;
@@ -1392,6 +1394,7 @@ void OnMediaEvent(WPARAM event, LPARAM param) {
             // The video given on the command line failed before the window showed: like a failed start, close.
             const bool starting = !IsWindowVisible(g.hwnd);
             KillTimer(g.hwnd, kShowTimer);
+            if (g.fullscreen) ToggleFullscreen();  // back to the menu bar, to open another
             ShowVideoError(param);
             if (starting) DestroyWindow(g.hwnd);
             break;
