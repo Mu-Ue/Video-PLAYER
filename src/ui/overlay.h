@@ -63,6 +63,7 @@ void DrawBar(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT width
 struct Controls {
     RECT seekBar;        // the track runs along its middle
     double progress;     // 0..1 of the track played
+    double playback;     // 0..1 of the track where the video plays while the knob is dragged; -1 if not dragging
     bool seekHot;        // the track is thicker
     RECT volumeTrack;    // the volume slider's track runs along its middle; none if empty
     double volumeLevel;  // 0..1 of the volume track filled

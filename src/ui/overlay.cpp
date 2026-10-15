@@ -591,7 +591,7 @@ void DrawControls(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT 
         g.shade->SetEndPoint({0, float(height)});
         dc->FillRectangle(D2D1::RectF(0, 0, float(width), float(height)), g.shade.Get());
 
-        // The rest of the track, the played part and the knob.
+        // The rest of the track, the played part, the knob and, while it's dragged, where the video plays.
         const D2D1_RECT_F seek = RectF(c.seekBar);
         const float y = (seek.top + seek.bottom) / 2, half = (c.seekHot ? 4 : 2.5f) * scale;
         const float x = seek.left + float(c.progress) * (seek.right - seek.left), knob = (c.seekHot ? 8 : 6) * scale;
@@ -600,6 +600,11 @@ void DrawControls(IDCompositionDevice* dcomp, IDCompositionVisual* visual, UINT 
         g.kit.brush->SetColor(D2D1::ColorF(0xe50914));
         dc->FillRectangle(D2D1::RectF(seek.left, y - half, x, y + half), g.kit.brush.Get());
         dc->FillEllipse(D2D1::Ellipse({x, y}, knob, knob), g.kit.brush.Get());
+        if (c.playback >= 0) {
+            const float px = seek.left + float(c.playback) * (seek.right - seek.left);
+            g.kit.brush->SetColor(D2D1::ColorF(0xffffff));
+            dc->FillEllipse(D2D1::Ellipse({px, y}, knob, knob), g.kit.brush.Get());
+        }
 
         // The volume slider, the same way in white.
         if (c.volumeTrack.right > c.volumeTrack.left) {

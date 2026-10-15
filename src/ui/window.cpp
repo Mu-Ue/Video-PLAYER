@@ -362,11 +362,15 @@ bool DrawControls() {
     // Progress to the nearest pixel of the track, so it only changes when the drawing would.
     const RECT seek = rect(kSeek);
     const double track = std::max(1L, seek.right - seek.left);
+    const auto along = [&](double seconds) {
+        return duration > 0 ? std::round(std::clamp(seconds / duration, 0.0, 1.0) * track) / track : 0.0;
+    };
     RECT volume = VolumeTrack();
     OffsetRect(&volume, 0, -top);
     Controls controls{
         seek,
-        duration > 0 ? std::round(std::clamp(now / duration, 0.0, 1.0) * track) / track : 0.0,
+        along(now),
+        g.drag == kSeek && duration > 0 ? along(ShownTime()) : -1.0,
         !off && (g.hot == kSeek || g.drag == kSeek),
         volume,
         g.muted ? 0.0 : g.volume,
