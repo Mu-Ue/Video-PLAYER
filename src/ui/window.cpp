@@ -1467,6 +1467,25 @@ void OnKey(WPARAM key, bool repeat) {
     }
 }
 
+// Media keys, and the mouse's side buttons, which come as browser back and forward; false if not one of those.
+bool OnAppCommand(int command) {
+    switch (command) {
+        case APPCOMMAND_MEDIA_PLAY_PAUSE:
+            if (HasVideo()) TogglePlay();
+            return true;
+        case APPCOMMAND_MEDIA_PLAY:
+        case APPCOMMAND_MEDIA_PAUSE:
+        case APPCOMMAND_MEDIA_STOP:
+            if (HasVideo() && g.playing != (command == APPCOMMAND_MEDIA_PLAY)) TogglePlay();
+            return true;
+        case APPCOMMAND_BROWSER_BACKWARD:
+        case APPCOMMAND_BROWSER_FORWARD:
+            if (HasVideo()) Seek(command == APPCOMMAND_BROWSER_BACKWARD ? -kSeekStep : kSeekStep);
+            return true;
+    }
+    return false;
+}
+
 void OnDrop(HDROP drop) {
     std::vector<std::wstring> paths;
     const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
@@ -1544,6 +1563,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_KEYDOWN:
             OnKey(wp, (lp & (1 << 30)) != 0);
             return 0;
+        case WM_APPCOMMAND:
+            if (OnAppCommand(GET_APPCOMMAND_LPARAM(lp))) return TRUE;
+            break;
         case WM_SYSCHAR:  // Alt+F, Alt+S
             if (wp == 'f' || wp == 'F' || wp == 's' || wp == 'S') {
                 ShowMenu((wp | 0x20) == 'f' ? kFile : kSubs);
