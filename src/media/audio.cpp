@@ -357,8 +357,9 @@ class Stretch {
         const size_t at = size_t(std::lround(position_));
         size_t from = at;
         if (joined_) {
+            // Within the search, nothing matches the last segment's run better than the run itself.
             const size_t natural = last_ + half_;
-            if (at != natural) from = BestJoin(natural, at);
+            from = natural + search_ >= at && natural <= at + search_ ? natural : BestJoin(natural, at);
         }
         // Fades from the last segment's second half into this one's first; its own continuation fades back into
         // itself, as the window's halves add up to 1, so it is passed through as it is.
