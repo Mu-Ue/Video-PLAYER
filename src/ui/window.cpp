@@ -1518,10 +1518,13 @@ void OnMediaEvent(WPARAM event, LPARAM param) {
     }
 }
 
-// Turns the volume up or down a step, showing the new level; held keeps the icon up rather than popping it again.
+// Turns the volume up or down to the next step, showing the new level; held keeps the icon up rather than popping
+// it again. Off a step, as the slider leaves it, the first one goes only to the nearest step that way.
 void StepVolume(bool up, bool held) {
     if (g.volume > 0) g.restoreVolume = g.volume;
-    g.volume = ChangeVolume(up ? kVolumeStep : -kVolumeStep);
+    const long step = std::lround(kVolumeStep * 100), now = std::lround(g.volume * 100);
+    const long next = up ? (now / step + 1) * step : ((now + step - 1) / step - 1) * step;
+    g.volume = ChangeVolume((next - now) / 100.0);
     g.muted = IsMuted();  // turning it up unmutes
     UpdateControls();
     ShowFlash(VolumeGlyph(), false, held, std::to_wstring(std::lround(g.volume * 100)) + L"%");
